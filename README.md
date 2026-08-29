@@ -21,6 +21,7 @@
 ## 目录
 
 - `src/QuantumCheckpointProbe`：UE4SS Lua 研究原型。
+- `cpp/QuantumCheckpoint`：只读战斗状态导出器的 C++ 源码；尚未在本机构建。
 - `deployment`：开发探针使用的 UE4SS 配置。
 - `scripts`：安装、卸载和收集日志的 PowerShell 脚本。
 - `docs`：需求、架构决策和阶段实验记录。
@@ -51,8 +52,11 @@ F:\SteamLibrary\steamapps\common\Quantum Protocol
 - `Ctrl+F7`：只读比较当前卡牌区域与快照。
 - `Ctrl+F8`：只读枚举当前加载的 Quantum 对象。
 - `Ctrl+F9`：请求 UE4SS 完整对象转储。
+- `Ctrl+F10`：调用 UE4SS CXX Header Generator，把当前已加载类型导出到本地 `CXXHeaderDump`；建议进入战斗且状态稳定后使用。
 
 `Ctrl+F1` 敌人清空/重建实验已移除：实测会先触发原生小关完成逻辑，从而直接进入下一小关。UE4SS 热重载也已在随附配置中关闭；修改 Lua 后请完全退出并重启游戏。
+
+C++ 构建前提、当前工具链缺口和反射结构提取方法见 [C++ 开发说明](docs/cpp-development.md)。
 
 不要在 UE4SS 3.0.1 Lua 中调用 `GI_Quantum_C:getActiveDecklist()`。它在传递大型 `Decklist` 返回结构时会导致原生访问冲突，原 `Ctrl+F4` 诊断入口已移除。
 

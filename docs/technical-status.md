@@ -8,7 +8,7 @@
 - 已测试安装目录：`F:\SteamLibrary\steamapps\common\Quantum Protocol`。
 - 注入/反射工具：UE4SS 3.0.1 zDEV。
 - 当前实现：UE4SS Lua 研究探针；只保存内存快照，不具备跨进程恢复。
-- 正式跨进程恢复倾向 UE4SS C++ Mod，但本机目前未发现可用的 MSVC、CMake 或 Ninja 工具链。
+- 正式跨进程恢复倾向 UE4SS C++ Mod。第一版只读反射导出器源码已建立，但本机目前未发现可用的 MSVC、CMake 或 Ninja 工具链，且当前 GitHub 凭据无权读取官方 UEPseudo 子模块。
 
 ## 已验证能力
 
@@ -67,7 +67,19 @@
 
 场面：`PLAYER=0`、`ENEMY=1`。行：`FRONT=0`、`BACK=1`、`CORE=2`、`NONE=3`。
 
-已发现的结构名包括 `Decklist`、`DecklistCard`、`CardInfoInstance`、`GameDeckRun`、`RecordableCard` 和 `CardPlacement`。这些名称不代表字段已经完整识别。
+已发现的结构名包括 `Decklist`、`DecklistCard`、`CardInfoInstance`、`GameDeckRun`、`RecordableCard` 和 `CardPlacement`。
+
+离线解析现有 UE4SS 对象转储后，已确认以下反射字段：
+
+- `GameDeckRun`：`parentDeckDbId`、`characterTag`、`deckId`、`deckTag`、`deckName`、`deck`、`storage`、`lootSets` 和时间戳。
+- `RecordableCard`：`cardTag`、`displayText`、`upgradeLevel`、`count`。
+- `DecklistCard`：`cardName`、`count`、`upgradeLevel`。
+- `CardPlacement`：位置类型、索引、行和阵营。
+- `SpawnController`：波次索引、倒计时、警戒计数、生成列表以及自动生成相关字段。
+
+其中 `GameDeckRun.deck` 和 `GameDeckRun.storage` 都是 `RecordableCard` 数组。这是“重编程”路线的重要正面证据：玩家完整牌组和缓存区的构成、升级与数量已经存在紧凑的、近似序列化用途的数据结构，不必从可视卡牌对象反推。但对象转储只证明字段可被反射发现，尚未证明跨进程写回方式或所有运行时约束。
+
+敌人侧仍没有同等完整的单一结构。`InGameCard` 的卡牌标识、当前生命、位置和回合计数主要表现为 getter，持续效果还分散在卡牌和覆盖层相关对象中。因此敌人精确恢复依然是“重编程”路线的主要未知量。
 
 ## 存档安全边界
 
@@ -79,7 +91,9 @@
 ## 下一步需要获得的证据
 
 1. 生成并检查 UE4SS C++ SDK，确认上述结构的真实内存布局和函数签名。
-2. 只读导出玩家完整卡组、缓存区和全部升级字段，不经过 Lua 大结构返回值。
+2. 用 C++ 只读导出 `GameDeckRun` 的完整牌组、缓存区和全部升级字段，不经过 Lua 大结构返回值。
 3. 只读导出敌人全部实例状态、持续效果和生成控制器字段。
 4. 验证从菜单进入指定流程/关卡的安全路径。
 5. 根据实际字段规模回到 [architecture-options.md](architecture-options.md) 做最终路线决策。
+
+具体构建要求和当前阻塞见 [cpp-development.md](cpp-development.md)。

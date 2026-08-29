@@ -5,6 +5,7 @@
 - [requirements.md](requirements.md)：用户需求、检查点语义、未决产品问题。
 - [architecture-options.md](architecture-options.md)：小关开头与重编程锚点两条路线的成本和取舍。
 - [technical-status.md](technical-status.md)：已验证事实、失败实验、API 线索和当前技术边界。
+- [cpp-development.md](cpp-development.md)：C++ 工程、构建依赖、只读导出器和 SDK 生成流程。
 
 阶段报告保留实验发生时的上下文与证据：
 

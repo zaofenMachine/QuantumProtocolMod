@@ -760,4 +760,9 @@ RegisterKeyBind(Key.F9, { ModifierKey.CONTROL }, function()
     DumpAllObjects()
 end)
 
-log("LOADED phase-two safe prototype; Ctrl+F2 tests internal player-card loading after Ctrl+F3, Ctrl+F3 tests native player-board reset after a saved checkpoint, Ctrl+F5 saves a reprogram anchor, Ctrl+F6 restores health, Ctrl+F7 compares card zones, Ctrl+F8 inventories objects, Ctrl+F9 dumps all objects; hot reload is disabled")
+RegisterKeyBindAsync(Key.F10, { ModifierKey.CONTROL }, function()
+    log("CXX_HEADER_DUMP_REQUESTED")
+    GenerateSDK()
+end)
+
+log("LOADED phase-two safe prototype; Ctrl+F2 tests internal player-card loading after Ctrl+F3, Ctrl+F3 tests native player-board reset after a saved checkpoint, Ctrl+F5 saves a reprogram anchor, Ctrl+F6 restores health, Ctrl+F7 compares card zones, Ctrl+F8 inventories objects, Ctrl+F9 dumps all objects, Ctrl+F10 generates CXX headers; hot reload is disabled")
