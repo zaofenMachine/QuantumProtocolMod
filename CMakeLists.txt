@@ -2,6 +2,28 @@ cmake_minimum_required(VERSION 3.18)
 
 project(QuantumProtocolMods LANGUAGES CXX)
 
+# Keep the standalone mod and nested dependencies under one predictable output
+# tree. The build script also supplies UE4SS's custom configuration names on the
+# first configure so its bundled Corrosion can resolve Rust artifact paths.
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/Output/$<CONFIG>/bin")
+set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/Output/$<CONFIG>/bin")
+set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/Output/$<CONFIG>/lib")
+
+# UE4SS v3.0.1 names two moving branches in FetchContent. Pin them to revisions
+# that existed when v3.0.1 was released so upstream branch changes cannot break
+# this historical build (the first declaration of a FetchContent name wins).
+include(FetchContent)
+FetchContent_Declare(ImGuiTextEdit
+    GIT_REPOSITORY git@github.com:UE4SS-RE/ImGuiColorTextEdit.git
+    GIT_TAG af7821926251feca84e35f8fa83eee84dae90424
+    GIT_PROGRESS ON
+)
+FetchContent_Declare(IconFontCppHeaders
+    GIT_REPOSITORY git@github.com:juliettef/IconFontCppHeaders.git
+    GIT_TAG 8886c5657bac22b8fee34354871e3ade2a596433
+    GIT_PROGRESS ON
+)
+
 set(
     UE4SS_ROOT
     "${CMAKE_CURRENT_SOURCE_DIR}/vendor/RE-UE4SS-v3.0.1"
@@ -23,9 +45,10 @@ if(NOT EXISTS "${UE4SS_ROOT}/deps/first/Unreal/CMakeLists.txt")
     )
 endif()
 
-if(NOT EXISTS "${UE4SS_ROOT}/deps/first/patternsleuth/CMakeLists.txt")
+if(NOT EXISTS "${UE4SS_ROOT}/deps/first/patternsleuth/Cargo.toml"
+   OR NOT EXISTS "${UE4SS_ROOT}/deps/first/patternsleuth_bind/Cargo.toml")
     message(FATAL_ERROR
-        "The patternsleuth submodule is missing from UE4SS_ROOT. Initialize UE4SS submodules."
+        "The patternsleuth Rust sources are missing from UE4SS_ROOT. Initialize UE4SS submodules."
     )
 endif()
 

@@ -20,7 +20,7 @@
 #include <Input/Handler.hpp>
 #include <Mod/CppUserModBase.hpp>
 #include <UE4SSProgram.hpp>
-#include <Unreal/CoreUObject/UObject/UnrealType.hpp>
+#include <Unreal/FProperty.hpp>
 #include <Unreal/UObject.hpp>
 #include <Unreal/UObjectGlobals.hpp>
 
@@ -175,12 +175,11 @@ namespace QuantumCheckpoint
             BattleInventory inventory{};
             inventory.captured_at_utc = utc_timestamp();
 
-            UObjectGlobals::ForEachUObject([&](void* raw_object, [[maybe_unused]] int32_t chunk_index,
-                                                [[maybe_unused]] int32_t object_index) {
-                auto* object = static_cast<UObject*>(raw_object);
+            UObjectGlobals::ForEachUObject([&](UObject* object, [[maybe_unused]] int32_t object_index,
+                                                [[maybe_unused]] int32_t chunk_index) {
                 if (!object)
                 {
-                    return;
+                    return LoopAction::Continue;
                 }
 
                 const std::string full_name = to_string(object->GetFullName());
@@ -188,7 +187,7 @@ namespace QuantumCheckpoint
                 const bool game_instance = role == "GI_Quantum_C";
                 if (role.empty() || (!game_instance && !is_live_level_instance(full_name)))
                 {
-                    return;
+                    return LoopAction::Continue;
                 }
 
                 ObjectSnapshot snapshot{.role = role, .full_name = full_name};
@@ -213,6 +212,7 @@ namespace QuantumCheckpoint
                     });
                 }
                 inventory.objects.push_back(std::move(snapshot));
+                return LoopAction::Continue;
             });
 
             return inventory;

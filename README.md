@@ -57,7 +57,7 @@ F:\SteamLibrary\steamapps\common\Quantum Protocol
 
 `Ctrl+F1` 敌人清空/重建实验已移除：实测会先触发原生小关完成逻辑，从而直接进入下一小关。UE4SS 热重载也已在随附配置中关闭；修改 Lua 后请完全退出并重启游戏。
 
-C++ 构建前提、当前工具链缺口和反射结构提取方法见 [C++ 开发说明](docs/cpp-development.md)。
+C++ 构建前提、已验证工具链和反射结构提取方法见 [C++ 开发说明](docs/cpp-development.md)。
 
 不要在 UE4SS 3.0.1 Lua 中调用 `GI_Quantum_C:getActiveDecklist()`。它在传递大型 `Decklist` 返回结构时会导致原生访问冲突，原 `Ctrl+F4` 诊断入口已移除。
 

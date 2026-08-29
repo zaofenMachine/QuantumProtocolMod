@@ -20,16 +20,21 @@ vendor/RE-UE4SS-v3.0.1
 
 第三方源码、生成头文件和构建产物都位于被忽略的目录，不进入本仓库。
 
-## 当前环境缺口
+## 已验证的构建环境
 
-2026-08-29 的检查结果：
+2026-08-30 已完成并实际通过全量编译：
 
-- 本机未发现 CMake、MSVC、MSBuild、Ninja 或 clang-cl。
-- zDEV 发布包只有运行时 DLL/PDB，没有构建 C++ Mod 所需的头文件和导入目标。
-- 官方 `v3.0.1` 源码可以下载，但 `deps/first/Unreal`（UEPseudo）是受限子模块。
-- 当前 GitHub 凭据访问 UEPseudo 返回 `Repository not found`。
+- Visual Studio 2022 Build Tools `17.14.39`。
+- 固定使用 MSVC v143 `14.38.33130`（编译器 `19.38.33145`）。UE4SS v3.0.1 的旧 UEPseudo 源码不能直接通过本机最新的 MSVC `14.44` 编译，因此两个工具集并排保留。
+- Visual Studio 自带 CMake `3.31.6-msvc6`；脚本会自动发现它，不要求 `cmake.exe` 位于终端 `PATH`。
+- Windows SDK `10.0.28000.0`。这是 Windows 11 SDK，但 CMake 已验证能以 Windows `10.0.19045` 为目标构建，无需另外安装 Windows 10 SDK。
+- Rust `nightly-2024-02-14-x86_64-pc-windows-msvc`，用于编译 UE4SS 的 `patternsleuth_bind`。
+- RE-UE4SS v3.0.1：`d935b5b23bac03b65c14ae38382b02007204cc2e`。
+- UEPseudo：`d09b7218bfe7392adeffb500fdeee0b42ca1cd27`；patternsleuth：`33e731e99f2a6bb7f65a8e95e89fd1c06ce9d1d2`。
 
-UE4SS 官方流程要求 GitHub 账号与 Epic Games 账号关联，并接受 EpicGames GitHub 组织邀请，随后才能初始化全部子模块。缺少 UEPseudo 时，CMake 会主动中止并给出明确错误，避免产生与当前 UE4SS 二进制不兼容的 DLL。
+UEPseudo 的授权访问已通过 GitHub SSH 验证。构建脚本只在自身的子进程中把 GitHub HTTPS URL 改写为 SSH，不修改用户的全局 Git 配置。
+
+UE4SS v3.0.1 还把两个 FetchContent 依赖指向可移动分支。顶层工程已把 `ImGuiColorTextEdit` 和 `IconFontCppHeaders` 固定到 v3.0.1 发布时期的提交，避免上游分支变化破坏历史构建。
 
 ## 环境检查与构建
 
@@ -45,7 +50,17 @@ UE4SS 官方流程要求 GitHub 账号与 Epic Games 账号关联，并接受 Ep
 .\scripts\Build-CppMod.ps1
 ```
 
-构建配置默认为 `Game__Shipping__Win64`。生成 DLL 后仍需单独经过安装脚本和启动验证；在成功构建前，当前游戏只运行 Lua 研究探针。
+构建配置默认为 `Game__Shipping__Win64`。生成 DLL 后仍需单独经过安装脚本和启动验证；当前游戏仍只运行 Lua 研究探针，尚未加载这份 C++ DLL。
+
+当前已验证产物：
+
+```text
+build/cpp-vs17-14.38/Output/Game__Shipping__Win64/bin/QuantumCheckpoint.dll
+```
+
+首次构建会下载并编译 UE4SS 的第三方依赖，耗时明显长于增量构建。构建脚本固定 Visual Studio 17 生成器、MSVC 14.38、UE4SS 的六种多配置名称和 Rust nightly，以规避旧版 Corrosion 在首次配置时产生空输出目录的问题。
+
+2026-08-30 的本地产物静态核验结果：x64 DLL，大小 `429056` 字节，导出 `start_mod` 与 `uninstall_mod`，SHA-256 为 `435C67C5C9C3170B4BD3C0CE3FBD65AD4B5A9F66EB0AA30DD748687955318F54`。构建产物不提交仓库，也尚未部署到游戏；下一步需先增加可回滚的安装流程，再由玩家手动启动游戏测试 `Ctrl+F11`。
 
 ## 生成游戏 CXX 头文件
 
