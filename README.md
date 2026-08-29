@@ -16,6 +16,7 @@
 - [需求基线](docs/requirements.md)
 - [架构路线对比](docs/architecture-options.md)
 - [技术状态与实验结论](docs/technical-status.md)
+- [CXX SDK 分析](docs/sdk-analysis.md)
 - [文档索引](docs/README.md)
 
 ## 目录
