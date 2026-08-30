@@ -7,8 +7,8 @@
 - 游戏：Quantum Protocol，Windows / Unreal Engine 4。
 - 已测试安装目录：`F:\SteamLibrary\steamapps\common\Quantum Protocol`。
 - 注入/反射工具：UE4SS 3.0.1 zDEV。
-- 当前实现：UE4SS Lua 研究探针；只保存内存快照，不具备跨进程恢复。
-- 正式跨进程恢复倾向 UE4SS C++ Mod。第一版只读反射导出器已使用 RE-UE4SS v3.0.1、UEPseudo、MSVC 14.38 和固定 Rust nightly 成功构建；当前 DLL 尚未部署进游戏。
+- 当前实现：UE4SS Lua 研究探针加 C++ 只读反射导出器；尚不具备跨进程恢复。
+- 正式跨进程恢复倾向 UE4SS C++ Mod。第一版只读反射导出器已使用 RE-UE4SS v3.0.1、UEPseudo、MSVC 14.38 和固定 Rust nightly 成功构建，并已通过可回滚脚本部署到游戏目录；尚待首次进程内加载与 `Ctrl+F11` 导出验证。
 - Windows 11 SDK `10.0.28000.0` 已被 CMake 正确选中并以 Windows `10.0.19045` 为目标完成构建，不需要额外安装 Windows 10 SDK。
 - 已在战斗场景成功生成 CXX SDK：662 个头文件，关键 Quantum 类、结构和函数签名均已取得。详细证据见 [sdk-analysis.md](sdk-analysis.md)。
 
@@ -94,7 +94,7 @@ CXX SDK 进一步确认：已公开的卡牌状态修改函数主要是 `Action_
 
 ## 下一步需要获得的证据
 
-1. 为已生成的只读 C++ DLL 增加可回滚安装流程，并在游戏中验证加载与 `Ctrl+F11` 导出，不执行恢复。
+1. 在游戏中验证已部署 C++ DLL 的加载与 `Ctrl+F11` 导出，不执行恢复。
 2. 用 C++ 只读导出 `GameDeckRun` 的完整牌组、缓存区和全部升级字段，不经过 Lua 大结构返回值。
 3. 只读导出敌人全部实例状态、持续效果、生成控制器子类和关卡辅助 Actor。
 4. 验证从菜单进入指定流程/关卡的安全路径。

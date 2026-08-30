@@ -50,7 +50,7 @@ UE4SS v3.0.1 还把两个 FetchContent 依赖指向可移动分支。顶层工�
 .\scripts\Build-CppMod.ps1
 ```
 
-构建配置默认为 `Game__Shipping__Win64`。生成 DLL 后仍需单独经过安装脚本和启动验证；当前游戏仍只运行 Lua 研究探针，尚未加载这份 C++ DLL。
+构建配置默认为 `Game__Shipping__Win64`。生成 DLL 后仍需单独经过安装脚本和启动验证；C++ 模块可以与现有 Lua 研究探针并行加载。
 
 当前已验证产物：
 
@@ -60,7 +60,22 @@ build/cpp-vs17-14.38/Output/Game__Shipping__Win64/bin/QuantumCheckpoint.dll
 
 首次构建会下载并编译 UE4SS 的第三方依赖，耗时明显长于增量构建。构建脚本固定 Visual Studio 17 生成器、MSVC 14.38、UE4SS 的六种多配置名称和 Rust nightly，以规避旧版 Corrosion 在首次配置时产生空输出目录的问题。
 
-2026-08-30 的本地产物静态核验结果：x64 DLL，大小 `429056` 字节，导出 `start_mod` 与 `uninstall_mod`，SHA-256 为 `435C67C5C9C3170B4BD3C0CE3FBD65AD4B5A9F66EB0AA30DD748687955318F54`。构建产物不提交仓库，也尚未部署到游戏；下一步需先增加可回滚的安装流程，再由玩家手动启动游戏测试 `Ctrl+F11`。
+2026-08-30 的本地产物静态核验结果：x64 DLL，大小 `429056` 字节，导出 `start_mod` 与 `uninstall_mod`，SHA-256 为 `435C67C5C9C3170B4BD3C0CE3FBD65AD4B5A9F66EB0AA30DD748687955318F54`。构建产物不提交仓库。
+
+可回滚部署流程：
+
+```powershell
+.\scripts\Install-CppMod.ps1 -DryRun
+.\scripts\Install-CppMod.ps1
+```
+
+安装器在游戏进程存在时拒绝写入。它按 UE4SS v3.0.1 的要求将产物复制为 `Mods/QuantumCheckpoint/dlls/main.dll`，更新现有 `mods.txt`，并记录 DLL 和 `mods.txt` 的备份及散列。回滚使用：
+
+```powershell
+.\scripts\Uninstall-CppMod.ps1
+```
+
+回滚器只覆盖仍与部署散列一致的文件；若 `mods.txt` 后来有其他改动，则保留那些改动并只把 `QuantumCheckpoint` 设为禁用。DLL 删除也通过移动到备份目录完成。
 
 ## 生成游戏 CXX 头文件
 
