@@ -19,12 +19,13 @@
 - [CXX SDK 分析](docs/sdk-analysis.md)
 - [C++ 只读导出实验](docs/phase-3-cpp-readonly-export.md)
 - [原生卡牌状态验证](docs/phase-4-native-card-state.md)
+- [受控生命值写入验证](docs/phase-5-guarded-health-write.md)
 - [文档索引](docs/README.md)
 
 ## 目录
 
 - `src/QuantumCheckpointProbe`：UE4SS Lua 研究原型。
-- `cpp/QuantumCheckpoint`：只读战斗状态导出器的 C++ 源码；已在本机构建通过。
+- `cpp/QuantumCheckpoint`：战斗状态导出器与受控原生写入探针的 C++ 源码；已在本机构建并实测。
 - `deployment`：开发探针使用的 UE4SS 配置。
 - `scripts`：安装、卸载和收集日志的 PowerShell 脚本。
 - `docs`：需求、架构决策和阶段实验记录。
@@ -61,7 +62,7 @@ Lua 版 `Ctrl+F1` 敌人清空/重建实验已移除：实测会先触发原生�
 
 C++ 构建前提、已验证工具链和反射结构提取方法见 [C++ 开发说明](docs/cpp-development.md)。
 
-## C++ 只读导出器
+## C++ 研究模块
 
 构建并进行无写入部署检查：
 
@@ -76,7 +77,9 @@ C++ 构建前提、已验证工具链和反射结构提取方法见 [C++ 开发�
 .\scripts\Install-CppMod.ps1
 ```
 
-安装器会把 DLL 部署为 `Mods\QuantumCheckpoint\dlls\main.dll`，在现有 `mods.txt` 中加入 `QuantumCheckpoint : 1`，并把精确回滚材料保存在被 Git 忽略的 `backups/cpp` 与 `runtime` 目录。它不会禁用 Lua 研究探针。进入战斗后按 `Ctrl+F1`，只读报告应生成到 `Mods\QuantumCheckpoint\Reports`。
+安装器会把 DLL 部署为 `Mods\QuantumCheckpoint\dlls\main.dll`，在现有 `mods.txt` 中加入 `QuantumCheckpoint : 1`，并把精确回滚材料保存在被 Git 忽略的 `backups/cpp` 与 `runtime` 目录。若旧 Lua 研究探针存在，安装器会在本次 C++ 部署中将其禁用，避免破坏性研究热键与 C++ 实验冲突；回滚时会恢复部署前配置。进入战斗后按 `Ctrl+F1`，只读报告应生成到 `Mods\QuantumCheckpoint\Reports`。
+
+当前 v0.6.1 还提供 `Ctrl+Shift+F12` 受控写入探针，只能用于可丢弃流程中的受伤存活卡。它临时把私有当前生命加 1、直接读回并立即恢复，在恢复前不调用反射函数。该实验已成功，但不等于检查点恢复已经可用，详见 [第五阶段报告](docs/phase-5-guarded-health-write.md)。
 
 回滚 C++ 模块：
 

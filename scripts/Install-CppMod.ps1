@@ -40,6 +40,7 @@ $modsText = [System.IO.File]::ReadAllText($modsFile)
 $lineEnding = if ($modsText.Contains("`r`n")) { "`r`n" } else { "`n" }
 $lines = [System.Text.RegularExpressions.Regex]::Split($modsText, '\r?\n')
 $modLinePattern = '^\s*QuantumCheckpoint\s*:\s*[01]\s*(?:;.*)?$'
+$luaProbeLinePattern = '^\s*QuantumCheckpointProbe\s*:\s*[01]\s*(?:;.*)?$'
 $matchingIndexes = @()
 for ($index = 0; $index -lt $lines.Count; $index++) {
     if ($lines[$index] -match $modLinePattern) {
@@ -75,12 +76,26 @@ if ($matchingIndexes.Count -eq 1) {
     }
     $lines = $updatedLines.ToArray()
 }
+
+$luaProbeIndexes = @()
+for ($index = 0; $index -lt $lines.Count; $index++) {
+    if ($lines[$index] -match $luaProbeLinePattern) {
+        $luaProbeIndexes += $index
+    }
+}
+if ($luaProbeIndexes.Count -gt 1) {
+    throw "mods.txt contains more than one QuantumCheckpointProbe entry. Resolve the duplicate entries before installing: $modsFile"
+}
+if ($luaProbeIndexes.Count -eq 1) {
+    $lines[$luaProbeIndexes[0]] = 'QuantumCheckpointProbe : 0'
+}
 $updatedModsText = [string]::Join($lineEnding, $lines)
 
 Write-Host "Source DLL: $resolvedDllPath"
 Write-Host "Source SHA-256: $sourceHash"
 Write-Host "Target DLL: $targetDll"
 Write-Host 'UE4SS load entry: QuantumCheckpoint : 1'
+Write-Host 'Legacy Lua probe: disabled when present to prevent destructive hotkey conflicts'
 if ($DryRun) {
     Write-Host 'Dry run completed. No files were changed.'
     exit 0
@@ -141,4 +156,4 @@ Move-Item -LiteralPath $temporaryManifest -Destination $activeManifest
 Write-Host "Installed QuantumCheckpoint C++ mod: $targetDll"
 Write-Host "Deployment manifest: $activeManifest"
 Write-Host "Rollback backup: $backupRoot"
-Write-Host 'The existing QuantumCheckpointProbe Lua mod remains enabled.'
+Write-Host 'The legacy QuantumCheckpointProbe Lua mod is disabled for this C++ deployment.'

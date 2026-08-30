@@ -34,7 +34,7 @@ vendor/RE-UE4SS-v3.0.1
 
 UEPseudo 的授权访问已通过 GitHub SSH 验证。构建脚本只在自身的子进程中把 GitHub HTTPS URL 改写为 SSH，不修改用户的全局 Git 配置。
 
-UE4SS v3.0.1 还把两个 FetchContent 依赖指向可移动分支。顶层工程已把 `ImGuiColorTextEdit` 和 `IconFontCppHeaders` 固定到 v3.0.1 发布时期的提交，避免上游分支变化破坏历史构建。
+UE4SS v3.0.1 还把多个 FetchContent 依赖指向可移动分支。顶层工程已把 `ImGuiColorTextEdit`、`IconFontCppHeaders` 和 Tracy 固定到已验证的历史提交，避免上游分支变化或新版 CMake 最低版本要求破坏历史构建。
 
 ## 环境检查与构建
 
@@ -65,6 +65,8 @@ build/cpp-vs17-14.38/Output/Game__Shipping__Win64/bin/QuantumCheckpoint.dll
 v0.3 已在真实战斗中导出 99 个对象且无崩溃，包括完整玩家运行牌组、各牌区实例、20 个场上槽位、敌方实例、效果显示与通用/特殊计数器。详细结果见 [phase-3-cpp-readonly-export.md](phase-3-cpp-readonly-export.md)。
 
 v0.4 记录 getter 原生地址并完成离线调用链分析；v0.5 只读导出私有卡牌状态。在包含 17 张活动卡、敌我受伤、三个敌人与全部主要玩家牌区的复杂样本中，私有生命/回合字段与公开 getter 逐张一致。偏移只适用于已记录 SHA-256 的当前游戏 EXE，详见 [phase-4-native-card-state.md](phase-4-native-card-state.md)。
+
+v0.6.1 加入带 EXE 大小、getter RVA、setter 机器码、内存页权限和数值范围门禁的生命写入探针。实测目标生命 `1→2→1`，临时值直接读回和恢复后公开 getter 均符合预期，无崩溃或残留变化。该版本 DLL 大小为 `470016` 字节，部署 SHA-256 为 `DE43B09134181B90FA82B619C799A1FA69F0B51B81AC3ED0D1317601A058A2F6`。详细安全边界见 [phase-5-guarded-health-write.md](phase-5-guarded-health-write.md)。
 
 可回滚部署流程：
 
