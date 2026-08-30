@@ -15,5 +15,6 @@
 - [phase-2-player-reset-test.md](phase-2-player-reset-test.md)：玩家牌区清空与原生重载测试。
 - [phase-2-reprogram-anchor.md](phase-2-reprogram-anchor.md)：重编程锚点实验小结。
 - [phase-3-cpp-readonly-export.md](phase-3-cpp-readonly-export.md)：C++ getter、精确槽位、效果与计数器导出验证。
+- [phase-4-native-card-state.md](phase-4-native-card-state.md)：游戏私有卡牌状态布局、EXE 指纹与复杂样本交叉验证。
 
 维护规则：需求发生变化时先更新 `requirements.md`；技术实验产生新证据时更新 `technical-status.md` 并补充对应阶段报告；正式选定恢复路线后在 `architecture-options.md` 记录决定与理由。

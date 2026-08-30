@@ -60,9 +60,11 @@ build/cpp-vs17-14.38/Output/Game__Shipping__Win64/bin/QuantumCheckpoint.dll
 
 首次构建会下载并编译 UE4SS 的第三方依赖，耗时明显长于增量构建。构建脚本固定 Visual Studio 17 生成器、MSVC 14.38、UE4SS 的六种多配置名称和 Rust nightly，以规避旧版 Corrosion 在首次配置时产生空输出目录的问题。
 
-2026-08-30 已完成三版运行验证。当前 v0.3/schema 3 本地产物为 x64 DLL，大小 `443392` 字节，导出 `start_mod` 与 `uninstall_mod`，部署 SHA-256 为 `07151909FFB2C8C08A8B28981D5011D2C6F337A185FB60353F271E73B971968B`。构建产物不提交仓库；重新构建后散列可以变化。
+2026-08-31 已完成五版运行验证。当前已验证的 v0.5/schema 5 本地产物为 x64 DLL，大小 `449536` 字节，导出 `start_mod` 与 `uninstall_mod`，部署 SHA-256 为 `8332C4D2F3E65FCA389E8A53AD63531146493D1A5B7B4F438010B7D552A0FEAD`。构建产物不提交仓库；重新构建后散列可以变化。
 
 v0.3 已在真实战斗中导出 99 个对象且无崩溃，包括完整玩家运行牌组、各牌区实例、20 个场上槽位、敌方实例、效果显示与通用/特殊计数器。详细结果见 [phase-3-cpp-readonly-export.md](phase-3-cpp-readonly-export.md)。
+
+v0.4 记录 getter 原生地址并完成离线调用链分析；v0.5 只读导出私有卡牌状态。在包含 17 张活动卡、敌我受伤、三个敌人与全部主要玩家牌区的复杂样本中，私有生命/回合字段与公开 getter 逐张一致。偏移只适用于已记录 SHA-256 的当前游戏 EXE，详见 [phase-4-native-card-state.md](phase-4-native-card-state.md)。
 
 可回滚部署流程：
 

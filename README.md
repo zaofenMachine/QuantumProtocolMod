@@ -18,6 +18,7 @@
 - [技术状态与实验结论](docs/technical-status.md)
 - [CXX SDK 分析](docs/sdk-analysis.md)
 - [C++ 只读导出实验](docs/phase-3-cpp-readonly-export.md)
+- [原生卡牌状态验证](docs/phase-4-native-card-state.md)
 - [文档索引](docs/README.md)
 
 ## 目录

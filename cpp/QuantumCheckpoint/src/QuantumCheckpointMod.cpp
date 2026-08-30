@@ -3,7 +3,9 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <ctime>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -159,6 +161,15 @@ namespace QuantumCheckpoint
             STR("getCurrentCounters"),
         };
 
+        // Native diagnostics for Quantum-Win64-Shipping.exe SHA-256
+        // 0DCF220317FA31667C14DD7FB41A6757B94FF7CDE2262E5A87337D00CCB017A6.
+        // These are read-only corroboration fields, not a supported checkpoint format.
+        constexpr std::size_t InGameCardStatePointerOffset = 0x228;
+        constexpr std::size_t CardStateBaseHealthOffset = 0x118;
+        constexpr std::size_t CardStateCurrentHealthOffset = 0x11C;
+        constexpr std::size_t CardStateTurnAdjustmentOffset = 0x194;
+        constexpr std::size_t CardStateTurnBaseOffset = 0x198;
+
         auto json_escape(std::string_view value) -> std::string
         {
             std::string escaped{};
@@ -311,6 +322,71 @@ namespace QuantumCheckpoint
             };
         }
 
+        auto export_function_pointer(UObject* object, StringViewType function_name)
+            -> std::optional<PropertySnapshot>
+        {
+            auto* function = object->GetFunctionByNameInChain(function_name.data());
+            if (!function)
+            {
+                return std::nullopt;
+            }
+
+            const auto address = reinterpret_cast<std::uintptr_t>(function->GetFuncPtr());
+            std::ostringstream value{};
+            value << "0x" << std::hex << std::uppercase << address;
+            return PropertySnapshot{
+                .name = "functionPointer:" + to_string(function_name),
+                .value = value.str(),
+            };
+        }
+
+        template <typename ValueType>
+        auto read_native_value(const void* base, std::size_t offset) -> ValueType
+        {
+            ValueType value{};
+            std::memcpy(
+                &value,
+                static_cast<const std::byte*>(base) + offset,
+                sizeof(ValueType));
+            return value;
+        }
+
+        auto append_private_card_state_diagnostics(ObjectSnapshot& snapshot, UObject* object) -> void
+        {
+            const auto* state = read_native_value<const void*>(
+                object,
+                InGameCardStatePointerOffset);
+            if (!state)
+            {
+                snapshot.properties.push_back({
+                    .name = "nativeDiagnostic:stateObject",
+                    .value = "null",
+                });
+                return;
+            }
+
+            std::ostringstream state_address{};
+            state_address << "0x" << std::hex << std::uppercase
+                          << reinterpret_cast<std::uintptr_t>(state);
+            snapshot.properties.push_back({
+                .name = "nativeDiagnostic:stateObject",
+                .value = state_address.str(),
+            });
+
+            const auto base_health = read_native_value<std::int32_t>(state, CardStateBaseHealthOffset);
+            const auto current_health = read_native_value<std::int32_t>(state, CardStateCurrentHealthOffset);
+            const auto turn_adjustment = read_native_value<std::int32_t>(state, CardStateTurnAdjustmentOffset);
+            const auto turn_base = read_native_value<std::int32_t>(state, CardStateTurnBaseOffset);
+            snapshot.properties.push_back({"nativeDiagnostic:baseHealth", std::to_string(base_health)});
+            snapshot.properties.push_back({"nativeDiagnostic:currentHealth", std::to_string(current_health)});
+            snapshot.properties.push_back({"nativeDiagnostic:turnAdjustment", std::to_string(turn_adjustment)});
+            snapshot.properties.push_back({"nativeDiagnostic:turnBase", std::to_string(turn_base)});
+            snapshot.properties.push_back({
+                "nativeDiagnostic:computedTurnCounter",
+                std::to_string(turn_adjustment + turn_base),
+            });
+        }
+
         template <std::size_t Size>
         auto append_getters(ObjectSnapshot& snapshot, UObject* object,
                             const std::array<StringViewType, Size>& getters) -> void
@@ -320,6 +396,10 @@ namespace QuantumCheckpoint
                 if (auto exported = export_zero_argument_getter(object, getter))
                 {
                     snapshot.properties.push_back(std::move(*exported));
+                }
+                if (auto pointer = export_function_pointer(object, getter))
+                {
+                    snapshot.properties.push_back(std::move(*pointer));
                 }
             }
         }
@@ -377,6 +457,7 @@ namespace QuantumCheckpoint
                 }
                 else if (role == "BP_InGameCard_C")
                 {
+                    append_private_card_state_diagnostics(snapshot, object);
                     append_getters(snapshot, object, InGameCardGetters);
                 }
                 else if (role == "BP_CardEngine_C")
@@ -501,7 +582,7 @@ namespace QuantumCheckpoint
         QuantumCheckpointMod()
         {
             ModName = STR("QuantumCheckpoint");
-            ModVersion = STR("0.3.0-dev");
+            ModVersion = STR("0.5.0-dev");
             ModDescription = STR("Read-only battle inventory groundwork for persistent checkpoints");
             ModAuthors = STR("zaofenMachine and contributors");
             ModIntendedSDKVersion = STR("3.0.1");
