@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -21,6 +22,7 @@
 #include <Mod/CppUserModBase.hpp>
 #include <UE4SSProgram.hpp>
 #include <Unreal/FProperty.hpp>
+#include <Unreal/UFunction.hpp>
 #include <Unreal/UObject.hpp>
 #include <Unreal/UObjectGlobals.hpp>
 
@@ -34,7 +36,7 @@ namespace QuantumCheckpoint
         std::atomic_bool g_export_requested{false};
         std::atomic_bool g_unreal_ready{false};
 
-        constexpr std::array<std::string_view, 11> RelevantClassPrefixes{
+        constexpr std::array<std::string_view, 17> RelevantClassPrefixes{
             "BP_CardEngine_C ",
             "BP_BottomBar_C ",
             "BP_ControllerDeck_C ",
@@ -46,19 +48,33 @@ namespace QuantumCheckpoint
             "BP_ControllerTrash_C ",
             "BP_InGameCard_C ",
             "GI_Quantum_C ",
+            "CardPlacementComponent ",
+            "BP_FieldSlot_C ",
+            "BP_CardEffectDisplay_C ",
+            "BP_GenericCounterDisplay_C ",
+            "BP_SpecialCounterDisplay_C ",
+            "UMG_CardEffectDisplay_C ",
         };
 
-        constexpr std::array<StringViewType, 35> CandidateProperties{
+        constexpr std::array<StringViewType, 60> CandidateProperties{
             STR("currentWaveIndex"),
             STR("lastWaveIndex"),
             STR("currentTurnCountdown"),
             STR("waveIndex"),
             STR("waveNumber"),
             STR("waveCountdownPenalty"),
+            STR("currentWaveAlertCounter"),
+            STR("amountPerWaveAlertLevel"),
+            STR("maxWaveAlertStacks"),
+            STR("autoSpawn"),
+            STR("spawnList"),
             STR("currentHealth"),
             STR("maxHealth"),
             STR("health"),
             STR("currentGameState"),
+            STR("isEnemyBoardPenaltyOn"),
+            STR("startingHandSize"),
+            STR("playtime"),
             STR("deckRun"),
             STR("deckrunId"),
             STR("deck"),
@@ -69,6 +85,12 @@ namespace QuantumCheckpoint
             STR("levelName"),
             STR("levelTag"),
             STR("levelToLoad"),
+            STR("CurrentLevel"),
+            STR("sourceLevelName"),
+            STR("secondaryLevelToGoto"),
+            STR("lastLevelChangeType"),
+            STR("activeCharacterInfo"),
+            STR("activeStageInfo"),
             STR("cardInstanceList"),
             STR("cardInstances"),
             STR("cardInfoInstance"),
@@ -77,6 +99,13 @@ namespace QuantumCheckpoint
             STR("currentTurnCounter"),
             STR("turnCounter"),
             STR("CardPlacementComponent"),
+            STR("cardOverlayGenericCounters"),
+            STR("cardOverlaySpecialCounters"),
+            STR("cardOverlayEffects"),
+            STR("mCardEffectWidget"),
+            STR("EffectType"),
+            STR("activationBlockers"),
+            STR("isAutomationHighlighted"),
             STR("cardModifiers"),
             STR("modifiers"),
             STR("tag"),
@@ -84,6 +113,50 @@ namespace QuantumCheckpoint
             STR("id"),
             STR("Id"),
             STR("upgradeLevel"),
+            STR("rowType"),
+            STR("SlotIndex"),
+            STR("boardSide"),
+        };
+
+        constexpr std::array<StringViewType, 3> GameInstanceGetters{
+            STR("getCurrentDeckRun"),
+            STR("getActiveDecklistInstances"),
+            STR("getActiveStorage"),
+        };
+
+        constexpr std::array<StringViewType, 1> CardGroupGetters{
+            STR("getCardInstanceListSorted"),
+        };
+
+        constexpr std::array<StringViewType, 6> InGameCardGetters{
+            STR("getTag"),
+            STR("getId"),
+            STR("getCurrentTurnCounter"),
+            STR("getCurrentHealth"),
+            STR("getCardLocation"),
+            STR("getCardInfoInstance"),
+        };
+
+        constexpr std::array<StringViewType, 3> CardEngineGetters{
+            STR("getTurnCount"),
+            STR("getCurrentMaxTurnCountdown"),
+            STR("getCurrentHealth"),
+        };
+
+        constexpr std::array<StringViewType, 1> PlacementComponentGetters{
+            STR("getPlacedFieldSlot"),
+        };
+
+        constexpr std::array<StringViewType, 1> FieldSlotGetters{
+            STR("getPlacementInfo"),
+        };
+
+        constexpr std::array<StringViewType, 1> EffectDisplayGetters{
+            STR("getEffectActionState"),
+        };
+
+        constexpr std::array<StringViewType, 1> CounterDisplayGetters{
+            STR("getCurrentCounters"),
         };
 
         auto json_escape(std::string_view value) -> std::string
@@ -146,11 +219,29 @@ namespace QuantumCheckpoint
             return stream.str();
         }
 
-        auto is_live_level_instance(std::string_view full_name) -> bool
+        auto is_live_instance(std::string_view full_name, std::string_view role) -> bool
         {
-            return full_name.contains(":PersistentLevel.")
-                && !full_name.contains("Default__")
-                && !full_name.contains("_GEN_VARIABLE");
+            if (full_name.contains("Default__"))
+            {
+                return false;
+            }
+
+            if (role == "UMG_CardEffectDisplay_C")
+            {
+                return full_name.contains(":PersistentLevel.")
+                    || full_name.contains("/Engine/Transient.");
+            }
+
+            if (!full_name.contains(":PersistentLevel."))
+            {
+                return false;
+            }
+
+            const bool child_actor_state = role == "BP_FieldSlot_C"
+                || role == "BP_CardEffectDisplay_C"
+                || role == "BP_GenericCounterDisplay_C"
+                || role == "BP_SpecialCounterDisplay_C";
+            return child_actor_state || !full_name.contains("_GEN_VARIABLE");
         }
 
         auto classify(std::string_view full_name) -> std::string
@@ -170,6 +261,69 @@ namespace QuantumCheckpoint
             return {};
         }
 
+        auto export_zero_argument_getter(UObject* object, StringViewType function_name)
+            -> std::optional<PropertySnapshot>
+        {
+            auto* function = object->GetFunctionByNameInChain(function_name.data());
+            if (!function)
+            {
+                return std::nullopt;
+            }
+
+            auto* return_property = function->GetReturnProperty();
+            if (!return_property)
+            {
+                return std::nullopt;
+            }
+
+            for (auto* property : function->ForEachProperty())
+            {
+                if (property->HasAnyPropertyFlags(CPF_Parm)
+                    && !property->HasAnyPropertyFlags(CPF_ReturnParm))
+                {
+                    return std::nullopt;
+                }
+            }
+
+            const auto parameter_size = static_cast<std::size_t>(function->GetParmsSize());
+            if (parameter_size == 0)
+            {
+                return std::nullopt;
+            }
+
+            Output::send<LogLevel::Verbose>(
+                STR("[QuantumCheckpoint] Read-only call {} on {}\n"),
+                function_name,
+                object->GetFullName());
+
+            std::vector<uint8_t> parameters(parameter_size, 0);
+            object->ProcessEvent(function, parameters.data());
+
+            FString exported{};
+            auto* return_value = return_property->ContainerPtrToValuePtr<void>(parameters.data());
+            return_property->ExportTextItem(exported, return_value, nullptr, object, 0);
+            std::string value = to_string(exported.GetCharArray());
+            return_property->DestroyValue_InContainer(parameters.data());
+
+            return PropertySnapshot{
+                .name = "getter:" + to_string(function_name),
+                .value = std::move(value),
+            };
+        }
+
+        template <std::size_t Size>
+        auto append_getters(ObjectSnapshot& snapshot, UObject* object,
+                            const std::array<StringViewType, Size>& getters) -> void
+        {
+            for (const auto getter : getters)
+            {
+                if (auto exported = export_zero_argument_getter(object, getter))
+                {
+                    snapshot.properties.push_back(std::move(*exported));
+                }
+            }
+        }
+
         auto collect_inventory() -> BattleInventory
         {
             BattleInventory inventory{};
@@ -185,7 +339,7 @@ namespace QuantumCheckpoint
                 const std::string full_name = to_string(object->GetFullName());
                 const std::string role = classify(full_name);
                 const bool game_instance = role == "GI_Quantum_C";
-                if (role.empty() || (!game_instance && !is_live_level_instance(full_name)))
+                if (role.empty() || (!game_instance && !is_live_instance(full_name, role)))
                 {
                     return LoopAction::Continue;
                 }
@@ -210,6 +364,41 @@ namespace QuantumCheckpoint
                         .name = to_string(property_name),
                         .value = to_string(exported.GetCharArray()),
                     });
+                }
+
+                if (role == "GI_Quantum_C" && full_name.contains("/Engine/Transient."))
+                {
+                    append_getters(snapshot, object, GameInstanceGetters);
+                }
+                else if (role.starts_with("BP_Controller") && role != "BP_ControllerBoard_C"
+                         && role != "BP_FieldSlot_C")
+                {
+                    append_getters(snapshot, object, CardGroupGetters);
+                }
+                else if (role == "BP_InGameCard_C")
+                {
+                    append_getters(snapshot, object, InGameCardGetters);
+                }
+                else if (role == "BP_CardEngine_C")
+                {
+                    append_getters(snapshot, object, CardEngineGetters);
+                }
+                else if (role == "CardPlacementComponent")
+                {
+                    append_getters(snapshot, object, PlacementComponentGetters);
+                }
+                else if (role == "BP_FieldSlot_C")
+                {
+                    append_getters(snapshot, object, FieldSlotGetters);
+                }
+                else if (role == "BP_CardEffectDisplay_C")
+                {
+                    append_getters(snapshot, object, EffectDisplayGetters);
+                }
+                else if (role == "BP_GenericCounterDisplay_C"
+                         || role == "BP_SpecialCounterDisplay_C")
+                {
+                    append_getters(snapshot, object, CounterDisplayGetters);
                 }
                 inventory.objects.push_back(std::move(snapshot));
                 return LoopAction::Continue;
@@ -312,7 +501,7 @@ namespace QuantumCheckpoint
         QuantumCheckpointMod()
         {
             ModName = STR("QuantumCheckpoint");
-            ModVersion = STR("0.1.0-dev");
+            ModVersion = STR("0.3.0-dev");
             ModDescription = STR("Read-only battle inventory groundwork for persistent checkpoints");
             ModAuthors = STR("zaofenMachine and contributors");
             ModIntendedSDKVersion = STR("3.0.1");
@@ -321,12 +510,12 @@ namespace QuantumCheckpoint
         auto on_program_start() -> void override
         {
             UE4SSProgram::get_program().register_keydown_event(
-                Input::Key::F11,
+                Input::Key::F1,
                 {Input::ModifierKey::CONTROL},
                 []() { g_export_requested.store(true, std::memory_order_release); });
 
             Output::send<LogLevel::Verbose>(
-                STR("[QuantumCheckpoint] Loaded read-only C++ inventory prototype; Ctrl+F11 requests an export.\n"));
+                STR("[QuantumCheckpoint] Loaded read-only C++ inventory prototype; Ctrl+F1 requests an export.\n"));
         }
 
         auto on_unreal_init() -> void override

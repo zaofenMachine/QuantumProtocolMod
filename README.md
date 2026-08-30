@@ -17,6 +17,7 @@
 - [架构路线对比](docs/architecture-options.md)
 - [技术状态与实验结论](docs/technical-status.md)
 - [CXX SDK 分析](docs/sdk-analysis.md)
+- [C++ 只读导出实验](docs/phase-3-cpp-readonly-export.md)
 - [文档索引](docs/README.md)
 
 ## 目录
@@ -55,7 +56,7 @@ F:\SteamLibrary\steamapps\common\Quantum Protocol
 - `Ctrl+F9`：请求 UE4SS 完整对象转储。
 - `Ctrl+F10`：调用 UE4SS CXX Header Generator，把当前已加载类型导出到本地 `CXXHeaderDump`；建议进入战斗且状态稳定后使用。
 
-`Ctrl+F1` 敌人清空/重建实验已移除：实测会先触发原生小关完成逻辑，从而直接进入下一小关。UE4SS 热重载也已在随附配置中关闭；修改 Lua 后请完全退出并重启游戏。
+Lua 版 `Ctrl+F1` 敌人清空/重建实验已移除：实测会先触发原生小关完成逻辑，从而直接进入下一小关。当前 `Ctrl+F1` 由 C++ 只读导出器使用。UE4SS 热重载也已在随附配置中关闭；修改 Lua 或 C++ DLL 后请完全退出并重启游戏。
 
 C++ 构建前提、已验证工具链和反射结构提取方法见 [C++ 开发说明](docs/cpp-development.md)。
 
@@ -74,7 +75,7 @@ C++ 构建前提、已验证工具链和反射结构提取方法见 [C++ 开发�
 .\scripts\Install-CppMod.ps1
 ```
 
-安装器会把 DLL 部署为 `Mods\QuantumCheckpoint\dlls\main.dll`，在现有 `mods.txt` 中加入 `QuantumCheckpoint : 1`，并把精确回滚材料保存在被 Git 忽略的 `backups/cpp` 与 `runtime` 目录。它不会禁用 Lua 研究探针。进入战斗后按 `Ctrl+F11`，只读报告应生成到 `Mods\QuantumCheckpoint\Reports`。
+安装器会把 DLL 部署为 `Mods\QuantumCheckpoint\dlls\main.dll`，在现有 `mods.txt` 中加入 `QuantumCheckpoint : 1`，并把精确回滚材料保存在被 Git 忽略的 `backups/cpp` 与 `runtime` 目录。它不会禁用 Lua 研究探针。进入战斗后按 `Ctrl+F1`，只读报告应生成到 `Mods\QuantumCheckpoint\Reports`。
 
 回滚 C++ 模块：
 

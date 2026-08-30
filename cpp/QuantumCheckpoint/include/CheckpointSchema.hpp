@@ -5,7 +5,7 @@
 
 namespace QuantumCheckpoint
 {
-    inline constexpr int SchemaVersion = 1;
+    inline constexpr int SchemaVersion = 3;
 
     struct PropertySnapshot
     {

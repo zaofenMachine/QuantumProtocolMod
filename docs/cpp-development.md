@@ -8,7 +8,7 @@
 - 把当前战斗对象导出为带版本号的 JSON 状态报告。
 - 用报告确认完整卡组、缓存区、敌人实例和控制器究竟包含哪些字段，再决定恢复路线。
 
-`cpp/QuantumCheckpoint` 已包含第一版只读导出器源码。编译并安装后，`Ctrl+F11` 请求导出，文件写入 UE4SS 的 `Mods/QuantumCheckpoint/Reports`。导出器只读取属性，不调用卡牌、波次或生命修改函数。
+`cpp/QuantumCheckpoint` 已包含只读导出器源码。编译并安装后，`Ctrl+F1` 请求导出，文件写入 UE4SS 的 `Mods/QuantumCheckpoint/Reports`。导出器读取反射属性，并调用零参数、带返回值的只读 getter；不调用卡牌、波次或生命修改函数。旧版曾使用 `Ctrl+F11`，实测会同时触发游戏自身的窗口模式切换，因此已更换。
 
 ## 固定版本
 
@@ -60,7 +60,9 @@ build/cpp-vs17-14.38/Output/Game__Shipping__Win64/bin/QuantumCheckpoint.dll
 
 首次构建会下载并编译 UE4SS 的第三方依赖，耗时明显长于增量构建。构建脚本固定 Visual Studio 17 生成器、MSVC 14.38、UE4SS 的六种多配置名称和 Rust nightly，以规避旧版 Corrosion 在首次配置时产生空输出目录的问题。
 
-2026-08-30 的本地产物静态核验结果：x64 DLL，大小 `429056` 字节，导出 `start_mod` 与 `uninstall_mod`，SHA-256 为 `435C67C5C9C3170B4BD3C0CE3FBD65AD4B5A9F66EB0AA30DD748687955318F54`。构建产物不提交仓库。
+2026-08-30 已完成三版运行验证。当前 v0.3/schema 3 本地产物为 x64 DLL，大小 `443392` 字节，导出 `start_mod` 与 `uninstall_mod`，部署 SHA-256 为 `07151909FFB2C8C08A8B28981D5011D2C6F337A185FB60353F271E73B971968B`。构建产物不提交仓库；重新构建后散列可以变化。
+
+v0.3 已在真实战斗中导出 99 个对象且无崩溃，包括完整玩家运行牌组、各牌区实例、20 个场上槽位、敌方实例、效果显示与通用/特殊计数器。详细结果见 [phase-3-cpp-readonly-export.md](phase-3-cpp-readonly-export.md)。
 
 可回滚部署流程：
 
