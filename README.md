@@ -79,7 +79,7 @@ C++ 构建前提、已验证工具链和反射结构提取方法见 [C++ 开发�
 
 安装器会把 DLL 部署为 `Mods\QuantumCheckpoint\dlls\main.dll`，在现有 `mods.txt` 中加入 `QuantumCheckpoint : 1`，并把精确回滚材料保存在被 Git 忽略的 `backups/cpp` 与 `runtime` 目录。若旧 Lua 研究探针存在，安装器会在本次 C++ 部署中将其禁用，避免破坏性研究热键与 C++ 实验冲突；回滚时会恢复部署前配置。进入战斗后按 `Ctrl+F1`，只读报告应生成到 `Mods\QuantumCheckpoint\Reports`。
 
-当前 v0.6.1 还提供 `Ctrl+Shift+F12` 受控写入探针，只能用于可丢弃流程中的受伤存活卡。它临时把私有当前生命加 1、直接读回并立即恢复，在恢复前不调用反射函数。该实验已成功，但不等于检查点恢复已经可用，详见 [第五阶段报告](docs/phase-5-guarded-health-write.md)。
+当前 v0.7 还提供 `Ctrl+Shift+F12` 受控写入探针，只能用于可丢弃流程中的受伤存活卡。它把私有当前生命加 1、跨帧保持约一秒，并在重新验证对象身份和字段值后自动恢复。实测生命 UI 会同步增加并恢复，且无崩溃；该实验仍不等于完整检查点恢复已经可用，详见 [第五阶段报告](docs/phase-5-guarded-health-write.md)。
 
 回滚 C++ 模块：
 

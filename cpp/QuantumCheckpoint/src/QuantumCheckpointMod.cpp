@@ -180,6 +180,7 @@ namespace QuantumCheckpoint
         constexpr std::uintmax_t ExpectedGameExecutableSize = 82'718'720;
         constexpr std::uintptr_t CurrentHealthGetterThunkRva = 0x102D100;
         constexpr std::uintptr_t SetCurrentHealthRva = 0xE522E0;
+        constexpr auto TimedHealthProbeHold = std::chrono::milliseconds{1000};
         constexpr std::array<std::uint8_t, 7> SetCurrentHealthSignature{
             0x89, 0x91, 0x1C, 0x01, 0x00, 0x00, 0xC3,
         };
@@ -199,6 +200,10 @@ namespace QuantumCheckpoint
             std::int32_t test_value{};
             std::int32_t during_private{};
             std::int32_t during_getter{};
+            std::int64_t requested_hold_milliseconds{};
+            std::int64_t actual_hold_milliseconds{};
+            bool restore_identity_validated{};
+            std::int32_t before_restore_private{};
             std::int32_t restored_private{};
             std::int32_t restored_getter{};
         };
@@ -220,6 +225,18 @@ namespace QuantumCheckpoint
                 }
             }
         };
+
+        struct PendingHealthWriteProbe
+        {
+            HealthWriteProbeResult result{};
+            UObject* card{};
+            const void* state{};
+            SetCurrentHealthFunction setter{};
+            std::chrono::steady_clock::time_point started_at{};
+            std::chrono::steady_clock::time_point restore_after{};
+        };
+
+        std::optional<PendingHealthWriteProbe> g_pending_health_write_probe{};
 
         auto json_escape(std::string_view value) -> std::string
         {
@@ -689,7 +706,7 @@ namespace QuantumCheckpoint
 
             output << "{\n"
                    << "  \"schemaVersion\": 1,\n"
-                   << "  \"kind\": \"guarded-native-health-write-probe\",\n"
+                   << "  \"kind\": \"guarded-timed-native-health-write-probe\",\n"
                    << "  \"capturedAtUtc\": \"" << json_escape(utc_timestamp()) << "\",\n"
                    << "  \"status\": \"" << json_escape(result.status) << "\",\n"
                    << "  \"reason\": \"" << json_escape(result.reason) << "\",\n"
@@ -705,6 +722,13 @@ namespace QuantumCheckpoint
                    << "  \"duringPrivate\": " << result.during_private << ",\n"
                    << "  \"reflectedGetterCalledDuringTemporaryWrite\": false,\n"
                    << "  \"duringGetter\": " << result.during_getter << ",\n"
+                   << "  \"requestedHoldMilliseconds\": "
+                   << result.requested_hold_milliseconds << ",\n"
+                   << "  \"actualHoldMilliseconds\": "
+                   << result.actual_hold_milliseconds << ",\n"
+                   << "  \"restoreIdentityValidated\": "
+                   << (result.restore_identity_validated ? "true" : "false") << ",\n"
+                   << "  \"beforeRestorePrivate\": " << result.before_restore_private << ",\n"
                    << "  \"restoredPrivate\": " << result.restored_private << ",\n"
                    << "  \"restoredGetter\": " << result.restored_getter << "\n"
                    << "}\n";
@@ -721,8 +745,16 @@ namespace QuantumCheckpoint
         auto run_health_write_probe() -> void
         {
             HealthWriteProbeResult result{};
+            result.requested_hold_milliseconds = TimedHealthProbeHold.count();
             try
             {
+                if (g_pending_health_write_probe)
+                {
+                    Output::send<LogLevel::Warning>(
+                        STR("[QuantumCheckpoint] A timed health write probe is already active; request ignored.\n"));
+                    return;
+                }
+
                 const auto module = GetModuleHandleW(L"Quantum-Win64-Shipping.exe");
                 if (!module)
                 {
@@ -829,7 +861,7 @@ namespace QuantumCheckpoint
                 if (!target || !target_state)
                 {
                     result.status = "refused";
-                    result.reason = "no live damaged field card passed all safety checks";
+                    result.reason = "no live damaged card passed all safety checks";
                 }
                 else
                 {
@@ -861,30 +893,29 @@ namespace QuantumCheckpoint
                         set_current_health(target_state, result.test_value);
                         result.during_private = read_native_value<std::int32_t>(
                             target_state, CardStateCurrentHealthOffset);
-
-                        // Restore before invoking any reflected function. The temporary
-                        // mutation never intentionally survives this straight-line block.
-                        set_current_health(target_state, result.before_private);
-                        restore_guard.active = false;
-                        result.restored_private = read_native_value<std::int32_t>(
-                            target_state, CardStateCurrentHealthOffset);
-                        const auto restored_getter = export_zero_argument_getter(
-                            target, STR("getCurrentHealth"));
-
-                        const auto restored_value = restored_getter
-                            ? parse_int32(restored_getter->value)
-                            : std::nullopt;
                         result.during_getter = -1;
-                        result.restored_getter = restored_value.value_or(-1);
-
-                        const bool passed = result.before_getter == result.before_private
-                            && result.during_private == result.test_value
-                            && result.restored_private == result.before_private
-                            && restored_value == result.before_private;
-                        result.status = passed ? "passed" : "failed";
-                        result.reason = passed
-                            ? "temporary private health write succeeded and was restored before reflected calls"
-                            : "one or more write/read/restore checks did not match";
+                        if (result.during_private != result.test_value)
+                        {
+                            result.status = "failed";
+                            result.reason = "temporary private health write did not read back";
+                        }
+                        else
+                        {
+                            const auto started_at = std::chrono::steady_clock::now();
+                            g_pending_health_write_probe.emplace(PendingHealthWriteProbe{
+                                .result = std::move(result),
+                                .card = target,
+                                .state = target_state,
+                                .setter = set_current_health,
+                                .started_at = started_at,
+                                .restore_after = started_at + TimedHealthProbeHold,
+                            });
+                            restore_guard.active = false;
+                            Output::send<LogLevel::Verbose>(
+                                STR("[QuantumCheckpoint] Timed health write probe holding +1 HP for {} ms; do not interact.\n"),
+                                TimedHealthProbeHold.count());
+                            return;
+                        }
                     }
                 }
 
@@ -900,6 +931,103 @@ namespace QuantumCheckpoint
                     to_wstring(error.what()));
             }
         }
+
+        auto finish_health_write_probe_if_due() -> void
+        {
+            if (!g_pending_health_write_probe
+                || std::chrono::steady_clock::now()
+                    < g_pending_health_write_probe->restore_after)
+            {
+                return;
+            }
+
+            auto& pending = *g_pending_health_write_probe;
+            auto& result = pending.result;
+            try
+            {
+                result.actual_hold_milliseconds = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - pending.started_at).count();
+
+                bool identity_validated{};
+                UObjectGlobals::ForEachUObject([&](UObject* object, [[maybe_unused]] int32_t object_index,
+                                                    [[maybe_unused]] int32_t chunk_index) {
+                    if (object != pending.card)
+                    {
+                        return LoopAction::Continue;
+                    }
+
+                    const std::string full_name = to_string(object->GetFullName());
+                    if (classify(full_name) == "BP_InGameCard_C"
+                        && is_live_instance(full_name, "BP_InGameCard_C")
+                        && read_native_value<const void*>(object, InGameCardStatePointerOffset)
+                            == pending.state
+                        && address_is_writable(
+                            static_cast<const std::byte*>(pending.state)
+                                + CardStateCurrentHealthOffset,
+                            sizeof(std::int32_t)))
+                    {
+                        identity_validated = true;
+                    }
+                    return LoopAction::Continue;
+                });
+                result.restore_identity_validated = identity_validated;
+
+                if (!identity_validated)
+                {
+                    result.status = "failed";
+                    result.reason = "target identity changed during hold; restore was not attempted";
+                }
+                else
+                {
+                    result.before_restore_private = read_native_value<std::int32_t>(
+                        pending.state, CardStateCurrentHealthOffset);
+                    if (result.before_restore_private != result.test_value)
+                    {
+                        result.status = "failed";
+                        result.reason = "health changed independently during hold; value was not overwritten";
+                        result.restored_private = result.before_restore_private;
+                    }
+                    else
+                    {
+                        HealthRestoreGuard restore_guard{
+                            pending.setter, pending.state, result.before_private};
+                        pending.setter(pending.state, result.before_private);
+                        restore_guard.active = false;
+                        result.restored_private = read_native_value<std::int32_t>(
+                            pending.state, CardStateCurrentHealthOffset);
+
+                        const auto restored_getter = export_zero_argument_getter(
+                            pending.card, STR("getCurrentHealth"));
+                        const auto restored_value = restored_getter
+                            ? parse_int32(restored_getter->value)
+                            : std::nullopt;
+                        result.restored_getter = restored_value.value_or(-1);
+
+                        const bool passed = result.restored_private == result.before_private
+                            && restored_value == result.before_private;
+                        result.status = passed ? "passed" : "failed";
+                        result.reason = passed
+                            ? "temporary health write survived the timed hold and was restored"
+                            : "timed health restore verification did not match";
+                    }
+                }
+
+                HealthWriteProbeResult completed_result = result;
+                g_pending_health_write_probe.reset();
+                const auto path = write_health_probe_report(completed_result);
+                Output::send<LogLevel::Verbose>(
+                    STR("[QuantumCheckpoint] Timed health write probe {}: {}; report: {}\n"),
+                    to_wstring(completed_result.status),
+                    to_wstring(completed_result.reason),
+                    path.wstring());
+            }
+            catch (const std::exception& error)
+            {
+                Output::send<LogLevel::Error>(
+                    STR("[QuantumCheckpoint] Timed health restore failed before completion: {}\n"),
+                    to_wstring(error.what()));
+            }
+        }
     } // namespace
 
     class QuantumCheckpointMod final : public CppUserModBase
@@ -908,7 +1036,7 @@ namespace QuantumCheckpoint
         QuantumCheckpointMod()
         {
             ModName = STR("QuantumCheckpoint");
-            ModVersion = STR("0.6.1-dev");
+            ModVersion = STR("0.7.0-dev");
             ModDescription = STR("Battle inventory exporter and guarded native write experiment");
             ModAuthors = STR("zaofenMachine and contributors");
             ModIntendedSDKVersion = STR("3.0.1");
@@ -927,7 +1055,7 @@ namespace QuantumCheckpoint
                 []() { g_health_write_probe_requested.store(true, std::memory_order_release); });
 
             Output::send<LogLevel::Verbose>(
-                STR("[QuantumCheckpoint] Loaded C++ prototype; Ctrl+F1 exports, Ctrl+Shift+F12 runs the guarded health write probe.\n"));
+                STR("[QuantumCheckpoint] Loaded C++ prototype; Ctrl+F1 exports, Ctrl+Shift+F12 runs the timed health write probe.\n"));
         }
 
         auto on_unreal_init() -> void override
@@ -939,6 +1067,8 @@ namespace QuantumCheckpoint
 
         auto on_update() -> void override
         {
+            finish_health_write_probe_if_due();
+
             if (g_export_requested.exchange(false, std::memory_order_acq_rel))
             {
                 if (g_unreal_ready.load(std::memory_order_acquire))

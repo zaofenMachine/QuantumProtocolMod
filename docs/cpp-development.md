@@ -68,6 +68,8 @@ v0.4 记录 getter 原生地址并完成离线调用链分析；v0.5 只读导�
 
 v0.6.1 加入带 EXE 大小、getter RVA、setter 机器码、内存页权限和数值范围门禁的生命写入探针。实测目标生命 `1→2→1`，临时值直接读回和恢复后公开 getter 均符合预期，无崩溃或残留变化。该版本 DLL 大小为 `470016` 字节，部署 SHA-256 为 `DE43B09134181B90FA82B619C799A1FA69F0B51B81AC3ED0D1317601A058A2F6`。详细安全边界见 [phase-5-guarded-health-write.md](phase-5-guarded-health-write.md)。
 
+v0.7 将写入值跨帧保持约一秒，并在恢复前重新验证卡牌对象、状态指针和字段值。实测保持 `1003 ms`，生命 `1→2→1`，UI 可见地增加并恢复，无崩溃；DLL 大小为 `478720` 字节，部署 SHA-256 为 `1BF37E35C92390AD0A8C63FB92F34EBCEC57C8A03C5A68CCF948AA8F8008670C`。
+
 可回滚部署流程：
 
 ```powershell
