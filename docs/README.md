@@ -17,5 +17,6 @@
 - [phase-3-cpp-readonly-export.md](phase-3-cpp-readonly-export.md)：C++ getter、精确槽位、效果与计数器导出验证。
 - [phase-4-native-card-state.md](phase-4-native-card-state.md)：游戏私有卡牌状态布局、EXE 指纹与复杂样本交叉验证。
 - [phase-5-guarded-health-write.md](phase-5-guarded-health-write.md)：带版本门禁的临时生命写入、失败扫描路径与自动回滚验证。
+- [phase-6-guarded-turn-write.md](phase-6-guarded-turn-write.md)：回合计数私有字段、跨帧 UI 同步、并发变化保护与自动回滚验证。
 
 维护规则：需求发生变化时先更新 `requirements.md`；技术实验产生新证据时更新 `technical-status.md` 并补充对应阶段报告；正式选定恢复路线后在 `architecture-options.md` 记录决定与理由。

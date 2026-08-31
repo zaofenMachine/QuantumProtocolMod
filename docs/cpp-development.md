@@ -70,6 +70,8 @@ v0.6.1 加入带 EXE 大小、getter RVA、setter 机器码、内存页权限和
 
 v0.7 将写入值跨帧保持约一秒，并在恢复前重新验证卡牌对象、状态指针和字段值。实测保持 `1003 ms`，生命 `1→2→1`，UI 可见地增加并恢复，无崩溃；DLL 大小为 `478720` 字节，部署 SHA-256 为 `1BF37E35C92390AD0A8C63FB92F34EBCEC57C8A03C5A68CCF948AA8F8008670C`。
 
+v0.8 新增 `Ctrl+Shift+F9` 回合计数探针。它校验私有 getter 机器码，只选择正数回合计数卡，将 `state + 0x194` 的调整量临时加 1，并在恢复前同时检查基础值与调整量是否被游戏自行改变。实测基础值保持 `0`，计数和 UI 为 `5→6→5`，保持 `1004 ms`，无崩溃；DLL 大小为 `500224` 字节，部署 SHA-256 为 `6B0168055886214CC6D4BEBCC002B41523D0010D4AADEF5FB79B7371682388DC`。详见 [phase-6-guarded-turn-write.md](phase-6-guarded-turn-write.md)。
+
 可回滚部署流程：
 
 ```powershell

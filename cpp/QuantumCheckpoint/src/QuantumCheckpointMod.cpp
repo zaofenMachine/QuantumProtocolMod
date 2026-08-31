@@ -44,6 +44,7 @@ namespace QuantumCheckpoint
     {
         std::atomic_bool g_export_requested{false};
         std::atomic_bool g_health_write_probe_requested{false};
+        std::atomic_bool g_turn_write_probe_requested{false};
         std::atomic_bool g_unreal_ready{false};
 
         constexpr std::array<std::string_view, 17> RelevantClassPrefixes{
@@ -179,10 +180,18 @@ namespace QuantumCheckpoint
         constexpr std::size_t CardStateTurnBaseOffset = 0x198;
         constexpr std::uintmax_t ExpectedGameExecutableSize = 82'718'720;
         constexpr std::uintptr_t CurrentHealthGetterThunkRva = 0x102D100;
+        constexpr std::uintptr_t CurrentTurnGetterThunkRva = 0x102D130;
+        constexpr std::uintptr_t NativeCurrentTurnGetterRva = 0xE323C0;
         constexpr std::uintptr_t SetCurrentHealthRva = 0xE522E0;
         constexpr auto TimedHealthProbeHold = std::chrono::milliseconds{1000};
+        constexpr auto TimedTurnProbeHold = std::chrono::milliseconds{1000};
         constexpr std::array<std::uint8_t, 7> SetCurrentHealthSignature{
             0x89, 0x91, 0x1C, 0x01, 0x00, 0x00, 0xC3,
+        };
+        constexpr std::array<std::uint8_t, 13> NativeCurrentTurnGetterSignature{
+            0x8B, 0x81, 0x98, 0x01, 0x00, 0x00,
+            0x03, 0x81, 0x94, 0x01, 0x00, 0x00,
+            0xC3,
         };
 
         struct HealthWriteProbeResult
@@ -237,6 +246,64 @@ namespace QuantumCheckpoint
         };
 
         std::optional<PendingHealthWriteProbe> g_pending_health_write_probe{};
+
+        struct TurnWriteProbeResult
+        {
+            std::string status{"not-run"};
+            std::string reason{};
+            std::string card_full_name{};
+            std::string card_location{};
+            std::uintptr_t state_address{};
+            std::int32_t before_base{};
+            std::int32_t before_adjustment{};
+            std::int64_t before_computed{};
+            std::int32_t before_getter{};
+            std::int32_t test_adjustment{};
+            std::int64_t test_computed{};
+            std::int32_t during_base{};
+            std::int32_t during_adjustment{};
+            std::int64_t during_computed{};
+            std::int64_t requested_hold_milliseconds{};
+            std::int64_t actual_hold_milliseconds{};
+            bool restore_identity_validated{};
+            std::int32_t before_restore_base{};
+            std::int32_t before_restore_adjustment{};
+            std::int64_t before_restore_computed{};
+            std::int32_t restored_base{};
+            std::int32_t restored_adjustment{};
+            std::int64_t restored_computed{};
+            std::int32_t restored_getter{};
+        };
+
+        struct Int32FieldRestoreGuard
+        {
+            const void* state{};
+            std::size_t offset{};
+            std::int32_t value{};
+            bool active{true};
+
+            ~Int32FieldRestoreGuard()
+            {
+                if (active && state)
+                {
+                    std::memcpy(
+                        static_cast<std::byte*>(const_cast<void*>(state)) + offset,
+                        &value,
+                        sizeof(value));
+                }
+            }
+        };
+
+        struct PendingTurnWriteProbe
+        {
+            TurnWriteProbeResult result{};
+            UObject* card{};
+            const void* state{};
+            std::chrono::steady_clock::time_point started_at{};
+            std::chrono::steady_clock::time_point restore_after{};
+        };
+
+        std::optional<PendingTurnWriteProbe> g_pending_turn_write_probe{};
 
         auto json_escape(std::string_view value) -> std::string
         {
@@ -460,6 +527,15 @@ namespace QuantumCheckpoint
                 static_cast<const std::byte*>(base) + offset,
                 sizeof(ValueType));
             return value;
+        }
+
+        template <typename ValueType>
+        auto write_native_value(const void* base, std::size_t offset, const ValueType& value) -> void
+        {
+            std::memcpy(
+                static_cast<std::byte*>(const_cast<void*>(base)) + offset,
+                &value,
+                sizeof(ValueType));
         }
 
         auto append_private_card_state_diagnostics(ObjectSnapshot& snapshot, UObject* object) -> void
@@ -748,10 +824,10 @@ namespace QuantumCheckpoint
             result.requested_hold_milliseconds = TimedHealthProbeHold.count();
             try
             {
-                if (g_pending_health_write_probe)
+                if (g_pending_health_write_probe || g_pending_turn_write_probe)
                 {
                     Output::send<LogLevel::Warning>(
-                        STR("[QuantumCheckpoint] A timed health write probe is already active; request ignored.\n"));
+                        STR("[QuantumCheckpoint] A timed native write probe is already active; health request ignored.\n"));
                     return;
                 }
 
@@ -1028,6 +1104,390 @@ namespace QuantumCheckpoint
                     to_wstring(error.what()));
             }
         }
+
+        auto write_turn_probe_report(const TurnWriteProbeResult& result) -> std::filesystem::path
+        {
+            const auto mods_directory = std::filesystem::path{
+                UE4SSProgram::get_program().get_mods_directory()};
+            const auto report_directory = mods_directory / STR("QuantumCheckpoint") / STR("Reports");
+            std::filesystem::create_directories(report_directory);
+
+            const auto report_path = report_directory /
+                (STR("turn-write-probe-") + to_wstring(filename_timestamp()) + STR(".json"));
+            auto temporary_path = report_path;
+            temporary_path += STR(".tmp");
+
+            std::ofstream output{temporary_path, std::ios::binary | std::ios::trunc};
+            if (!output)
+            {
+                throw std::runtime_error{"Unable to open temporary turn probe report"};
+            }
+
+            output << "{\n"
+                   << "  \"schemaVersion\": 1,\n"
+                   << "  \"kind\": \"guarded-timed-native-turn-write-probe\",\n"
+                   << "  \"capturedAtUtc\": \"" << json_escape(utc_timestamp()) << "\",\n"
+                   << "  \"status\": \"" << json_escape(result.status) << "\",\n"
+                   << "  \"reason\": \"" << json_escape(result.reason) << "\",\n"
+                   << "  \"cardFullName\": \"" << json_escape(result.card_full_name) << "\",\n"
+                   << "  \"cardLocation\": \"" << json_escape(result.card_location) << "\",\n"
+                   << "  \"stateAddress\": \"" << format_address(result.state_address) << "\",\n"
+                   << "  \"beforeBase\": " << result.before_base << ",\n"
+                   << "  \"beforeAdjustment\": " << result.before_adjustment << ",\n"
+                   << "  \"beforeComputed\": " << result.before_computed << ",\n"
+                   << "  \"beforeGetter\": " << result.before_getter << ",\n"
+                   << "  \"testAdjustment\": " << result.test_adjustment << ",\n"
+                   << "  \"testComputed\": " << result.test_computed << ",\n"
+                   << "  \"duringBase\": " << result.during_base << ",\n"
+                   << "  \"duringAdjustment\": " << result.during_adjustment << ",\n"
+                   << "  \"duringComputed\": " << result.during_computed << ",\n"
+                   << "  \"reflectedGetterCalledDuringTemporaryWrite\": false,\n"
+                   << "  \"requestedHoldMilliseconds\": "
+                   << result.requested_hold_milliseconds << ",\n"
+                   << "  \"actualHoldMilliseconds\": "
+                   << result.actual_hold_milliseconds << ",\n"
+                   << "  \"restoreIdentityValidated\": "
+                   << (result.restore_identity_validated ? "true" : "false") << ",\n"
+                   << "  \"beforeRestoreBase\": " << result.before_restore_base << ",\n"
+                   << "  \"beforeRestoreAdjustment\": " << result.before_restore_adjustment << ",\n"
+                   << "  \"beforeRestoreComputed\": " << result.before_restore_computed << ",\n"
+                   << "  \"restoredBase\": " << result.restored_base << ",\n"
+                   << "  \"restoredAdjustment\": " << result.restored_adjustment << ",\n"
+                   << "  \"restoredComputed\": " << result.restored_computed << ",\n"
+                   << "  \"restoredGetter\": " << result.restored_getter << "\n"
+                   << "}\n";
+            output.flush();
+            if (!output)
+            {
+                throw std::runtime_error{"Unable to finish writing turn probe report"};
+            }
+            output.close();
+            std::filesystem::rename(temporary_path, report_path);
+            return report_path;
+        }
+
+        auto run_turn_write_probe() -> void
+        {
+            TurnWriteProbeResult result{};
+            result.requested_hold_milliseconds = TimedTurnProbeHold.count();
+            try
+            {
+                if (g_pending_health_write_probe || g_pending_turn_write_probe)
+                {
+                    Output::send<LogLevel::Warning>(
+                        STR("[QuantumCheckpoint] A timed native write probe is already active; turn request ignored.\n"));
+                    return;
+                }
+
+                const auto module = GetModuleHandleW(L"Quantum-Win64-Shipping.exe");
+                if (!module)
+                {
+                    result.status = "refused";
+                    result.reason = "game executable module was not found";
+                }
+                else
+                {
+                    std::array<wchar_t, 32768> executable_path{};
+                    const auto path_length = GetModuleFileNameW(
+                        module, executable_path.data(), static_cast<DWORD>(executable_path.size()));
+                    if (path_length == 0 || path_length >= executable_path.size()
+                        || std::filesystem::file_size(executable_path.data()) != ExpectedGameExecutableSize)
+                    {
+                        result.status = "refused";
+                        result.reason = "game executable size does not match the validated build";
+                    }
+                    else
+                    {
+                        const auto module_base = reinterpret_cast<std::uintptr_t>(module);
+                        const auto* getter_bytes = reinterpret_cast<const std::uint8_t*>(
+                            module_base + NativeCurrentTurnGetterRva);
+                        if (!std::equal(
+                                NativeCurrentTurnGetterSignature.begin(),
+                                NativeCurrentTurnGetterSignature.end(),
+                                getter_bytes))
+                        {
+                            result.status = "refused";
+                            result.reason = "native turn getter signature does not match the validated build";
+                        }
+                        else
+                        {
+                            UObject* target{};
+                            const void* target_state{};
+                            std::int32_t target_base{};
+                            std::int32_t target_adjustment{};
+                            std::int32_t target_computed{};
+
+                            UObjectGlobals::ForEachUObject([&](UObject* object,
+                                                                [[maybe_unused]] int32_t object_index,
+                                                                [[maybe_unused]] int32_t chunk_index) {
+                                if (!object)
+                                {
+                                    return LoopAction::Continue;
+                                }
+
+                                const std::string full_name = to_string(object->GetFullName());
+                                if (classify(full_name) != "BP_InGameCard_C"
+                                    || !is_live_instance(full_name, "BP_InGameCard_C"))
+                                {
+                                    return LoopAction::Continue;
+                                }
+
+                                auto* turn_getter = object->GetFunctionByNameInChain(
+                                    STR("getCurrentTurnCounter"));
+                                if (!turn_getter
+                                    || reinterpret_cast<std::uintptr_t>(turn_getter->GetFuncPtr())
+                                        != module_base + CurrentTurnGetterThunkRva)
+                                {
+                                    return LoopAction::Continue;
+                                }
+
+                                const auto* state = read_native_value<const void*>(
+                                    object, InGameCardStatePointerOffset);
+                                if (!state
+                                    || !address_is_writable(
+                                        static_cast<const std::byte*>(state)
+                                            + CardStateTurnAdjustmentOffset,
+                                        sizeof(std::int32_t))
+                                    || !address_is_writable(
+                                        static_cast<const std::byte*>(state)
+                                            + CardStateTurnBaseOffset,
+                                        sizeof(std::int32_t)))
+                                {
+                                    return LoopAction::Continue;
+                                }
+
+                                const auto turn_base = read_native_value<std::int32_t>(
+                                    state, CardStateTurnBaseOffset);
+                                const auto turn_adjustment = read_native_value<std::int32_t>(
+                                    state, CardStateTurnAdjustmentOffset);
+                                const auto computed_wide = static_cast<std::int64_t>(turn_base)
+                                    + static_cast<std::int64_t>(turn_adjustment);
+                                if (turn_base < -1000 || turn_base > 1000
+                                    || turn_adjustment < -1000 || turn_adjustment >= 1000
+                                    || computed_wide <= 0 || computed_wide >= 1000)
+                                {
+                                    return LoopAction::Continue;
+                                }
+
+                                const auto computed = static_cast<std::int32_t>(computed_wide);
+                                if (!target || computed > target_computed)
+                                {
+                                    target = object;
+                                    target_state = state;
+                                    target_base = turn_base;
+                                    target_adjustment = turn_adjustment;
+                                    target_computed = computed;
+                                }
+                                return LoopAction::Continue;
+                            });
+
+                            if (!target || !target_state)
+                            {
+                                result.status = "refused";
+                                result.reason = "no live card with a positive turn counter passed all safety checks";
+                            }
+                            else
+                            {
+                                result.card_full_name = to_string(target->GetFullName());
+                                result.card_location = "not-read; complex location getter intentionally avoided";
+                                result.state_address = reinterpret_cast<std::uintptr_t>(target_state);
+                                result.before_base = target_base;
+                                result.before_adjustment = target_adjustment;
+                                result.before_computed = target_computed;
+                                result.test_adjustment = target_adjustment + 1;
+                                result.test_computed = target_computed + 1;
+
+                                const auto before_getter = export_zero_argument_getter(
+                                    target, STR("getCurrentTurnCounter"));
+                                const auto before_value = before_getter
+                                    ? parse_int32(before_getter->value)
+                                    : std::nullopt;
+                                if (!before_value || *before_value != result.before_computed)
+                                {
+                                    result.status = "refused";
+                                    result.reason = "current turn getter did not match private state before write";
+                                }
+                                else
+                                {
+                                    result.before_getter = *before_value;
+                                    Int32FieldRestoreGuard restore_guard{
+                                        target_state,
+                                        CardStateTurnAdjustmentOffset,
+                                        result.before_adjustment};
+
+                                    write_native_value(
+                                        target_state,
+                                        CardStateTurnAdjustmentOffset,
+                                        result.test_adjustment);
+                                    result.during_base = read_native_value<std::int32_t>(
+                                        target_state, CardStateTurnBaseOffset);
+                                    result.during_adjustment = read_native_value<std::int32_t>(
+                                        target_state, CardStateTurnAdjustmentOffset);
+                                    result.during_computed = static_cast<std::int64_t>(
+                                        result.during_base) + result.during_adjustment;
+                                    if (result.during_base != result.before_base
+                                        || result.during_adjustment != result.test_adjustment
+                                        || result.during_computed != result.test_computed)
+                                    {
+                                        result.status = "failed";
+                                        result.reason = "temporary private turn write did not read back";
+                                    }
+                                    else
+                                    {
+                                        const auto started_at = std::chrono::steady_clock::now();
+                                        g_pending_turn_write_probe.emplace(PendingTurnWriteProbe{
+                                            .result = std::move(result),
+                                            .card = target,
+                                            .state = target_state,
+                                            .started_at = started_at,
+                                            .restore_after = started_at + TimedTurnProbeHold,
+                                        });
+                                        restore_guard.active = false;
+                                        Output::send<LogLevel::Verbose>(
+                                            STR("[QuantumCheckpoint] Timed turn write probe holding +1 turn for {} ms; do not interact.\n"),
+                                            TimedTurnProbeHold.count());
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                const auto path = write_turn_probe_report(result);
+                Output::send<LogLevel::Verbose>(
+                    STR("[QuantumCheckpoint] Turn write probe {}: {}; report: {}\n"),
+                    to_wstring(result.status), to_wstring(result.reason), path.wstring());
+            }
+            catch (const std::exception& error)
+            {
+                Output::send<LogLevel::Error>(
+                    STR("[QuantumCheckpoint] Turn write probe failed before report completion: {}\n"),
+                    to_wstring(error.what()));
+            }
+        }
+
+        auto finish_turn_write_probe_if_due() -> void
+        {
+            if (!g_pending_turn_write_probe
+                || std::chrono::steady_clock::now()
+                    < g_pending_turn_write_probe->restore_after)
+            {
+                return;
+            }
+
+            auto& pending = *g_pending_turn_write_probe;
+            auto& result = pending.result;
+            try
+            {
+                result.actual_hold_milliseconds = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - pending.started_at).count();
+
+                bool identity_validated{};
+                UObjectGlobals::ForEachUObject([&](UObject* object,
+                                                    [[maybe_unused]] int32_t object_index,
+                                                    [[maybe_unused]] int32_t chunk_index) {
+                    if (object != pending.card)
+                    {
+                        return LoopAction::Continue;
+                    }
+
+                    const std::string full_name = to_string(object->GetFullName());
+                    if (classify(full_name) == "BP_InGameCard_C"
+                        && is_live_instance(full_name, "BP_InGameCard_C")
+                        && read_native_value<const void*>(object, InGameCardStatePointerOffset)
+                            == pending.state
+                        && address_is_writable(
+                            static_cast<const std::byte*>(pending.state)
+                                + CardStateTurnAdjustmentOffset,
+                            sizeof(std::int32_t))
+                        && address_is_writable(
+                            static_cast<const std::byte*>(pending.state)
+                                + CardStateTurnBaseOffset,
+                            sizeof(std::int32_t)))
+                    {
+                        identity_validated = true;
+                    }
+                    return LoopAction::Continue;
+                });
+                result.restore_identity_validated = identity_validated;
+
+                if (!identity_validated)
+                {
+                    result.status = "failed";
+                    result.reason = "target identity changed during hold; restore was not attempted";
+                }
+                else
+                {
+                    result.before_restore_base = read_native_value<std::int32_t>(
+                        pending.state, CardStateTurnBaseOffset);
+                    result.before_restore_adjustment = read_native_value<std::int32_t>(
+                        pending.state, CardStateTurnAdjustmentOffset);
+                    result.before_restore_computed = static_cast<std::int64_t>(
+                        result.before_restore_base) + result.before_restore_adjustment;
+                    if (result.before_restore_base != result.before_base
+                        || result.before_restore_adjustment != result.test_adjustment
+                        || result.before_restore_computed != result.test_computed)
+                    {
+                        result.status = "failed";
+                        result.reason = "turn state changed independently during hold; values were not overwritten";
+                        result.restored_base = result.before_restore_base;
+                        result.restored_adjustment = result.before_restore_adjustment;
+                        result.restored_computed = result.before_restore_computed;
+                    }
+                    else
+                    {
+                        Int32FieldRestoreGuard restore_guard{
+                            pending.state,
+                            CardStateTurnAdjustmentOffset,
+                            result.before_adjustment};
+                        write_native_value(
+                            pending.state,
+                            CardStateTurnAdjustmentOffset,
+                            result.before_adjustment);
+                        restore_guard.active = false;
+
+                        result.restored_base = read_native_value<std::int32_t>(
+                            pending.state, CardStateTurnBaseOffset);
+                        result.restored_adjustment = read_native_value<std::int32_t>(
+                            pending.state, CardStateTurnAdjustmentOffset);
+                        result.restored_computed = static_cast<std::int64_t>(
+                            result.restored_base) + result.restored_adjustment;
+
+                        const auto restored_getter = export_zero_argument_getter(
+                            pending.card, STR("getCurrentTurnCounter"));
+                        const auto restored_value = restored_getter
+                            ? parse_int32(restored_getter->value)
+                            : std::nullopt;
+                        result.restored_getter = restored_value.value_or(-1001);
+
+                        const bool passed = result.restored_base == result.before_base
+                            && result.restored_adjustment == result.before_adjustment
+                            && result.restored_computed == result.before_computed
+                            && restored_value == result.before_computed;
+                        result.status = passed ? "passed" : "failed";
+                        result.reason = passed
+                            ? "temporary turn write survived the timed hold and was restored"
+                            : "timed turn restore verification did not match";
+                    }
+                }
+
+                TurnWriteProbeResult completed_result = result;
+                g_pending_turn_write_probe.reset();
+                const auto path = write_turn_probe_report(completed_result);
+                Output::send<LogLevel::Verbose>(
+                    STR("[QuantumCheckpoint] Timed turn write probe {}: {}; report: {}\n"),
+                    to_wstring(completed_result.status),
+                    to_wstring(completed_result.reason),
+                    path.wstring());
+            }
+            catch (const std::exception& error)
+            {
+                Output::send<LogLevel::Error>(
+                    STR("[QuantumCheckpoint] Timed turn restore failed before completion: {}\n"),
+                    to_wstring(error.what()));
+            }
+        }
     } // namespace
 
     class QuantumCheckpointMod final : public CppUserModBase
@@ -1036,7 +1496,7 @@ namespace QuantumCheckpoint
         QuantumCheckpointMod()
         {
             ModName = STR("QuantumCheckpoint");
-            ModVersion = STR("0.7.0-dev");
+            ModVersion = STR("0.8.0-dev");
             ModDescription = STR("Battle inventory exporter and guarded native write experiment");
             ModAuthors = STR("zaofenMachine and contributors");
             ModIntendedSDKVersion = STR("3.0.1");
@@ -1054,8 +1514,13 @@ namespace QuantumCheckpoint
                 {Input::ModifierKey::CONTROL, Input::ModifierKey::SHIFT},
                 []() { g_health_write_probe_requested.store(true, std::memory_order_release); });
 
+            UE4SSProgram::get_program().register_keydown_event(
+                Input::Key::F9,
+                {Input::ModifierKey::CONTROL, Input::ModifierKey::SHIFT},
+                []() { g_turn_write_probe_requested.store(true, std::memory_order_release); });
+
             Output::send<LogLevel::Verbose>(
-                STR("[QuantumCheckpoint] Loaded C++ prototype; Ctrl+F1 exports, Ctrl+Shift+F12 runs the timed health write probe.\n"));
+                STR("[QuantumCheckpoint] Loaded C++ prototype; Ctrl+F1 exports, Ctrl+Shift+F12 tests health, Ctrl+Shift+F9 tests turn count.\n"));
         }
 
         auto on_unreal_init() -> void override
@@ -1068,6 +1533,7 @@ namespace QuantumCheckpoint
         auto on_update() -> void override
         {
             finish_health_write_probe_if_due();
+            finish_turn_write_probe_if_due();
 
             if (g_export_requested.exchange(false, std::memory_order_acq_rel))
             {
@@ -1092,6 +1558,19 @@ namespace QuantumCheckpoint
                 {
                     Output::send<LogLevel::Warning>(
                         STR("[QuantumCheckpoint] Unreal is not initialized; health write probe ignored.\n"));
+                }
+            }
+
+            if (g_turn_write_probe_requested.exchange(false, std::memory_order_acq_rel))
+            {
+                if (g_unreal_ready.load(std::memory_order_acquire))
+                {
+                    run_turn_write_probe();
+                }
+                else
+                {
+                    Output::send<LogLevel::Warning>(
+                        STR("[QuantumCheckpoint] Unreal is not initialized; turn write probe ignored.\n"));
                 }
             }
         }
