@@ -2,6 +2,8 @@ cmake_minimum_required(VERSION 3.18)
 
 project(QuantumProtocolMods LANGUAGES CXX)
 
+include(CTest)
+
 # Keep the standalone mod and nested dependencies under one predictable output
 # tree. The build script also supplies UE4SS's custom configuration names on the
 # first configure so its bundled Corrosion can resolve Rust artifact paths.

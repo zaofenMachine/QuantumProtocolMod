@@ -1,12 +1,13 @@
-# C++ 开发环境与只读导出器
+# C++ 开发环境与路线 C 原型
 
 ## 目标
 
-本阶段先建立两条恢复路线共用的 C++ 基础，不执行恢复：
+工程从只读导出器逐步发展到 v0.9 路线 C 恢复原型：
 
 - 使用 UE4SS 反射读取对象和属性，不硬编码内存偏移。
 - 把当前战斗对象导出为带版本号的 JSON 状态报告。
-- 用报告确认完整卡组、缓存区、敌人实例和控制器究竟包含哪些字段，再决定恢复路线。
+- 用报告确认完整卡组、缓存区、敌人实例和控制器字段。
+- 将普通地牢小关保存为独立、版本化检查点，并通过关卡重载完成语义恢复。
 
 `cpp/QuantumCheckpoint` 已包含只读导出器源码。编译并安装后，`Ctrl+F1` 请求导出，文件写入 UE4SS 的 `Mods/QuantumCheckpoint/Reports`。导出器读取反射属性，并调用零参数、带返回值的只读 getter；不调用卡牌、波次或生命修改函数。旧版曾使用 `Ctrl+F11`，实测会同时触发游戏自身的窗口模式切换，因此已更换。
 
@@ -50,7 +51,7 @@ UE4SS v3.0.1 还把多个 FetchContent 依赖指向可移动分支。顶层工�
 .\scripts\Build-CppMod.ps1
 ```
 
-构建配置默认为 `Game__Shipping__Win64`。生成 DLL 后仍需单独经过安装脚本和启动验证；C++ 模块可以与现有 Lua 研究探针并行加载。
+构建配置默认为 `Game__Shipping__Win64`。脚本先构建持久化测试与 DLL，再通过 CTest；生成 DLL 后仍需单独经过安装脚本和启动验证。
 
 当前已验证产物：
 
@@ -71,6 +72,18 @@ v0.6.1 加入带 EXE 大小、getter RVA、setter 机器码、内存页权限和
 v0.7 将写入值跨帧保持约一秒，并在恢复前重新验证卡牌对象、状态指针和字段值。实测保持 `1003 ms`，生命 `1→2→1`，UI 可见地增加并恢复，无崩溃；DLL 大小为 `478720` 字节，部署 SHA-256 为 `1BF37E35C92390AD0A8C63FB92F34EBCEC57C8A03C5A68CCF948AA8F8008670C`。
 
 v0.8 新增 `Ctrl+Shift+F9` 回合计数探针。它校验私有 getter 机器码，只选择正数回合计数卡，将 `state + 0x194` 的调整量临时加 1，并在恢复前同时检查基础值与调整量是否被游戏自行改变。实测基础值保持 `0`，计数和 UI 为 `5→6→5`，保持 `1004 ms`，无崩溃；DLL 大小为 `500224` 字节，部署 SHA-256 为 `6B0168055886214CC6D4BEBCC002B41523D0010D4AADEF5FB79B7371682388DC`。详见 [phase-6-guarded-turn-write.md](phase-6-guarded-turn-write.md)。
+
+v0.9 新增路线 C schema/持久化库、ProcessEvent 波次拦截、GameInstance 关卡/牌组导入、战斗重载状态机、玩家牌区重建、生命恢复、超时/失败收尾和结构化报告。它只支持普通 `DUNGEON`，明确拒绝无限、地牢事件、教程/Boss 伴生逻辑和有状态 Spawner。向下恢复生命使用受 EXE/RVA/对象布局/页权限/数值交叉验证保护的 CardEngine 权威状态写入，并同步 BottomBar；失败会回滚。跨关卡对象按被拦截 Spawner 的新 World 筛选。
+
+v0.9.0 首轮读取三次触发相同 `ucrtbase!abort`，且没有生成预期检查点。v0.9.1 把零参数复杂 Getter 改为使用经 FProperty 初始化并逆序析构的参数缓冲区，无存档读取改为 `error_code` 检查，更新回调增加异常边界，并写入强制刷盘的阶段轨迹。无存档读取随后在两个独立进程中安全拒绝。
+
+首次保存报告进一步确认普通 `DUNGEON` 使用原生 `NeskaraDungeon1Spawner`，旧版按 `Spawner_C` 名称匹配会误判缺失。v0.9.2 改从 CardEngine 的 `mEnemySpawnController` 与 `mHUDBottomBar` 反射引用锚定精确战斗对象，并验证生成器继承原生 `SpawnController`。
+
+后续实机确认 `getActiveStorage()` 的合法空 `TArray` 会由 UE 4.27 导出为空文本，旧必填门禁因此误拒；同时正常小关推进实际命中 `spawnNextWave()`，而非旧自动捕获唯一监听的 `spawnWaveIndex(int)`。v0.9.3 将空数组规范化为可导入的 `()`，并在 `spawnNextWave` 后读取 `currentWaveIndex` 调度延迟捕获。构建及持久化测试 `1/1` 通过；DLL 大小 `636416` 字节，SHA-256 `F6B8945378320A400A7FA12953B4B593C8AAF56A3A61498B38A48E98348A7AE3`，部署 ID `20260901-223651-072`。真实运行结论仍待复测，详见 [phase-7-route-c-vertical-slice.md](phase-7-route-c-vertical-slice.md)。
+
+v0.9.3 实机虽确认两个波次 UFunction 均已找到，但全局 ProcessEvent 回调没有观察到原生波次调用。v0.9.4 改用 `UObjectGlobals::RegisterHook(UFunction*)` 对具体原生函数注册回调，与早期 Lua `RegisterHook` 的命中机制一致，并在析构时注销钩子。当前 DLL 大小 `638976` 字节，SHA-256 `B5B268E99FD4CECA3610F76C34B8D26EEAC8D3F7DA10F0B924BFC32634683126`，部署 ID `20260901-225404-393`；真实运行仍从自动保存开始分段复测。
+
+v0.9.4 实机首次用热键完整写出普通地牢检查点，但进入第二小关后具体原生 UFunction 钩子仍无调度轨迹，文件也未自动覆盖。v0.9.5 改为每 750 ms 低频筛选活动 CardEngine，从 `mEnemySpawnController.currentWaveIndex` 读取权威波次，只在稳定 `OPEN` 状态且 Spawner/World/波次变化时安排一次延迟捕获；恢复所需的 `spawnWaveIndex` 前置钩子继续保留。当前 DLL 大小 `643072` 字节，SHA-256 `843D45D379F8229E43C1FF0EAC982997059B65CFF348638B65FBCED791D8B5C5`，部署 ID `20260901-230923-817`；构建及持久化测试 `1/1` 通过，等待自动保存实测。
 
 可回滚部署流程：
 

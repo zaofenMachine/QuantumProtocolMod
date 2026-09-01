@@ -63,8 +63,12 @@ if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE
 }
 
-& $cmakePath --build $resolvedBuildDirectory --config $Configuration --target QuantumCheckpoint
+& $cmakePath --build $resolvedBuildDirectory --config $Configuration --target QuantumCheckpointPersistenceTests QuantumCheckpoint
 $buildExitCode = $LASTEXITCODE
+if ($buildExitCode -eq 0) {
+    & $cmakePath --build $resolvedBuildDirectory --config $Configuration --target RUN_TESTS
+    $buildExitCode = $LASTEXITCODE
+}
 $env:Path = $previousPath
 $env:RUSTUP_TOOLCHAIN = $previousRustToolchain
 $env:GIT_CONFIG_COUNT = $previousGitConfigCount

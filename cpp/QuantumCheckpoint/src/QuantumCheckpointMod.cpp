@@ -2,18 +2,21 @@
 #define WIN32_LEAN_AND_MEAN
 
 #include "CheckpointSchema.hpp"
+#include "CheckpointPersistence.hpp"
 
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <charconv>
 #include <chrono>
+#include <cstdio>
 #include <cstdint>
 #include <ctime>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <initializer_list>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -24,6 +27,7 @@
 #include <vector>
 
 #include <Windows.h>
+#include <bcrypt.h>
 
 #include <DynamicOutput/DynamicOutput.hpp>
 #include <Helpers/String.hpp>
@@ -31,7 +35,12 @@
 #include <Mod/CppUserModBase.hpp>
 #include <UE4SSProgram.hpp>
 #include <Unreal/FProperty.hpp>
+#include <Unreal/FOutputDevice.hpp>
+#include <Unreal/Property/FArrayProperty.hpp>
+#include <Unreal/Property/FObjectProperty.hpp>
+#include <Unreal/UClass.hpp>
 #include <Unreal/UFunction.hpp>
+#include <Unreal/UFunctionStructs.hpp>
 #include <Unreal/UObject.hpp>
 #include <Unreal/UObjectGlobals.hpp>
 
@@ -45,7 +54,68 @@ namespace QuantumCheckpoint
         std::atomic_bool g_export_requested{false};
         std::atomic_bool g_health_write_probe_requested{false};
         std::atomic_bool g_turn_write_probe_requested{false};
+        std::atomic_bool g_route_c_save_requested{false};
+        std::atomic_bool g_route_c_load_requested{false};
         std::atomic_bool g_unreal_ready{false};
+
+        struct ExecutableFingerprint
+        {
+            std::filesystem::path path{};
+            std::uint64_t size{};
+            std::string sha256{};
+        };
+
+        enum class RouteCRestorePhase
+        {
+            AwaitingWaveIntercept,
+            AwaitingStableBattle,
+            AwaitingBoardReset,
+            AwaitingPlayerLoad,
+            AwaitingVerification,
+        };
+
+        struct PendingRouteCRestore
+        {
+            RouteCCheckpoint checkpoint{};
+            RouteCRestorePhase phase{RouteCRestorePhase::AwaitingWaveIntercept};
+            std::chrono::steady_clock::time_point started_at{};
+            std::chrono::steady_clock::time_point phase_ready_at{};
+            UObject* intercepted_spawner{};
+            const void* intercepted_world{};
+            UObject* card_engine{};
+            bool action_queue_paused{};
+            std::string status{"running"};
+            std::string reason{};
+        };
+
+        struct PendingRouteCCapture
+        {
+            UObject* spawner{};
+            std::int32_t wave_index{};
+            std::chrono::steady_clock::time_point ready_at{};
+        };
+
+        struct RouteCWaveObservation
+        {
+            UObject* spawner{};
+            const void* world{};
+            std::int32_t wave_index{};
+        };
+
+        std::optional<ExecutableFingerprint> g_executable_fingerprint{};
+        std::optional<PendingRouteCRestore> g_pending_route_c_restore{};
+        std::optional<PendingRouteCCapture> g_pending_route_c_capture{};
+        std::optional<RouteCWaveObservation> g_route_c_wave_observation{};
+        std::chrono::steady_clock::time_point g_next_route_c_wave_poll{};
+        UFunction* g_spawn_wave_index_function{};
+        UFunction* g_spawn_next_wave_function{};
+        UClass* g_spawn_controller_class{};
+        std::optional<std::pair<int, int>> g_spawn_wave_index_hook_ids{};
+        std::optional<std::pair<int, int>> g_spawn_next_wave_hook_ids{};
+
+        auto is_live_instance(std::string_view full_name, std::string_view role) -> bool;
+        auto classify(std::string_view full_name) -> std::string;
+        auto object_class_name(UObject* object) -> std::string;
 
         constexpr std::array<std::string_view, 17> RelevantClassPrefixes{
             "BP_CardEngine_C ",
@@ -179,10 +249,16 @@ namespace QuantumCheckpoint
         constexpr std::size_t CardStateTurnAdjustmentOffset = 0x194;
         constexpr std::size_t CardStateTurnBaseOffset = 0x198;
         constexpr std::uintmax_t ExpectedGameExecutableSize = 82'718'720;
+        constexpr std::string_view ExpectedGameExecutableSha256 =
+            "0DCF220317FA31667C14DD7FB41A6757B94FF7CDE2262E5A87337D00CCB017A6";
         constexpr std::uintptr_t CurrentHealthGetterThunkRva = 0x102D100;
         constexpr std::uintptr_t CurrentTurnGetterThunkRva = 0x102D130;
+        constexpr std::uintptr_t CardEngineCurrentHealthGetterThunkRva = 0x1019930;
         constexpr std::uintptr_t NativeCurrentTurnGetterRva = 0xE323C0;
         constexpr std::uintptr_t SetCurrentHealthRva = 0xE522E0;
+        constexpr std::size_t CardEngineHealthStatePointerOffset = 0x268;
+        constexpr std::size_t PlayerStateCurrentHealthOffset = 0x1C;
+        constexpr std::size_t PlayerStateMaxHealthOffset = 0x24;
         constexpr auto TimedHealthProbeHold = std::chrono::milliseconds{1000};
         constexpr auto TimedTurnProbeHold = std::chrono::milliseconds{1000};
         constexpr std::array<std::uint8_t, 7> SetCurrentHealthSignature{
@@ -365,6 +441,598 @@ namespace QuantumCheckpoint
             return stream.str();
         }
 
+        struct BCryptAlgorithmHandle
+        {
+            BCRYPT_ALG_HANDLE value{};
+            ~BCryptAlgorithmHandle()
+            {
+                if (value)
+                {
+                    BCryptCloseAlgorithmProvider(value, 0);
+                }
+            }
+        };
+
+        struct BCryptHashHandle
+        {
+            BCRYPT_HASH_HANDLE value{};
+            ~BCryptHashHandle()
+            {
+                if (value)
+                {
+                    BCryptDestroyHash(value);
+                }
+            }
+        };
+
+        auto sha256_file(const std::filesystem::path& path) -> std::string
+        {
+            BCryptAlgorithmHandle algorithm{};
+            if (BCryptOpenAlgorithmProvider(
+                    &algorithm.value, BCRYPT_SHA256_ALGORITHM, nullptr, 0) < 0)
+            {
+                throw std::runtime_error{"Unable to open the Windows SHA-256 provider"};
+            }
+
+            DWORD object_size{};
+            DWORD hash_size{};
+            DWORD bytes_written{};
+            if (BCryptGetProperty(
+                    algorithm.value,
+                    BCRYPT_OBJECT_LENGTH,
+                    reinterpret_cast<PUCHAR>(&object_size),
+                    sizeof(object_size),
+                    &bytes_written,
+                    0) < 0
+                || BCryptGetProperty(
+                    algorithm.value,
+                    BCRYPT_HASH_LENGTH,
+                    reinterpret_cast<PUCHAR>(&hash_size),
+                    sizeof(hash_size),
+                    &bytes_written,
+                    0) < 0
+                || hash_size != 32)
+            {
+                throw std::runtime_error{"Unable to query the Windows SHA-256 provider"};
+            }
+
+            std::vector<UCHAR> hash_object(object_size);
+            std::vector<UCHAR> hash(hash_size);
+            BCryptHashHandle hash_handle{};
+            if (BCryptCreateHash(
+                    algorithm.value,
+                    &hash_handle.value,
+                    hash_object.data(),
+                    static_cast<ULONG>(hash_object.size()),
+                    nullptr,
+                    0,
+                    0) < 0)
+            {
+                throw std::runtime_error{"Unable to create the SHA-256 state"};
+            }
+
+            std::ifstream input{path, std::ios::binary};
+            if (!input)
+            {
+                throw std::runtime_error{"Unable to open the game executable for hashing"};
+            }
+            std::array<char, 1024 * 1024> buffer{};
+            while (input)
+            {
+                input.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
+                const auto count = input.gcount();
+                if (count > 0
+                    && BCryptHashData(
+                        hash_handle.value,
+                        reinterpret_cast<PUCHAR>(buffer.data()),
+                        static_cast<ULONG>(count),
+                        0) < 0)
+                {
+                    throw std::runtime_error{"Unable to hash the game executable"};
+                }
+            }
+            if (!input.eof())
+            {
+                throw std::runtime_error{"Unable to finish reading the game executable"};
+            }
+            if (BCryptFinishHash(
+                    hash_handle.value, hash.data(), static_cast<ULONG>(hash.size()), 0) < 0)
+            {
+                throw std::runtime_error{"Unable to finish the game executable SHA-256"};
+            }
+
+            std::ostringstream output{};
+            output << std::hex << std::uppercase << std::setfill('0');
+            for (const auto byte : hash)
+            {
+                output << std::setw(2) << static_cast<unsigned>(byte);
+            }
+            return output.str();
+        }
+
+        auto executable_fingerprint() -> const ExecutableFingerprint&
+        {
+            if (g_executable_fingerprint)
+            {
+                return *g_executable_fingerprint;
+            }
+
+            const auto module = GetModuleHandleW(L"Quantum-Win64-Shipping.exe");
+            if (!module)
+            {
+                throw std::runtime_error{"Game executable module was not found"};
+            }
+            std::array<wchar_t, 32768> executable_path{};
+            const auto path_length = GetModuleFileNameW(
+                module, executable_path.data(), static_cast<DWORD>(executable_path.size()));
+            if (path_length == 0 || path_length >= executable_path.size())
+            {
+                throw std::runtime_error{"Game executable path could not be resolved"};
+            }
+
+            ExecutableFingerprint fingerprint{};
+            fingerprint.path = std::filesystem::path{executable_path.data()};
+            fingerprint.size = std::filesystem::file_size(fingerprint.path);
+            fingerprint.sha256 = sha256_file(fingerprint.path);
+            g_executable_fingerprint.emplace(std::move(fingerprint));
+            return *g_executable_fingerprint;
+        }
+
+        auto fingerprint_matches_supported_game(const ExecutableFingerprint& fingerprint) -> bool
+        {
+            return fingerprint.size == ExpectedGameExecutableSize
+                && fingerprint.sha256 == ExpectedGameExecutableSha256;
+        }
+
+        auto export_property_text(UObject* object, StringViewType property_name)
+            -> std::optional<std::string>
+        {
+            if (!object)
+            {
+                return std::nullopt;
+            }
+            auto* property = object->GetPropertyByNameInChain(property_name.data());
+            if (!property)
+            {
+                return std::nullopt;
+            }
+
+            FString exported{};
+            auto* value = property->ContainerPtrToValuePtr<void>(object);
+            property->ExportTextItem(exported, value, value, object, 0);
+            return to_string(exported.GetCharArray());
+        }
+
+        auto import_property_text(UObject* object, StringViewType property_name,
+                                  std::string_view value) -> void
+        {
+            if (!object)
+            {
+                throw std::runtime_error{"Cannot import a property on a null object"};
+            }
+            auto* property = object->GetPropertyByNameInChain(property_name.data());
+            if (!property)
+            {
+                throw std::runtime_error{
+                    "Required reflected property was not found: " + to_string(property_name)};
+            }
+            const auto wide_value = to_wstring(value);
+            FOutputDevice errors{};
+            if (!property->ImportText(
+                    wide_value.c_str(),
+                    property->ContainerPtrToValuePtr<void>(object),
+                    0,
+                    object,
+                    &errors))
+            {
+                throw std::runtime_error{
+                    "Unreal rejected reflected property text: " + to_string(property_name)};
+            }
+        }
+
+        struct ReflectedArgument
+        {
+            StringViewType name{};
+            std::string_view value{};
+        };
+
+        struct ReflectedParameterBuffer
+        {
+            std::vector<std::uint8_t> bytes{};
+            std::vector<FProperty*> initialized{};
+
+            explicit ReflectedParameterBuffer(UFunction* function)
+                : bytes(static_cast<std::size_t>(function->GetParmsSize()), 0)
+            {
+                for (auto* property : function->ForEachProperty())
+                {
+                    if (property->HasAnyPropertyFlags(CPF_Parm))
+                    {
+                        property->InitializeValue_InContainer(bytes.data());
+                        initialized.push_back(property);
+                    }
+                }
+            }
+
+            ~ReflectedParameterBuffer()
+            {
+                for (auto iterator = initialized.rbegin(); iterator != initialized.rend(); ++iterator)
+                {
+                    (*iterator)->DestroyValue_InContainer(bytes.data());
+                }
+            }
+        };
+
+        auto call_reflected(UObject* object, StringViewType function_name,
+                            std::initializer_list<ReflectedArgument> arguments = {}) -> void
+        {
+            if (!object)
+            {
+                throw std::runtime_error{"Cannot call a reflected function on a null object"};
+            }
+            auto* function = object->GetFunctionByNameInChain(function_name.data());
+            if (!function)
+            {
+                throw std::runtime_error{
+                    "Required reflected function was not found: " + to_string(function_name)};
+            }
+
+            ReflectedParameterBuffer parameters{function};
+            for (const auto& argument : arguments)
+            {
+                auto* property = function->GetPropertyByNameInChain(argument.name.data());
+                if (!property || !property->HasAnyPropertyFlags(CPF_Parm)
+                    || property->HasAnyPropertyFlags(CPF_ReturnParm))
+                {
+                    throw std::runtime_error{
+                        "Required reflected function argument was not found: "
+                        + to_string(argument.name)};
+                }
+                const auto wide_value = to_wstring(argument.value);
+                FOutputDevice errors{};
+                if (!property->ImportText(
+                        wide_value.c_str(),
+                        property->ContainerPtrToValuePtr<void>(parameters.bytes.data()),
+                        0,
+                        object,
+                        &errors))
+                {
+                    throw std::runtime_error{
+                        "Unreal rejected reflected function argument: "
+                        + to_string(argument.name)};
+                }
+            }
+
+            object->ProcessEvent(function, parameters.bytes.empty() ? nullptr : parameters.bytes.data());
+        }
+
+        struct RouteCBattleObjects
+        {
+            UObject* game_instance{};
+            UObject* card_engine{};
+            UObject* spawner{};
+            UObject* bottom_bar{};
+        };
+
+        auto reflected_object_property(UObject* owner, StringViewType property_name) -> UObject*
+        {
+            if (!owner)
+            {
+                return nullptr;
+            }
+            auto* property = owner->GetPropertyByNameInChain(property_name.data());
+            if (!property || !property->IsA<FObjectProperty>())
+            {
+                return nullptr;
+            }
+            auto** storage = property->ContainerPtrToValuePtr<UObject*>(owner);
+            auto* object = storage ? *storage : nullptr;
+            if (!object || object->IsUnreachable()
+                || object->HasAnyFlags(
+                    static_cast<EObjectFlags>(RF_BeginDestroyed | RF_FinishDestroyed)))
+            {
+                return nullptr;
+            }
+            return object;
+        }
+
+        auto is_route_c_spawn_controller(UObject* object) -> bool
+        {
+            return object && g_spawn_controller_class && object->IsA(g_spawn_controller_class)
+                && object->GetPropertyByNameInChain(STR("currentWaveIndex"))
+                && object->GetFunctionByNameInChain(STR("spawnWaveIndex"));
+        }
+
+        auto find_route_c_objects(const void* preferred_world = nullptr) -> RouteCBattleObjects
+        {
+            RouteCBattleObjects result{};
+            UObjectGlobals::ForEachUObject([&](UObject* object,
+                                                [[maybe_unused]] int32_t object_index,
+                                                [[maybe_unused]] int32_t chunk_index) {
+                if (!object || object->IsUnreachable()
+                    || object->HasAnyFlags(
+                        static_cast<EObjectFlags>(RF_BeginDestroyed | RF_FinishDestroyed)))
+                {
+                    return LoopAction::Continue;
+                }
+                const std::string full_name = to_string(object->GetFullName());
+                const std::string role = classify(full_name);
+                if (role == "GI_Quantum_C" && full_name.contains("/Engine/Transient."))
+                {
+                    result.game_instance = object;
+                }
+                else if (role == "BP_CardEngine_C" && is_live_instance(full_name, role)
+                         && (!preferred_world
+                             || static_cast<const void*>(object->GetWorld()) == preferred_world))
+                {
+                    result.card_engine = object;
+                }
+                else if ((role == "Spawner_C" || is_route_c_spawn_controller(object))
+                         && is_live_instance(full_name, "Spawner_C")
+                         && (!preferred_world
+                             || static_cast<const void*>(object->GetWorld()) == preferred_world))
+                {
+                    result.spawner = object;
+                }
+                else if (role == "BP_BottomBar_C" && is_live_instance(full_name, role)
+                         && (!preferred_world
+                             || static_cast<const void*>(object->GetWorld()) == preferred_world))
+                {
+                    result.bottom_bar = object;
+                }
+                return LoopAction::Continue;
+            });
+
+            // Native dungeon spawners (for example NeskaraDungeon1Spawner) do not use a
+            // Blueprint "*_Spawner_C" class name. CardEngine owns the authoritative pointer,
+            // so prefer that exact controller over name-based discovery.
+            if (result.card_engine)
+            {
+                if (auto* anchored_spawner = reflected_object_property(
+                        result.card_engine, STR("mEnemySpawnController"));
+                    is_route_c_spawn_controller(anchored_spawner)
+                    && (!preferred_world
+                        || static_cast<const void*>(anchored_spawner->GetWorld()) == preferred_world))
+                {
+                    result.spawner = anchored_spawner;
+                }
+
+                if (auto* anchored_bottom_bar = reflected_object_property(
+                        result.card_engine, STR("mHUDBottomBar"));
+                    anchored_bottom_bar
+                    && (!preferred_world
+                        || static_cast<const void*>(anchored_bottom_bar->GetWorld()) == preferred_world))
+                {
+                    result.bottom_bar = anchored_bottom_bar;
+                }
+            }
+            return result;
+        }
+
+        auto find_route_c_unsafe_companion() -> std::optional<std::string>
+        {
+            constexpr std::array<std::string_view, 5> unsupported_classes{
+                "BP_academyIntroFilter_C ",
+                "BP_AuroraTutorialFilter_C ",
+                "BP_introTutorialFilter_C ",
+                "BP_BossEntranceTutorial_C ",
+                "BP_BossWaystoneWatcher_C ",
+            };
+
+            std::optional<std::string> result{};
+            UObjectGlobals::ForEachUObject([&](UObject* object,
+                                                [[maybe_unused]] int32_t object_index,
+                                                [[maybe_unused]] int32_t chunk_index) {
+                if (!object || result)
+                {
+                    return result ? LoopAction::Break : LoopAction::Continue;
+                }
+                const std::string full_name = to_string(object->GetFullName());
+                if (!full_name.contains(".PersistentLevel."))
+                {
+                    return LoopAction::Continue;
+                }
+                for (const auto class_prefix : unsupported_classes)
+                {
+                    if (full_name.starts_with(class_prefix))
+                    {
+                        result = object_class_name(object);
+                        return LoopAction::Break;
+                    }
+                }
+                return LoopAction::Continue;
+            });
+            return result;
+        }
+
+        auto object_class_name(UObject* object) -> std::string
+        {
+            if (!object)
+            {
+                return {};
+            }
+            const std::string full_name = to_string(object->GetFullName());
+            const auto separator = full_name.find(' ');
+            return separator == std::string::npos ? full_name : full_name.substr(0, separator);
+        }
+
+        auto route_c_checkpoint_path() -> std::filesystem::path
+        {
+            const auto mods_directory = std::filesystem::path{
+                UE4SSProgram::get_program().get_mods_directory()};
+            return mods_directory / STR("QuantumCheckpoint") / STR("Checkpoint")
+                / STR("route-c.json");
+        }
+
+        auto append_route_c_trace(std::string_view event) noexcept -> void
+        {
+            try
+            {
+                const auto mods_directory = std::filesystem::path{
+                    UE4SSProgram::get_program().get_mods_directory()};
+                const auto path = mods_directory / STR("QuantumCheckpoint")
+                    / STR("route-c-trace.log");
+                const HANDLE file = CreateFileW(
+                    path.c_str(),
+                    FILE_APPEND_DATA,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    nullptr,
+                    OPEN_ALWAYS,
+                    FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH,
+                    nullptr);
+                if (file == INVALID_HANDLE_VALUE)
+                {
+                    return;
+                }
+
+                SYSTEMTIME utc{};
+                GetSystemTime(&utc);
+                std::array<char, 512> line{};
+                const int length = std::snprintf(
+                    line.data(),
+                    line.size(),
+                    "%04u-%02u-%02uT%02u:%02u:%02u.%03uZ pid=%lu tid=%lu %.*s\r\n",
+                    static_cast<unsigned>(utc.wYear),
+                    static_cast<unsigned>(utc.wMonth),
+                    static_cast<unsigned>(utc.wDay),
+                    static_cast<unsigned>(utc.wHour),
+                    static_cast<unsigned>(utc.wMinute),
+                    static_cast<unsigned>(utc.wSecond),
+                    static_cast<unsigned>(utc.wMilliseconds),
+                    static_cast<unsigned long>(GetCurrentProcessId()),
+                    static_cast<unsigned long>(GetCurrentThreadId()),
+                    static_cast<int>(std::min(event.size(), line.size() / 2)),
+                    event.data());
+                if (length > 0)
+                {
+                    const DWORD bytes_to_write = static_cast<DWORD>(
+                        std::min<std::size_t>(static_cast<std::size_t>(length), line.size() - 1));
+                    DWORD bytes_written{};
+                    WriteFile(file, line.data(), bytes_to_write, &bytes_written, nullptr);
+                    FlushFileBuffers(file);
+                }
+                CloseHandle(file);
+            }
+            catch (...)
+            {
+                // This trace is a last-resort crash breadcrumb and must never escape into UE4SS.
+            }
+        }
+
+        auto append_route_c_trace_failure(std::string_view event, std::string_view reason) noexcept
+            -> void
+        {
+            try
+            {
+                std::string line{event};
+                line += " reason=";
+                for (const char character : reason)
+                {
+                    line.push_back(character == '\r' || character == '\n' ? ' ' : character);
+                }
+                append_route_c_trace(line);
+            }
+            catch (...)
+            {
+            }
+        }
+
+        auto write_file_atomically(const std::filesystem::path& path, std::string_view contents)
+            -> void
+        {
+            if (contents.empty() || contents.size() > RouteCMaximumFileBytes)
+            {
+                throw std::runtime_error{"Route C checkpoint exceeds the 2 MiB safety limit"};
+            }
+            std::filesystem::create_directories(path.parent_path());
+            auto temporary = path;
+            temporary += STR(".tmp");
+            auto backup = path;
+            backup += STR(".bak");
+
+            std::ofstream output{temporary, std::ios::binary | std::ios::trunc};
+            if (!output)
+            {
+                throw std::runtime_error{"Unable to open the temporary Route C checkpoint"};
+            }
+            output.write(contents.data(), static_cast<std::streamsize>(contents.size()));
+            output.flush();
+            if (!output)
+            {
+                throw std::runtime_error{"Unable to finish writing the Route C checkpoint"};
+            }
+            output.close();
+
+            std::error_code ignored{};
+            if (std::filesystem::exists(path))
+            {
+                std::filesystem::copy_file(
+                    path, backup, std::filesystem::copy_options::overwrite_existing, ignored);
+            }
+            if (!MoveFileExW(
+                    temporary.c_str(),
+                    path.c_str(),
+                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+            {
+                std::filesystem::remove(temporary, ignored);
+                throw std::runtime_error{"Atomic Route C checkpoint replacement failed"};
+            }
+        }
+
+        auto read_route_c_checkpoint() -> RouteCCheckpoint
+        {
+            append_route_c_trace("restore.read.begin");
+            const auto path = route_c_checkpoint_path();
+            std::error_code file_error{};
+            const bool exists = std::filesystem::exists(path, file_error);
+            if (file_error)
+            {
+                append_route_c_trace("restore.read.path-error");
+                throw std::runtime_error{"The Route C checkpoint path could not be inspected"};
+            }
+            if (!exists)
+            {
+                append_route_c_trace("restore.read.missing");
+                throw std::runtime_error{"No Route C checkpoint exists; save one first"};
+            }
+
+            const auto size = std::filesystem::file_size(path, file_error);
+            if (file_error)
+            {
+                append_route_c_trace("restore.read.size-error");
+                throw std::runtime_error{"The Route C checkpoint size could not be read"};
+            }
+            if (size == 0 || size > RouteCMaximumFileBytes)
+            {
+                append_route_c_trace("restore.read.invalid-size");
+                throw std::runtime_error{"Route C checkpoint is empty or exceeds the 2 MiB limit"};
+            }
+            std::ifstream input{path, std::ios::binary};
+            if (!input)
+            {
+                append_route_c_trace("restore.read.open-failed");
+                throw std::runtime_error{"Unable to open the Route C checkpoint"};
+            }
+            std::string contents(static_cast<std::size_t>(size), '\0');
+            input.read(contents.data(), static_cast<std::streamsize>(contents.size()));
+            if (!input)
+            {
+                append_route_c_trace("restore.read.incomplete");
+                throw std::runtime_error{"Unable to read the complete Route C checkpoint"};
+            }
+
+            append_route_c_trace("restore.read.parse");
+            std::string error{};
+            auto checkpoint = parse_route_c_checkpoint(contents, error);
+            if (!checkpoint)
+            {
+                append_route_c_trace("restore.read.rejected");
+                throw std::runtime_error{"Route C checkpoint was rejected: " + error};
+            }
+            append_route_c_trace("restore.read.complete");
+            return std::move(*checkpoint);
+        }
+
         auto parse_int32(std::string_view value) -> std::optional<std::int32_t>
         {
             std::int32_t parsed{};
@@ -399,6 +1067,21 @@ namespace QuantumCheckpoint
                 || protection == PAGE_WRITECOPY
                 || protection == PAGE_EXECUTE_READWRITE
                 || protection == PAGE_EXECUTE_WRITECOPY;
+        }
+
+        auto address_is_readable(const void* address, std::size_t size) -> bool
+        {
+            MEMORY_BASIC_INFORMATION memory{};
+            if (VirtualQuery(address, &memory, sizeof(memory)) != sizeof(memory)
+                || memory.State != MEM_COMMIT
+                || (memory.Protect & (PAGE_GUARD | PAGE_NOACCESS)) != 0)
+            {
+                return false;
+            }
+            const auto begin = reinterpret_cast<std::uintptr_t>(address);
+            const auto region_begin = reinterpret_cast<std::uintptr_t>(memory.BaseAddress);
+            const auto region_end = region_begin + memory.RegionSize;
+            return begin >= region_begin && begin + size >= begin && begin + size <= region_end;
         }
 
         auto format_address(std::uintptr_t address) -> std::string
@@ -485,14 +1168,21 @@ namespace QuantumCheckpoint
                 function_name,
                 object->GetFullName());
 
-            std::vector<uint8_t> parameters(parameter_size, 0);
-            object->ProcessEvent(function, parameters.data());
+            ReflectedParameterBuffer parameters{function};
+            object->ProcessEvent(function, parameters.bytes.data());
 
             FString exported{};
-            auto* return_value = return_property->ContainerPtrToValuePtr<void>(parameters.data());
+            auto* return_value = return_property->ContainerPtrToValuePtr<void>(
+                parameters.bytes.data());
             return_property->ExportTextItem(exported, return_value, nullptr, object, 0);
             std::string value = to_string(exported.GetCharArray());
-            return_property->DestroyValue_InContainer(parameters.data());
+            if (value.empty() && return_property->IsA<FArrayProperty>())
+            {
+                // UE 4.27 exports an empty TArray return value as an empty string. Keep a
+                // non-empty, importable representation so an empty storage/bench remains
+                // distinguishable from a missing function or return property.
+                value = "()";
+            }
 
             return PropertySnapshot{
                 .name = "getter:" + to_string(function_name),
@@ -540,14 +1230,39 @@ namespace QuantumCheckpoint
 
         auto append_private_card_state_diagnostics(ObjectSnapshot& snapshot, UObject* object) -> void
         {
+            const auto& fingerprint = executable_fingerprint();
+            if (!fingerprint_matches_supported_game(fingerprint)
+                || !address_is_readable(
+                    static_cast<const std::byte*>(static_cast<const void*>(object))
+                        + InGameCardStatePointerOffset,
+                    sizeof(void*)))
+            {
+                snapshot.properties.push_back({
+                    .name = "nativeDiagnostic:status",
+                    .value = "refused; unsupported executable or unreadable card state pointer",
+                });
+                return;
+            }
             const auto* state = read_native_value<const void*>(
                 object,
                 InGameCardStatePointerOffset);
-            if (!state)
+            if (!state
+                || !address_is_readable(
+                    static_cast<const std::byte*>(state) + CardStateBaseHealthOffset,
+                    sizeof(std::int32_t))
+                || !address_is_readable(
+                    static_cast<const std::byte*>(state) + CardStateCurrentHealthOffset,
+                    sizeof(std::int32_t))
+                || !address_is_readable(
+                    static_cast<const std::byte*>(state) + CardStateTurnAdjustmentOffset,
+                    sizeof(std::int32_t))
+                || !address_is_readable(
+                    static_cast<const std::byte*>(state) + CardStateTurnBaseOffset,
+                    sizeof(std::int32_t)))
             {
                 snapshot.properties.push_back({
                     .name = "nativeDiagnostic:stateObject",
-                    .value = "null",
+                    .value = "null-or-unreadable",
                 });
                 return;
             }
@@ -591,6 +1306,849 @@ namespace QuantumCheckpoint
             }
         }
 
+        auto required_text(std::optional<std::string> value, std::string_view label)
+            -> std::string
+        {
+            if (!value || value->empty())
+            {
+                throw std::runtime_error{
+                    "Required Route C value was not available: " + std::string{label}};
+            }
+            return std::move(*value);
+        }
+
+        auto required_getter_text(UObject* object, StringViewType function_name) -> std::string
+        {
+            auto value = export_zero_argument_getter(object, function_name);
+            if (!value || value->value.empty())
+            {
+                throw std::runtime_error{
+                    "Required Route C getter was not available: " + to_string(function_name)};
+            }
+            return std::move(value->value);
+        }
+
+        auto capture_route_c_checkpoint(std::optional<PendingRouteCCapture> expected = std::nullopt)
+            -> std::filesystem::path
+        {
+            append_route_c_trace("capture.begin");
+            if (g_pending_route_c_restore || g_pending_health_write_probe
+                || g_pending_turn_write_probe)
+            {
+                throw std::runtime_error{"A restore or native write probe is already active"};
+            }
+
+            const auto objects = find_route_c_objects();
+            append_route_c_trace(objects.game_instance
+                                     ? "capture.object.game-instance.found"
+                                     : "capture.object.game-instance.missing");
+            append_route_c_trace(objects.card_engine
+                                     ? "capture.object.card-engine.found"
+                                     : "capture.object.card-engine.missing");
+            append_route_c_trace(objects.spawner
+                                     ? "capture.object.spawn-controller.found"
+                                     : "capture.object.spawn-controller.missing");
+            append_route_c_trace(objects.bottom_bar
+                                     ? "capture.object.bottom-bar.found"
+                                     : "capture.object.bottom-bar.missing");
+            if (!objects.game_instance || !objects.card_engine || !objects.spawner
+                || !objects.bottom_bar)
+            {
+                throw std::runtime_error{"A complete active battle was not found"};
+            }
+            if (expected && expected->spawner != objects.spawner)
+            {
+                throw std::runtime_error{"The wave-start spawner was replaced before capture"};
+            }
+            if (const auto unsafe_companion = find_route_c_unsafe_companion())
+            {
+                throw std::runtime_error{
+                    "Route C v1 refuses a tutorial or boss encounter companion: "
+                    + *unsafe_companion};
+            }
+
+            const auto game_state = required_text(
+                export_property_text(objects.card_engine, STR("currentGameState")),
+                "CardEngine.currentGameState");
+            if (game_state != "OPEN")
+            {
+                throw std::runtime_error{"The battle is not in the stable OPEN state"};
+            }
+            const auto active_selection = required_text(
+                export_property_text(objects.card_engine, STR("mActiveCardSelectionPrompt")),
+                "CardEngine.mActiveCardSelectionPrompt");
+            const auto active_placement = required_text(
+                export_property_text(objects.card_engine, STR("mActiveCardPlacementPrompt")),
+                "CardEngine.mActiveCardPlacementPrompt");
+            if (active_selection != "None" || active_placement != "None")
+            {
+                throw std::runtime_error{"A card prompt is active; checkpoint capture is not stable"};
+            }
+
+            RouteCCheckpoint checkpoint{};
+            checkpoint.captured_at_utc = utc_timestamp();
+            const auto& fingerprint = executable_fingerprint();
+            if (!fingerprint_matches_supported_game(fingerprint))
+            {
+                throw std::runtime_error{
+                    "Route C is disabled for this unvalidated game executable"};
+            }
+            checkpoint.game_executable_sha256 = fingerprint.sha256;
+            checkpoint.game_executable_size = fingerprint.size;
+            checkpoint.source_level_name = required_text(
+                export_property_text(objects.game_instance, STR("sourceLevelName")),
+                "GameInstance.sourceLevelName");
+            checkpoint.active_character_info = required_text(
+                export_property_text(objects.game_instance, STR("activeCharacterInfo")),
+                "GameInstance.activeCharacterInfo");
+            checkpoint.active_stage_info = required_text(
+                export_property_text(objects.game_instance, STR("activeStageInfo")),
+                "GameInstance.activeStageInfo");
+            if (!checkpoint.active_stage_info.contains("Type=DUNGEON")
+                || checkpoint.active_stage_info.contains("Type=DUNGEON_EVENT"))
+            {
+                throw std::runtime_error{
+                    "Route C v1 supports ordinary DUNGEON battles only"};
+            }
+
+            append_route_c_trace("capture.get-active-decklist.begin");
+            checkpoint.active_decklist = required_getter_text(
+                objects.game_instance, STR("getActiveDecklist"));
+            append_route_c_trace("capture.get-active-decklist.complete");
+            append_route_c_trace("capture.get-active-storage.begin");
+            checkpoint.active_storage = required_getter_text(
+                objects.game_instance, STR("getActiveStorage"));
+            append_route_c_trace("capture.get-active-storage.complete");
+            append_route_c_trace("capture.get-current-deck-run.begin");
+            checkpoint.deck_run = required_getter_text(
+                objects.game_instance, STR("getCurrentDeckRun"));
+            append_route_c_trace("capture.get-current-deck-run.complete");
+
+            const auto health_text = required_getter_text(
+                objects.card_engine, STR("getCurrentHealth"));
+            const auto max_health_text = required_getter_text(
+                objects.card_engine, STR("getMaxHealth"));
+            const auto health = parse_int32(health_text);
+            const auto max_health = parse_int32(max_health_text);
+            if (!health || !max_health)
+            {
+                throw std::runtime_error{"Player health getters did not return integers"};
+            }
+            checkpoint.player_health = *health;
+            checkpoint.player_max_health = *max_health;
+
+            const auto wave_text = required_text(
+                export_property_text(objects.spawner, STR("currentWaveIndex")),
+                "SpawnController.currentWaveIndex");
+            const auto wave = parse_int32(wave_text);
+            if (!wave)
+            {
+                throw std::runtime_error{"Spawner wave index was not an integer"};
+            }
+            checkpoint.wave_index = *wave;
+            if (expected && checkpoint.wave_index != expected->wave_index)
+            {
+                throw std::runtime_error{"Spawner wave changed before automatic capture"};
+            }
+
+            checkpoint.spawner_class = object_class_name(objects.spawner);
+            checkpoint.spawner_class_size = static_cast<std::uint32_t>(
+                objects.spawner->GetClassPrivate()->GetPropertiesSize());
+            checkpoint.payload_checksum = route_c_payload_checksum(checkpoint);
+            std::string validation_error{};
+            if (!validate_route_c_checkpoint(checkpoint, validation_error))
+            {
+                throw std::runtime_error{
+                    "Route C checkpoint validation failed: " + validation_error};
+            }
+
+            const auto path = route_c_checkpoint_path();
+            append_route_c_trace("capture.write.begin");
+            write_file_atomically(path, serialize_route_c_checkpoint(std::move(checkpoint)));
+            append_route_c_trace("capture.complete");
+            return path;
+        }
+
+        auto write_route_c_restore_report(const PendingRouteCRestore& restore)
+            -> std::filesystem::path
+        {
+            const auto mods_directory = std::filesystem::path{
+                UE4SSProgram::get_program().get_mods_directory()};
+            const auto path = mods_directory / STR("QuantumCheckpoint") / STR("Reports") /
+                (STR("route-c-restore-") + to_wstring(filename_timestamp()) + STR(".json"));
+            std::ostringstream output{};
+            output << "{\n"
+                   << "  \"schemaVersion\": 1,\n"
+                   << "  \"kind\": \"route-c-restore-report\",\n"
+                   << "  \"capturedAtUtc\": \"" << json_escape(utc_timestamp()) << "\",\n"
+                   << "  \"status\": \"" << json_escape(restore.status) << "\",\n"
+                   << "  \"reason\": \"" << json_escape(restore.reason) << "\",\n"
+                   << "  \"sourceLevelName\": \""
+                   << json_escape(restore.checkpoint.source_level_name) << "\",\n"
+                   << "  \"waveIndex\": " << restore.checkpoint.wave_index << ",\n"
+                   << "  \"spawnerClass\": \""
+                   << json_escape(restore.checkpoint.spawner_class) << "\",\n"
+                   << "  \"targetHealth\": " << restore.checkpoint.player_health << "\n"
+                   << "}\n";
+            write_file_atomically(path, output.str());
+            return path;
+        }
+
+        auto finish_route_c_restore(std::string status, std::string reason) -> void
+        {
+            if (!g_pending_route_c_restore)
+            {
+                return;
+            }
+            auto completed = std::move(*g_pending_route_c_restore);
+            completed.status = std::move(status);
+            completed.reason = std::move(reason);
+
+            if (completed.action_queue_paused && completed.card_engine)
+            {
+                try
+                {
+                    const auto live_objects = find_route_c_objects();
+                    if (live_objects.card_engine != completed.card_engine)
+                    {
+                        throw std::runtime_error{
+                            "the paused CardEngine is no longer the live battle object"};
+                    }
+                    call_reflected(live_objects.card_engine,
+                                   STR("setActionQueueSystemPaused"),
+                                   {{STR("IsPaused"), "False"}});
+                }
+                catch (...)
+                {
+                    if (completed.status == "passed")
+                    {
+                        completed.status = "failed";
+                        completed.reason = "restore completed but the action queue could not be resumed";
+                    }
+                }
+            }
+
+            g_pending_route_c_restore.reset();
+            try
+            {
+                const auto path = write_route_c_restore_report(completed);
+                Output::send<LogLevel::Verbose>(
+                    STR("[QuantumCheckpoint] Route C restore {}: {}; report: {}\n"),
+                    to_wstring(completed.status),
+                    to_wstring(completed.reason),
+                    path.wstring());
+            }
+            catch (const std::exception& error)
+            {
+                Output::send<LogLevel::Error>(
+                    STR("[QuantumCheckpoint] Route C restore {} but its report failed: {}\n"),
+                    to_wstring(completed.status),
+                    to_wstring(error.what()));
+            }
+        }
+
+        auto begin_route_c_restore() -> void
+        {
+            append_route_c_trace("restore.begin");
+            if (g_pending_route_c_restore || g_pending_health_write_probe
+                || g_pending_turn_write_probe)
+            {
+                throw std::runtime_error{"A restore or native write probe is already active"};
+            }
+            auto checkpoint = read_route_c_checkpoint();
+            append_route_c_trace("restore.checkpoint-loaded");
+            const auto& fingerprint = executable_fingerprint();
+            if (!fingerprint_matches_supported_game(fingerprint)
+                || checkpoint.game_executable_size != fingerprint.size
+                || checkpoint.game_executable_sha256 != fingerprint.sha256)
+            {
+                throw std::runtime_error{
+                    "Route C checkpoint belongs to a different game executable"};
+            }
+
+            const auto objects = find_route_c_objects();
+            if (!objects.game_instance)
+            {
+                throw std::runtime_error{"The live Quantum GameInstance was not found"};
+            }
+
+            const auto original_character = required_text(
+                export_property_text(objects.game_instance, STR("activeCharacterInfo")),
+                "original GameInstance.activeCharacterInfo");
+            const auto original_stage = required_text(
+                export_property_text(objects.game_instance, STR("activeStageInfo")),
+                "original GameInstance.activeStageInfo");
+            const auto original_source_level = required_text(
+                export_property_text(objects.game_instance, STR("sourceLevelName")),
+                "original GameInstance.sourceLevelName");
+            append_route_c_trace("restore.original-deck.begin");
+            const auto original_deck = required_getter_text(
+                objects.game_instance, STR("getActiveDecklist"));
+            append_route_c_trace("restore.original-deck.complete");
+            append_route_c_trace("restore.original-storage.begin");
+            const auto original_storage = required_getter_text(
+                objects.game_instance, STR("getActiveStorage"));
+            append_route_c_trace("restore.original-storage.complete");
+
+            const auto rollback_game_instance = [&]() {
+                const auto attempt = [](auto&& operation) {
+                    try
+                    {
+                        operation();
+                    }
+                    catch (...)
+                    {
+                    }
+                };
+                attempt([&]() {
+                    import_property_text(
+                        objects.game_instance, STR("activeCharacterInfo"), original_character);
+                });
+                attempt([&]() {
+                    import_property_text(
+                        objects.game_instance, STR("activeStageInfo"), original_stage);
+                });
+                attempt([&]() {
+                    import_property_text(
+                        objects.game_instance, STR("sourceLevelName"), original_source_level);
+                });
+                attempt([&]() {
+                    call_reflected(objects.game_instance,
+                                   STR("setActiveDecklist"),
+                                   {{STR("newDecklist"), original_deck}});
+                });
+                attempt([&]() {
+                    call_reflected(objects.game_instance,
+                                   STR("updateBench"),
+                                   {{STR("newCards"), original_storage}});
+                });
+            };
+
+            try
+            {
+                append_route_c_trace("restore.game-instance-import.begin");
+                import_property_text(objects.game_instance,
+                                     STR("activeCharacterInfo"),
+                                     checkpoint.active_character_info);
+                import_property_text(objects.game_instance,
+                                     STR("activeStageInfo"),
+                                     checkpoint.active_stage_info);
+                import_property_text(objects.game_instance,
+                                     STR("sourceLevelName"),
+                                     checkpoint.source_level_name);
+                call_reflected(objects.game_instance,
+                               STR("setActiveDecklist"),
+                               {{STR("newDecklist"), checkpoint.active_decklist}});
+                call_reflected(objects.game_instance,
+                               STR("updateBench"),
+                               {{STR("newCards"), checkpoint.active_storage}});
+                append_route_c_trace("restore.game-instance-import.complete");
+            }
+            catch (...)
+            {
+                rollback_game_instance();
+                throw;
+            }
+
+            const auto now = std::chrono::steady_clock::now();
+            g_pending_route_c_capture.reset();
+            g_pending_route_c_restore.emplace(PendingRouteCRestore{
+                .checkpoint = std::move(checkpoint),
+                .phase = RouteCRestorePhase::AwaitingWaveIntercept,
+                .started_at = now,
+                .phase_ready_at = now,
+            });
+
+            try
+            {
+                append_route_c_trace("restore.reload-battle-area.begin");
+                call_reflected(objects.game_instance, STR("reloadBattleArea"));
+                append_route_c_trace("restore.reload-battle-area.returned");
+            }
+            catch (...)
+            {
+                g_pending_route_c_restore.reset();
+                rollback_game_instance();
+                throw;
+            }
+            Output::send<LogLevel::Verbose>(
+                STR("[QuantumCheckpoint] Route C reload requested; waiting to redirect the initial wave to {}.\n"),
+                g_pending_route_c_restore->checkpoint.wave_index);
+        }
+
+        auto apply_route_c_health(const RouteCCheckpoint& checkpoint,
+                                  const RouteCBattleObjects& objects) -> void
+        {
+            const auto current_text = required_getter_text(
+                objects.card_engine, STR("getCurrentHealth"));
+            const auto max_text = required_getter_text(objects.card_engine, STR("getMaxHealth"));
+            const auto current = parse_int32(current_text);
+            const auto maximum = parse_int32(max_text);
+            if (!current || !maximum || *maximum <= 0)
+            {
+                throw std::runtime_error{"Restored player health getters were invalid"};
+            }
+            const auto target = std::clamp(checkpoint.player_health, 1, *maximum);
+            if (target > *current)
+            {
+                const auto amount = std::to_string(target - *current);
+                call_reflected(
+                    objects.card_engine, STR("healHealth"), {{STR("Amount"), amount}});
+            }
+            else if (target < *current)
+            {
+                if (!fingerprint_matches_supported_game(executable_fingerprint()))
+                {
+                    throw std::runtime_error{
+                        "Downward player-health restore is disabled for this game executable"};
+                }
+                const auto module = GetModuleHandleW(L"Quantum-Win64-Shipping.exe");
+                auto* health_getter = objects.card_engine->GetFunctionByNameInChain(
+                    STR("getCurrentHealth"));
+                if (!module || !health_getter
+                    || reinterpret_cast<std::uintptr_t>(health_getter->GetFuncPtr())
+                        != reinterpret_cast<std::uintptr_t>(module)
+                            + CardEngineCurrentHealthGetterThunkRva
+                    || objects.card_engine->GetClassPrivate()->GetPropertiesSize()
+                        < CardEngineHealthStatePointerOffset + sizeof(void*)
+                    || !address_is_readable(
+                        static_cast<const std::byte*>(
+                            static_cast<const void*>(objects.card_engine))
+                            + CardEngineHealthStatePointerOffset,
+                        sizeof(void*)))
+                {
+                    throw std::runtime_error{
+                        "Player-health native state layout did not pass the executable gate"};
+                }
+
+                const auto* state = read_native_value<const void*>(
+                    objects.card_engine, CardEngineHealthStatePointerOffset);
+                if (!state
+                    || !address_is_writable(
+                        static_cast<const std::byte*>(state) + PlayerStateCurrentHealthOffset,
+                        sizeof(std::int32_t))
+                    || !address_is_readable(
+                        static_cast<const std::byte*>(state) + PlayerStateMaxHealthOffset,
+                        sizeof(std::int32_t)))
+                {
+                    throw std::runtime_error{
+                        "Player-health native state is null or not safely accessible"};
+                }
+
+                const auto native_current = read_native_value<std::int32_t>(
+                    state, PlayerStateCurrentHealthOffset);
+                const auto native_maximum = read_native_value<std::int32_t>(
+                    state, PlayerStateMaxHealthOffset);
+                if (native_current != *current || native_maximum != *maximum)
+                {
+                    throw std::runtime_error{
+                        "Player-health native state disagrees with the reflected getters"};
+                }
+
+                const auto restore_original_health = [&]() {
+                    write_native_value(state, PlayerStateCurrentHealthOffset, native_current);
+                    try
+                    {
+                        import_property_text(objects.bottom_bar,
+                                             STR("currentHealth"),
+                                             std::to_string(native_current));
+                        call_reflected(objects.card_engine,
+                                       STR("OnHealthChanged"),
+                                       {{STR("Delta"), "0"},
+                                        {STR("changeType"), "IN_GAME"}});
+                    }
+                    catch (...)
+                    {
+                    }
+                };
+
+                try
+                {
+                    write_native_value(state, PlayerStateCurrentHealthOffset, target);
+                    import_property_text(
+                        objects.bottom_bar, STR("currentHealth"), std::to_string(target));
+                    // The authoritative value is already set. A zero-delta notification asks the
+                    // Blueprint/UI layer to refresh without applying damage a second time.
+                    call_reflected(objects.card_engine,
+                                   STR("OnHealthChanged"),
+                                   {{STR("Delta"), "0"},
+                                    {STR("changeType"), "IN_GAME"}});
+
+                    const auto verified_health = parse_int32(required_getter_text(
+                        objects.card_engine, STR("getCurrentHealth")));
+                    const auto verified_bottom_bar = parse_int32(required_text(
+                        export_property_text(objects.bottom_bar, STR("currentHealth")),
+                        "BottomBar.currentHealth after restore"));
+                    if (verified_health != target || verified_bottom_bar != target)
+                    {
+                        throw std::runtime_error{
+                            "Downward player-health restore did not verify in native state and UI"};
+                    }
+                }
+                catch (...)
+                {
+                    restore_original_health();
+                    throw;
+                }
+            }
+        }
+
+        auto update_route_c_restore() -> void
+        {
+            if (!g_pending_route_c_restore)
+            {
+                return;
+            }
+            const auto now = std::chrono::steady_clock::now();
+            if (now - g_pending_route_c_restore->started_at > std::chrono::seconds{45})
+            {
+                finish_route_c_restore("failed", "restore timed out before verification");
+                return;
+            }
+            if (now < g_pending_route_c_restore->phase_ready_at)
+            {
+                return;
+            }
+
+            try
+            {
+                auto& restore = *g_pending_route_c_restore;
+                if (restore.phase == RouteCRestorePhase::AwaitingWaveIntercept)
+                {
+                    return;
+                }
+
+                const auto objects = find_route_c_objects(restore.intercepted_world);
+                if (!objects.card_engine || !objects.spawner || !objects.bottom_bar)
+                {
+                    return;
+                }
+                const auto game_state = export_property_text(
+                    objects.card_engine, STR("currentGameState"));
+                if (!game_state || *game_state != "OPEN")
+                {
+                    return;
+                }
+                if (object_class_name(objects.spawner) != restore.checkpoint.spawner_class)
+                {
+                    throw std::runtime_error{"Restored spawner class does not match the checkpoint"};
+                }
+                if (objects.spawner != restore.intercepted_spawner)
+                {
+                    throw std::runtime_error{
+                        "The live spawner is not the instance intercepted during restore"};
+                }
+                const auto wave = parse_int32(required_text(
+                    export_property_text(objects.spawner, STR("currentWaveIndex")),
+                    "restored SpawnController.currentWaveIndex"));
+                if (!wave || *wave != restore.checkpoint.wave_index)
+                {
+                    throw std::runtime_error{"Restored wave index does not match the checkpoint"};
+                }
+
+                if (restore.phase == RouteCRestorePhase::AwaitingStableBattle)
+                {
+                    restore.card_engine = objects.card_engine;
+                    call_reflected(
+                        objects.card_engine,
+                        STR("setActionQueueSystemPaused"),
+                        {{STR("IsPaused"), "True"}});
+                    restore.action_queue_paused = true;
+                    call_reflected(objects.card_engine, STR("resetPlayerBoard"));
+                    restore.phase = RouteCRestorePhase::AwaitingBoardReset;
+                    restore.phase_ready_at = now + std::chrono::milliseconds{1000};
+                    return;
+                }
+                if (restore.phase == RouteCRestorePhase::AwaitingBoardReset)
+                {
+                    call_reflected(objects.card_engine, STR("LoadPlayerCardsStart"));
+                    restore.phase = RouteCRestorePhase::AwaitingPlayerLoad;
+                    restore.phase_ready_at = now + std::chrono::milliseconds{2500};
+                    return;
+                }
+                if (restore.phase == RouteCRestorePhase::AwaitingPlayerLoad)
+                {
+                    apply_route_c_health(restore.checkpoint, objects);
+                    call_reflected(
+                        objects.card_engine,
+                        STR("setActionQueueSystemPaused"),
+                        {{STR("IsPaused"), "False"}});
+                    restore.action_queue_paused = false;
+                    restore.phase = RouteCRestorePhase::AwaitingVerification;
+                    restore.phase_ready_at = now + std::chrono::milliseconds{750};
+                    return;
+                }
+
+                const auto health = parse_int32(required_getter_text(
+                    objects.card_engine, STR("getCurrentHealth")));
+                const auto maximum = parse_int32(required_getter_text(
+                    objects.card_engine, STR("getMaxHealth")));
+                if (!health || !maximum
+                    || *health != std::clamp(restore.checkpoint.player_health, 1, *maximum))
+                {
+                    throw std::runtime_error{"Restored player health did not verify"};
+                }
+                if (required_getter_text(objects.game_instance, STR("getActiveDecklist"))
+                        != restore.checkpoint.active_decklist
+                    || required_getter_text(objects.game_instance, STR("getActiveStorage"))
+                        != restore.checkpoint.active_storage)
+                {
+                    throw std::runtime_error{"Restored deck or storage did not verify"};
+                }
+
+                finish_route_c_restore(
+                    "passed",
+                    "ordinary substage, player deck, storage, and health were restored");
+            }
+            catch (const std::exception& error)
+            {
+                finish_route_c_restore("failed", error.what());
+            }
+        }
+
+        auto update_route_c_capture() -> void
+        {
+            if (!g_pending_route_c_capture || g_pending_route_c_restore
+                || std::chrono::steady_clock::now() < g_pending_route_c_capture->ready_at)
+            {
+                return;
+            }
+            auto capture = *g_pending_route_c_capture;
+            g_pending_route_c_capture.reset();
+            try
+            {
+                const auto path = capture_route_c_checkpoint(capture);
+                Output::send<LogLevel::Verbose>(
+                    STR("[QuantumCheckpoint] Route C checkpoint saved for wave {}: {}\n"),
+                    capture.wave_index,
+                    path.wstring());
+            }
+            catch (const std::exception& error)
+            {
+                append_route_c_trace_failure("auto-capture.refused", error.what());
+                Output::send<LogLevel::Warning>(
+                    STR("[QuantumCheckpoint] Automatic Route C checkpoint refused: {}\n"),
+                    to_wstring(error.what()));
+            }
+        }
+
+        auto find_live_route_c_card_engine() -> UObject*
+        {
+            UObject* result{};
+            static const FName card_engine_class_name{STR("BP_CardEngine_C")};
+            UObjectGlobals::ForEachUObject([&](UObject* object,
+                                                [[maybe_unused]] int32_t object_index,
+                                                [[maybe_unused]] int32_t chunk_index) {
+                if (!object || object->IsUnreachable()
+                    || object->HasAnyFlags(
+                        static_cast<EObjectFlags>(RF_BeginDestroyed | RF_FinishDestroyed)))
+                {
+                    return LoopAction::Continue;
+                }
+                auto* object_class = object->GetClassPrivate();
+                if (!object_class
+                    || !object_class->GetNamePrivate().Equals(card_engine_class_name))
+                {
+                    return LoopAction::Continue;
+                }
+                const auto full_name = to_string(object->GetFullName());
+                if (is_live_instance(full_name, "BP_CardEngine_C") && object->GetWorld())
+                {
+                    // A previous PersistentLevel can remain reachable briefly while travel is
+                    // completing. UObject iteration order puts the newly-created live instance
+                    // last, matching the full battle-object discovery used during capture.
+                    result = object;
+                }
+                return LoopAction::Continue;
+            });
+            return result;
+        }
+
+        auto update_route_c_wave_poll() -> void
+        {
+            const auto now = std::chrono::steady_clock::now();
+            if (!g_unreal_ready.load(std::memory_order_acquire)
+                || now < g_next_route_c_wave_poll)
+            {
+                return;
+            }
+            g_next_route_c_wave_poll = now + std::chrono::milliseconds{750};
+
+            // Restore owns battle travel and wave selection while it is active. Resuming the
+            // observer afterwards also makes the replacement spawner a fresh observation.
+            if (g_pending_route_c_restore)
+            {
+                g_route_c_wave_observation.reset();
+                return;
+            }
+
+            auto* card_engine = find_live_route_c_card_engine();
+            auto* spawner = reflected_object_property(
+                card_engine, STR("mEnemySpawnController"));
+            if (!card_engine || !is_route_c_spawn_controller(spawner))
+            {
+                g_route_c_wave_observation.reset();
+                return;
+            }
+
+            const auto game_state = export_property_text(
+                card_engine, STR("currentGameState"));
+            const auto wave_text = export_property_text(
+                spawner, STR("currentWaveIndex"));
+            const auto wave = wave_text ? parse_int32(*wave_text) : std::nullopt;
+            if (!game_state || *game_state != "OPEN" || !wave || *wave < 0 || *wave > 1000)
+            {
+                // Preserve the previous stable observation across a short transition. Once the
+                // new wave reaches OPEN, its changed index is detected exactly once.
+                return;
+            }
+
+            const auto world = static_cast<const void*>(spawner->GetWorld());
+            if (g_route_c_wave_observation
+                && g_route_c_wave_observation->spawner == spawner
+                && g_route_c_wave_observation->world == world
+                && g_route_c_wave_observation->wave_index == *wave)
+            {
+                return;
+            }
+
+            g_route_c_wave_observation.emplace(RouteCWaveObservation{
+                .spawner = spawner,
+                .world = world,
+                .wave_index = *wave,
+            });
+            g_pending_route_c_capture.emplace(PendingRouteCCapture{
+                .spawner = spawner,
+                .wave_index = *wave,
+                .ready_at = now + std::chrono::milliseconds{1500},
+            });
+            append_route_c_trace("auto-capture.scheduled.wave-poll");
+            Output::send<LogLevel::Verbose>(
+                STR("[QuantumCheckpoint] Route C observed stable wave {}; checkpoint capture scheduled.\n"),
+                *wave);
+        }
+
+        auto route_c_process_event_pre(UObject* context, UFunction* function, void* parameters)
+            -> void
+        {
+            if (!g_pending_route_c_restore || !function || function != g_spawn_wave_index_function
+                || !context || !parameters
+                || g_pending_route_c_restore->phase != RouteCRestorePhase::AwaitingWaveIntercept)
+            {
+                return;
+            }
+            auto& restore = *g_pending_route_c_restore;
+            if (object_class_name(context) != restore.checkpoint.spawner_class)
+            {
+                return;
+            }
+            auto* wave_property = function->GetPropertyByNameInChain(STR("waveIndex"));
+            if (!wave_property)
+            {
+                return;
+            }
+            auto* wave_index = wave_property->ContainerPtrToValuePtr<std::int32_t>(parameters);
+            if (!wave_index)
+            {
+                return;
+            }
+            *wave_index = restore.checkpoint.wave_index;
+            restore.intercepted_spawner = context;
+            restore.intercepted_world = context->GetWorld();
+            restore.phase = RouteCRestorePhase::AwaitingStableBattle;
+            restore.phase_ready_at = std::chrono::steady_clock::now();
+            Output::send<LogLevel::Verbose>(
+                STR("[QuantumCheckpoint] Route C redirected initial wave generation to {}.\n"),
+                *wave_index);
+        }
+
+        auto route_c_process_event_post(UObject* context, UFunction* function, void* parameters)
+            -> void
+        {
+            if (!function || !context || !is_route_c_spawn_controller(context))
+            {
+                return;
+            }
+            if (g_pending_route_c_restore)
+            {
+                return;
+            }
+
+            std::optional<std::int32_t> wave_index{};
+            std::string_view trigger{};
+            if (function == g_spawn_wave_index_function && parameters)
+            {
+                auto* wave_property = function->GetPropertyByNameInChain(STR("waveIndex"));
+                auto* value = wave_property
+                    ? wave_property->ContainerPtrToValuePtr<std::int32_t>(parameters)
+                    : nullptr;
+                if (value)
+                {
+                    wave_index = *value;
+                    trigger = "spawn-wave-index";
+                }
+            }
+            else if (function == g_spawn_next_wave_function)
+            {
+                const auto value = export_property_text(context, STR("currentWaveIndex"));
+                if (value)
+                {
+                    wave_index = parse_int32(*value);
+                    trigger = "spawn-next-wave";
+                }
+            }
+
+            if (!wave_index || *wave_index < 0 || *wave_index > 1000)
+            {
+                return;
+            }
+            g_pending_route_c_capture.emplace(PendingRouteCCapture{
+                .spawner = context,
+                .wave_index = *wave_index,
+                .ready_at = std::chrono::steady_clock::now() + std::chrono::milliseconds{1500},
+            });
+            append_route_c_trace(
+                trigger == "spawn-next-wave"
+                    ? "auto-capture.scheduled.spawn-next-wave"
+                    : "auto-capture.scheduled.spawn-wave-index");
+        }
+
+        auto route_c_native_spawn_wave_pre(
+            UnrealScriptFunctionCallableContext& context,
+            [[maybe_unused]] void* custom_data) -> void
+        {
+            route_c_process_event_pre(
+                context.Context,
+                context.TheStack.CurrentNativeFunction(),
+                context.TheStack.Locals());
+        }
+
+        auto route_c_native_spawn_wave_post(
+            UnrealScriptFunctionCallableContext& context,
+            [[maybe_unused]] void* custom_data) -> void
+        {
+            route_c_process_event_post(
+                context.Context,
+                context.TheStack.CurrentNativeFunction(),
+                context.TheStack.Locals());
+        }
+
+        auto route_c_native_spawn_next_pre(
+            [[maybe_unused]] UnrealScriptFunctionCallableContext& context,
+            [[maybe_unused]] void* custom_data) -> void
+        {
+        }
+
+        auto route_c_native_spawn_next_post(
+            UnrealScriptFunctionCallableContext& context,
+            [[maybe_unused]] void* custom_data) -> void
+        {
+            route_c_process_event_post(
+                context.Context,
+                context.TheStack.CurrentNativeFunction(),
+                context.TheStack.Locals());
+        }
+
         auto collect_inventory() -> BattleInventory
         {
             BattleInventory inventory{};
@@ -604,7 +2162,11 @@ namespace QuantumCheckpoint
                 }
 
                 const std::string full_name = to_string(object->GetFullName());
-                const std::string role = classify(full_name);
+                std::string role = classify(full_name);
+                if (role.empty() && is_route_c_spawn_controller(object))
+                {
+                    role = "Spawner_C";
+                }
                 const bool game_instance = role == "GI_Quantum_C";
                 if (role.empty() || (!game_instance && !is_live_instance(full_name, role)))
                 {
@@ -843,14 +2405,10 @@ namespace QuantumCheckpoint
                     return;
                 }
 
-                std::array<wchar_t, 32768> executable_path{};
-                const auto path_length = GetModuleFileNameW(
-                    module, executable_path.data(), static_cast<DWORD>(executable_path.size()));
-                if (path_length == 0 || path_length >= executable_path.size()
-                    || std::filesystem::file_size(executable_path.data()) != ExpectedGameExecutableSize)
+                if (!fingerprint_matches_supported_game(executable_fingerprint()))
                 {
                     result.status = "refused";
-                    result.reason = "game executable size does not match the validated build";
+                    result.reason = "game executable SHA-256 does not match the validated build";
                     const auto path = write_health_probe_report(result);
                     Output::send<LogLevel::Error>(
                         STR("[QuantumCheckpoint] Health write probe refused: {}; report: {}\n"),
@@ -1099,9 +2657,36 @@ namespace QuantumCheckpoint
             }
             catch (const std::exception& error)
             {
-                Output::send<LogLevel::Error>(
-                    STR("[QuantumCheckpoint] Timed health restore failed before completion: {}\n"),
-                    to_wstring(error.what()));
+                auto failed_result = result;
+                failed_result.status = "failed";
+                failed_result.reason = "exception during timed health restore: "
+                    + std::string{error.what()};
+                if (pending.setter && pending.state
+                    && address_is_writable(
+                        static_cast<const std::byte*>(pending.state)
+                            + CardStateCurrentHealthOffset,
+                        sizeof(std::int32_t))
+                    && read_native_value<std::int32_t>(
+                        pending.state, CardStateCurrentHealthOffset) == result.test_value)
+                {
+                    pending.setter(pending.state, result.before_private);
+                    failed_result.restored_private = result.before_private;
+                }
+                g_pending_health_write_probe.reset();
+                try
+                {
+                    const auto path = write_health_probe_report(failed_result);
+                    Output::send<LogLevel::Error>(
+                        STR("[QuantumCheckpoint] Timed health restore failed safely: {}; report: {}\n"),
+                        to_wstring(error.what()),
+                        path.wstring());
+                }
+                catch (...)
+                {
+                    Output::send<LogLevel::Error>(
+                        STR("[QuantumCheckpoint] Timed health restore and report both failed: {}\n"),
+                        to_wstring(error.what()));
+                }
             }
         }
 
@@ -1187,14 +2772,10 @@ namespace QuantumCheckpoint
                 }
                 else
                 {
-                    std::array<wchar_t, 32768> executable_path{};
-                    const auto path_length = GetModuleFileNameW(
-                        module, executable_path.data(), static_cast<DWORD>(executable_path.size()));
-                    if (path_length == 0 || path_length >= executable_path.size()
-                        || std::filesystem::file_size(executable_path.data()) != ExpectedGameExecutableSize)
+                    if (!fingerprint_matches_supported_game(executable_fingerprint()))
                     {
                         result.status = "refused";
-                        result.reason = "game executable size does not match the validated build";
+                        result.reason = "game executable SHA-256 does not match the validated build";
                     }
                     else
                     {
@@ -1483,9 +3064,42 @@ namespace QuantumCheckpoint
             }
             catch (const std::exception& error)
             {
-                Output::send<LogLevel::Error>(
-                    STR("[QuantumCheckpoint] Timed turn restore failed before completion: {}\n"),
-                    to_wstring(error.what()));
+                auto failed_result = result;
+                failed_result.status = "failed";
+                failed_result.reason = "exception during timed turn restore: "
+                    + std::string{error.what()};
+                if (pending.state
+                    && address_is_writable(
+                        static_cast<const std::byte*>(pending.state)
+                            + CardStateTurnAdjustmentOffset,
+                        sizeof(std::int32_t))
+                    && read_native_value<std::int32_t>(
+                        pending.state, CardStateTurnAdjustmentOffset)
+                        == result.test_adjustment)
+                {
+                    write_native_value(
+                        pending.state,
+                        CardStateTurnAdjustmentOffset,
+                        result.before_adjustment);
+                    failed_result.restored_adjustment = result.before_adjustment;
+                    failed_result.restored_computed = static_cast<std::int64_t>(
+                        result.before_base) + result.before_adjustment;
+                }
+                g_pending_turn_write_probe.reset();
+                try
+                {
+                    const auto path = write_turn_probe_report(failed_result);
+                    Output::send<LogLevel::Error>(
+                        STR("[QuantumCheckpoint] Timed turn restore failed safely: {}; report: {}\n"),
+                        to_wstring(error.what()),
+                        path.wstring());
+                }
+                catch (...)
+                {
+                    Output::send<LogLevel::Error>(
+                        STR("[QuantumCheckpoint] Timed turn restore and report both failed: {}\n"),
+                        to_wstring(error.what()));
+                }
             }
         }
     } // namespace
@@ -1496,10 +3110,32 @@ namespace QuantumCheckpoint
         QuantumCheckpointMod()
         {
             ModName = STR("QuantumCheckpoint");
-            ModVersion = STR("0.8.0-dev");
-            ModDescription = STR("Battle inventory exporter and guarded native write experiment");
+            ModVersion = STR("0.9.5-dev");
+            ModDescription = STR("Route C semantic substage checkpoint prototype");
             ModAuthors = STR("zaofenMachine and contributors");
             ModIntendedSDKVersion = STR("3.0.1");
+        }
+
+        ~QuantumCheckpointMod() override
+        {
+            try
+            {
+                if (g_spawn_next_wave_function && g_spawn_next_wave_hook_ids)
+                {
+                    UObjectGlobals::UnregisterHook(
+                        g_spawn_next_wave_function, *g_spawn_next_wave_hook_ids);
+                }
+                if (g_spawn_wave_index_function && g_spawn_wave_index_hook_ids)
+                {
+                    UObjectGlobals::UnregisterHook(
+                        g_spawn_wave_index_function, *g_spawn_wave_index_hook_ids);
+                }
+            }
+            catch (...)
+            {
+            }
+            g_spawn_next_wave_hook_ids.reset();
+            g_spawn_wave_index_hook_ids.reset();
         }
 
         auto on_program_start() -> void override
@@ -1519,58 +3155,189 @@ namespace QuantumCheckpoint
                 {Input::ModifierKey::CONTROL, Input::ModifierKey::SHIFT},
                 []() { g_turn_write_probe_requested.store(true, std::memory_order_release); });
 
+            UE4SSProgram::get_program().register_keydown_event(
+                Input::Key::F5,
+                {Input::ModifierKey::CONTROL, Input::ModifierKey::SHIFT},
+                []() {
+                    append_route_c_trace("hotkey.save.received");
+                    g_route_c_save_requested.store(true, std::memory_order_release);
+                });
+
+            UE4SSProgram::get_program().register_keydown_event(
+                Input::Key::F6,
+                {Input::ModifierKey::CONTROL, Input::ModifierKey::SHIFT},
+                []() {
+                    append_route_c_trace("hotkey.load.received");
+                    g_route_c_load_requested.store(true, std::memory_order_release);
+                });
+
             Output::send<LogLevel::Verbose>(
-                STR("[QuantumCheckpoint] Loaded C++ prototype; Ctrl+F1 exports, Ctrl+Shift+F12 tests health, Ctrl+Shift+F9 tests turn count.\n"));
+                STR("[QuantumCheckpoint] Loaded Route C prototype; waves auto-save in supported dungeons, Ctrl+Shift+F5 saves, Ctrl+Shift+F6 restores, Ctrl+F1 exports.\n"));
         }
 
         auto on_unreal_init() -> void override
         {
+            g_spawn_wave_index_function = UObjectGlobals::StaticFindObject<UFunction*>(
+                nullptr,
+                nullptr,
+                STR("/Script/Quantum.SpawnController:spawnWaveIndex"));
+            g_spawn_next_wave_function = UObjectGlobals::StaticFindObject<UFunction*>(
+                nullptr,
+                nullptr,
+                STR("/Script/Quantum.SpawnController:spawnNextWave"));
+            g_spawn_controller_class = UObjectGlobals::StaticFindObject<UClass*>(
+                nullptr,
+                nullptr,
+                STR("/Script/Quantum.SpawnController"));
             g_unreal_ready.store(true, std::memory_order_release);
-            Output::send<LogLevel::Verbose>(
-                STR("[QuantumCheckpoint] Unreal reflection is ready.\n"));
+            if (g_spawn_wave_index_function && g_spawn_next_wave_function
+                && g_spawn_controller_class)
+            {
+                try
+                {
+                    g_spawn_wave_index_hook_ids = UObjectGlobals::RegisterHook(
+                        g_spawn_wave_index_function,
+                        route_c_native_spawn_wave_pre,
+                        route_c_native_spawn_wave_post,
+                        nullptr);
+                    g_spawn_next_wave_hook_ids = UObjectGlobals::RegisterHook(
+                        g_spawn_next_wave_function,
+                        route_c_native_spawn_next_pre,
+                        route_c_native_spawn_next_post,
+                        nullptr);
+                    append_route_c_trace("native-wave-hooks.ready");
+                    Output::send<LogLevel::Verbose>(
+                        STR("[QuantumCheckpoint] Unreal reflection and native Route C wave hooks are ready.\n"));
+                }
+                catch (const std::exception& error)
+                {
+                    append_route_c_trace_failure("native-wave-hooks.failed", error.what());
+                    Output::send<LogLevel::Error>(
+                        STR("[QuantumCheckpoint] Route C native wave hook registration failed: {}\n"),
+                        to_wstring(error.what()));
+                }
+            }
+            else
+            {
+                Output::send<LogLevel::Error>(
+                    STR("[QuantumCheckpoint] Route C disabled: a required SpawnController function was not found.\n"));
+            }
         }
 
         auto on_update() -> void override
         {
-            finish_health_write_probe_if_due();
-            finish_turn_write_probe_if_due();
-
-            if (g_export_requested.exchange(false, std::memory_order_acq_rel))
+            try
             {
-                if (g_unreal_ready.load(std::memory_order_acquire))
+                update_route_c_restore();
+                update_route_c_capture();
+                update_route_c_wave_poll();
+                finish_health_write_probe_if_due();
+                finish_turn_write_probe_if_due();
+
+                if (g_route_c_save_requested.exchange(false, std::memory_order_acq_rel))
                 {
-                    export_inventory();
+                    append_route_c_trace("manual-save.dispatch");
+                    try
+                    {
+                        const auto path = capture_route_c_checkpoint();
+                        Output::send<LogLevel::Verbose>(
+                            STR("[QuantumCheckpoint] Manual Route C checkpoint saved: {}\n"),
+                            path.wstring());
+                    }
+                    catch (const std::exception& error)
+                    {
+                        append_route_c_trace_failure("manual-save.refused", error.what());
+                        Output::send<LogLevel::Warning>(
+                            STR("[QuantumCheckpoint] Manual Route C checkpoint refused: {}\n"),
+                            to_wstring(error.what()));
+                    }
                 }
-                else
+
+                if (g_route_c_load_requested.exchange(false, std::memory_order_acq_rel))
                 {
-                    Output::send<LogLevel::Warning>(
-                        STR("[QuantumCheckpoint] Unreal is not initialized; export ignored.\n"));
+                    append_route_c_trace("manual-load.dispatch");
+                    try
+                    {
+                    if (!g_spawn_wave_index_function || !g_spawn_controller_class
+                        || !g_spawn_wave_index_hook_ids)
+                        {
+                            throw std::runtime_error{"Route C wave hook is unavailable"};
+                        }
+                        begin_route_c_restore();
+                    }
+                    catch (const std::exception& error)
+                    {
+                        append_route_c_trace("manual-load.refused");
+                        Output::send<LogLevel::Error>(
+                            STR("[QuantumCheckpoint] Route C restore request refused: {}\n"),
+                            to_wstring(error.what()));
+                    }
+                }
+
+                if (g_export_requested.exchange(false, std::memory_order_acq_rel))
+                {
+                    if (g_unreal_ready.load(std::memory_order_acquire))
+                    {
+                        export_inventory();
+                    }
+                    else
+                    {
+                        Output::send<LogLevel::Warning>(
+                            STR("[QuantumCheckpoint] Unreal is not initialized; export ignored.\n"));
+                    }
+                }
+
+                if (g_health_write_probe_requested.exchange(false, std::memory_order_acq_rel))
+                {
+                    if (g_unreal_ready.load(std::memory_order_acquire))
+                    {
+                        run_health_write_probe();
+                    }
+                    else
+                    {
+                        Output::send<LogLevel::Warning>(
+                            STR("[QuantumCheckpoint] Unreal is not initialized; health write probe ignored.\n"));
+                    }
+                }
+
+                if (g_turn_write_probe_requested.exchange(false, std::memory_order_acq_rel))
+                {
+                    if (g_unreal_ready.load(std::memory_order_acquire))
+                    {
+                        run_turn_write_probe();
+                    }
+                    else
+                    {
+                        Output::send<LogLevel::Warning>(
+                            STR("[QuantumCheckpoint] Unreal is not initialized; turn write probe ignored.\n"));
+                    }
                 }
             }
-
-            if (g_health_write_probe_requested.exchange(false, std::memory_order_acq_rel))
+            catch (const std::exception& error)
             {
-                if (g_unreal_ready.load(std::memory_order_acquire))
+                append_route_c_trace("on-update.unhandled-standard-exception");
+                try
                 {
-                    run_health_write_probe();
+                    Output::send<LogLevel::Error>(
+                        STR("[QuantumCheckpoint] Unhandled update error was contained: {}\n"),
+                        to_wstring(error.what()));
                 }
-                else
+                catch (...)
                 {
-                    Output::send<LogLevel::Warning>(
-                        STR("[QuantumCheckpoint] Unreal is not initialized; health write probe ignored.\n"));
+                    append_route_c_trace("on-update.error-reporting-failed");
                 }
             }
-
-            if (g_turn_write_probe_requested.exchange(false, std::memory_order_acq_rel))
+            catch (...)
             {
-                if (g_unreal_ready.load(std::memory_order_acquire))
+                append_route_c_trace("on-update.unhandled-unknown-exception");
+                try
                 {
-                    run_turn_write_probe();
+                    Output::send<LogLevel::Error>(
+                        STR("[QuantumCheckpoint] An unknown update error was contained.\n"));
                 }
-                else
+                catch (...)
                 {
-                    Output::send<LogLevel::Warning>(
-                        STR("[QuantumCheckpoint] Unreal is not initialized; turn write probe ignored.\n"));
+                    append_route_c_trace("on-update.unknown-error-reporting-failed");
                 }
             }
         }

@@ -2,16 +2,18 @@
 
 《Quantum Protocol》局内检查点 Mod 的可行性研究与实验原型。
 
-目前已确认：可以通过 UE4SS 读取战斗对象、记录卡牌区域与场上位置，并调用部分原生函数恢复生命或重建玩家牌组。但“退出游戏后仍可读取的完整检查点”尚未实现，本仓库当前不是可直接游玩的成品 Mod。
+当前主线已确定为路线 C：先实现“普通地牢小关的语义重开”，再决定是否继续投入精确恢复。v0.9 已完成跨进程检查点格式、原子写入、版本门禁、关卡重载、波次重定向、玩家牌组/缓存重建、生命恢复及结果报告；首轮实机读取暴露了运行库 `abort`，随后版本依次修正反射返回缓冲区、原生 Dungeon Spawner、合法空缓存区与自动保存锚点。v0.9.4 已实机完成首个手动检查点，但具体原生 UFunction 钩子仍未观察到正常小关切换；v0.9.5 改用低频权威波次观测驱动自动保存，恢复拦截钩子继续保留待测。当前仍需复测确认，因此暂不视为稳定成品。
 
 ## 当前结论
 
-我们正在比较两条实现路线，尚未最终选型：
+当前不再同时推进两条高成本精确路线。路线 C v1 的语义是：
 
-- 小关开头检查点：敌人可按关卡原生逻辑生成，但需要精确恢复玩家手牌、场上、墓地等状态。
-- “重编程”完成后检查点：玩家牌区可按原生重编程规则重新洗牌并抽五张，避免保存手牌、场上与墓地；代价是必须精确恢复保存时的敌人状态。
+- 在普通 `DUNGEON` 小关生成稳定后自动覆盖唯一检查点，也可按 `Ctrl+Shift+F5` 手动保存。
+- 读取时重新进入保存的战斗，把首次生成重定向到保存的波次，再用保存的活动牌组和缓存区重建玩家牌区，重新洗牌并抽牌，最后恢复生命。
+- 不保证原手牌、牌库顺序、场上、墓地、敌人受伤或效果与保存画面一致；这是“小关语义重开”，不是精确快照。
+- 首版显式排除无限模式、地牢事件、教程、Boss 伴生逻辑和带额外状态的 Spawner。
 
-无论采用哪条路线，可靠的跨进程恢复都需要自定义持久化文件、重新进入对应战斗、恢复关卡上下文，并处理游戏结束界面与输入状态。详见：
+精确恢复路线 A/B 已冻结，只有路线 C 通过真实运行验收后才继续评估。详见：
 
 - [需求基线](docs/requirements.md)
 - [架构路线对比](docs/architecture-options.md)
@@ -21,6 +23,7 @@
 - [原生卡牌状态验证](docs/phase-4-native-card-state.md)
 - [受控生命值写入验证](docs/phase-5-guarded-health-write.md)
 - [受控回合计数写入验证](docs/phase-6-guarded-turn-write.md)
+- [路线 C 垂直切片](docs/phase-7-route-c-vertical-slice.md)
 - [文档索引](docs/README.md)
 
 ## 目录
@@ -63,7 +66,7 @@ Lua 版 `Ctrl+F1` 敌人清空/重建实验已移除：实测会先触发原生�
 
 C++ 构建前提、已验证工具链和反射结构提取方法见 [C++ 开发说明](docs/cpp-development.md)。
 
-## C++ 研究模块
+## C++ 路线 C 原型
 
 构建并进行无写入部署检查：
 
@@ -78,9 +81,20 @@ C++ 构建前提、已验证工具链和反射结构提取方法见 [C++ 开发�
 .\scripts\Install-CppMod.ps1
 ```
 
-安装器会把 DLL 部署为 `Mods\QuantumCheckpoint\dlls\main.dll`，在现有 `mods.txt` 中加入 `QuantumCheckpoint : 1`，并把精确回滚材料保存在被 Git 忽略的 `backups/cpp` 与 `runtime` 目录。若旧 Lua 研究探针存在，安装器会在本次 C++ 部署中将其禁用，避免破坏性研究热键与 C++ 实验冲突；回滚时会恢复部署前配置。进入战斗后按 `Ctrl+F1`，只读报告应生成到 `Mods\QuantumCheckpoint\Reports`。
+安装器会把 DLL 部署为 `Mods\QuantumCheckpoint\dlls\main.dll`，在现有 `mods.txt` 中加入 `QuantumCheckpoint : 1`，并把精确回滚材料保存在被 Git 忽略的 `backups/cpp` 与 `runtime` 目录。若旧 Lua 研究探针存在，安装器会在本次 C++ 部署中将其禁用；回滚时会恢复部署前配置。
 
-当前 v0.8 提供两个仅用于可丢弃流程的受控写入探针：`Ctrl+Shift+F12` 把受伤存活卡的当前生命临时加 1；`Ctrl+Shift+F9` 把正数回合计数临时加 1。两者都会跨帧保持约一秒，并在重新验证对象身份和字段值后自动恢复。实测生命与回合 UI 均会同步增加并恢复，且无崩溃；这些实验仍不等于完整检查点恢复已经可用，详见 [第五阶段报告](docs/phase-5-guarded-health-write.md)和 [第六阶段报告](docs/phase-6-guarded-turn-write.md)。
+v0.9.5 路线 C 热键与输出：
+
+- `Ctrl+Shift+F5`：在受支持的稳定普通小关手动保存；每次正常波次生成后也会自动保存。
+- `Ctrl+Shift+F6`：读取唯一检查点并执行语义重开。
+- `Ctrl+F1`：保留只读对象报告。
+- 检查点：`Mods\QuantumCheckpoint\Checkpoint\route-c.json`，原子替换并保留 `.bak`。
+- 恢复结果：`Mods\QuantumCheckpoint\Reports\route-c-restore-*.json`。
+- 诊断轨迹：`Mods\QuantumCheckpoint\route-c-trace.log`；F5/F6 和各高风险阶段都会立即刷盘。
+
+当前检查点仅接受已验证游戏 EXE 的完整 SHA-256，且只允许普通 `DUNGEON`、无活动提示、稳定 `OPEN` 状态和无额外状态的普通 Spawner。读取会重洗牌并重抽，不恢复保存瞬间的精确卡牌/敌人画面。
+
+旧的生命与回合写入探针仍保留用于可丢弃测试局，但不属于路线 C 的日常操作。路线 C 的实现和验收步骤见 [第七阶段报告](docs/phase-7-route-c-vertical-slice.md)。
 
 回滚 C++ 模块：
 

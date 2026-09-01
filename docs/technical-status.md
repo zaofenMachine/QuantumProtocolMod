@@ -1,16 +1,30 @@
 # 技术状态与已知事实
 
-最后更新：2026-08-31。
+最后更新：2026-09-01。
 
 ## 环境
 
 - 游戏：Quantum Protocol，Windows / Unreal Engine 4。
 - 已测试安装目录：`F:\SteamLibrary\steamapps\common\Quantum Protocol`。
 - 注入/反射工具：UE4SS 3.0.1 zDEV。
-- 当前实现：UE4SS Lua 研究探针加 C++ 反射/原生状态导出器，以及生命与回合计数的跨帧受控写入探针；尚不具备跨进程恢复。
+- 当前实现：C++ v0.9.5 路线 C 修正版已部署。v0.9.0 首轮实机读取三次触发相同运行库 `abort`；v0.9.1 修正复杂反射返回值生命周期和读取边界；v0.9.2 修正原生 SpawnController 子类识别；v0.9.3 修正合法空缓存区；v0.9.4 的具体原生 UFunction 钩子在正常小关切换中仍未命中，但手动保存首次完整成功；v0.9.5 改以低频读取权威 `currentWaveIndex` 驱动自动保存。构建与离线测试通过，自动保存和恢复真实运行验收尚未完成。
 - 正式跨进程恢复倾向 UE4SS C++ Mod。只读导出器 v0.1–v0.5 已使用 RE-UE4SS v3.0.1、UEPseudo、MSVC 14.38 和固定 Rust nightly 完成构建、部署与真实战斗验证，均未导致游戏崩溃。v0.5 复杂样本包含 141 个相关对象和 17 张活动卡。
 - Windows 11 SDK `10.0.28000.0` 已被 CMake 正确选中并以 Windows `10.0.19045` 为目标完成构建，不需要额外安装 Windows 10 SDK。
 - 已在战斗场景成功生成 CXX SDK：662 个头文件，关键 Quantum 类、结构和函数签名均已取得。详细证据见 [sdk-analysis.md](sdk-analysis.md)。
+- 当前已验证游戏 EXE：大小 `82718720` 字节，SHA-256 `0DCF220317FA31667C14DD7FB41A6757B94FF7CDE2262E5A87337D00CCB017A6`。v0.9.x 的保存、恢复和所有私有字段诊断/写探针都使用完整散列门禁。
+
+## 路线 C v0.9.5 实现状态
+
+- 已实现独立 `route-c.json`，schema 1、2 MiB 上限、规范负载 FNV-1a 校验、严格字段类型检查、临时文件写入和原子替换；旧文件保留为 `.bak`。
+- 已加入持久化单元测试，覆盖 UTF-8/转义往返、负载篡改拒绝、无限模式拒绝和有状态 Spawner 拒绝；构建脚本现在自动运行 CTest，当前 `1/1` 通过。
+- 保存只接受普通 `DUNGEON`、完整战斗对象、`OPEN` 状态、无活动卡牌提示、普通 Spawner 尺寸及无已知教程/Boss 伴生对象。
+- 恢复通过 `QuantumGameInstance.reloadBattleArea()` 重入战斗，并用具体原生 UFunction 前置钩子重定向首次 `SpawnController.spawnWaveIndex(int)`。
+- 新战斗稳定后暂停动作队列，原生清空并重载玩家牌区、恢复生命，再验证 Spawner 实例/类型、波次、生命、活动牌组和缓存区；45 秒超时与所有异常均写结构化报告。
+- 重载前任一关卡/牌组导入失败会尽力回滚原 GameInstance 数据；失败收尾只在仍是同一个活动 CardEngine 时恢复动作队列，避免解引用跨关卡旧对象。
+- 向下恢复生命不再只修改 BottomBar。v0.9 在完整 EXE 指纹、CardEngine getter thunk RVA、类尺寸、内存页权限及 getter/私有值交叉验证全部通过后，写入 CardEngine 权威生命状态，再同步 BottomBar 并发送零增量 UI 通知；任一验证失败会尽力回滚原生命。
+- 恢复在波次拦截时记录新 Spawner 所属 World，后续只从该 World 选择 CardEngine、Spawner 和 BottomBar，并跳过已销毁或不可达 UObject，避免关卡切换期间误选旧实例。
+- v0.9.5 当前 DLL 为 `643072` 字节，SHA-256 `843D45D379F8229E43C1FF0EAC982997059B65CFF348638B65FBCED791D8B5C5`；部署 ID `20260901-230923-817`，`QuantumCheckpoint : 1`、旧 Lua 探针为 `0`。
+- 尚未证明：真实普通地牢中的反射结构导入、首次波次拦截时序、向下生命写回后的 UI/流程一致性，以及恢复后完整战斗流程。不能仅凭编译和离线测试称为成功。
 
 ## 已验证能力
 
@@ -45,6 +59,34 @@
 ### 当前战斗中清空并重生敌人
 
 原 `Ctrl+F1` 调用 `clearEnemyBoard()` 后，游戏立即把当前小关判定为完成并进入下一小关，未能得到可比较的旧波次重建结果。该入口已从源码和部署副本移除。
+
+### 路线 C v0.9.0 首轮读取 abort
+
+2026-09-01 首轮实机覆盖了三种入口：战斗内 Esc 菜单读取、返回标题后读取、重启后在主界面直接读取，三次均退出。Windows WER 分别在 `21:40`、`21:44`、`21:45` 记录相同的 `BEX64`：`ucrtbase.dll + 0x7286e`、异常 `0xc0000409`、FAST_FAIL 数据 `7`；该偏移位于 `abort()` 内。游戏未生成新的 Crash Reporter 转储，预期目录也没有 `route-c.json` 或恢复报告，因此界面位置不是分歧点，且不能把这些样本计为进入恢复状态机后的失败。
+
+代码审查发现复杂零参数 Getter 使用了仅清零、未按 FProperty 初始化的返回缓冲区；自动/手动保存读取 `Decklist`、Storage 和 DeckRun 时可能破坏返回对象生命周期。v0.9.1 改为统一的 `ReflectedParameterBuffer` 初始化/逆序析构；无存档读取改用 `error_code` 路径并给出显式拒绝；整个 `on_update` 增加最后异常边界。`route-c-trace.log` 对热键接收、读取、复杂 Getter、写盘、导入和重载阶段使用 `FILE_FLAG_WRITE_THROUGH` 与 `FlushFileBuffers`。这些是针对现有证据的修复候选，必须由下一轮实机结果确认，尚不能宣称根因已闭合。
+
+### v0.9.1 普通地牢 Spawner 识别失败
+
+无存档 F6 已在两个独立游戏进程中安全拒绝，轨迹完整到 `manual-load.refused`，且没有新增 WER 崩溃。随后保存测试中，实机只读报告确认 CardEngine 为 `OPEN`、BottomBar/GameInstance/敌人与 13 张活动卡均存在，关卡为 `sourceLevelName=neskaraDungeon1`、`Type=DUNGEON`；缺失项只有按名称查找的 `Spawner_C`。`activeStageInfo` 显示权威生成器实际为原生类 `/Script/Quantum.NeskaraDungeon1Spawner`，不含蓝图 `_C` 后缀。
+
+v0.9.2 不再依赖生成器名称：从活动 CardEngine 的反射对象字段 `mEnemySpawnController` 取得精确实例，验证其继承 `/Script/Quantum.SpawnController` 且暴露 `currentWaveIndex/spawnWaveIndex`，并同样用 `mHUDBottomBar` 锚定 HUD。名称枚举只保留为诊断回退；每次捕获会分别记录四个必需对象是否存在。
+
+### v0.9.2 空缓存区与自动锚点误判
+
+v0.9.2 第三小关手动保存已找到 GameInstance、CardEngine、原生 SpawnController 和 BottomBar，且读取活动牌组成功；随后 `getActiveStorage()` 返回空文本，旧门禁将其当成 Getter 缺失而拒绝。第三阶段只读报告早已证明 UE 4.27 的空 `TArray` 返回值会导出为空文本，因此这是合法空缓存区，不是读取失败。v0.9.3 仅在返回属性确认为 `FArrayProperty` 时把空文本规范化为可回读的 `()`。
+
+同一进程的控制台和强制刷盘轨迹没有任何 Mod 自动捕获记录；第一小关看到的自动保存是游戏自身提示。旧 C++ 自动捕获只监听 `spawnWaveIndex(int)`，但第一阶段实机已确认正常小关推进命中的是 `spawnNextWave()`。v0.9.3 在 `spawnNextWave` 后读取权威 `currentWaveIndex` 并延迟 1.5 秒捕获，同时保留 `spawnWaveIndex` 用于恢复重定向；自动拒绝原因也会写入持久轨迹。
+
+### v0.9.3 ProcessEvent 层未命中原生波次调用
+
+v0.9.3 在新进程中确认反射初始化成功，`spawnWaveIndex`、`spawnNextWave` 和 SpawnController 类全部找到，但进入第一小关后没有任何自动调度轨迹，也没有检查点。这表明游戏的原生波次调用不经过当前注册的全局 `UObject::ProcessEvent` 回调；仅增加函数名不会解决。
+
+v0.9.4 改用 `UObjectGlobals::RegisterHook(UFunction*)`，与已实机命中的 Lua `RegisterHook` 共用 UE4SS 原生 UFunction 入口。`spawnWaveIndex` 前置回调保留参数重定向，`spawnNextWave` 后置回调读取权威 `currentWaveIndex` 并调度捕获；钩子 ID 会保存并在模块析构时注销。只有原生恢复钩子注册成功时 F6 才可进入重载事务。
+
+v0.9.4 新进程在第一小关手动保存成功，生成了首个完整 `route-c.json`：普通 `cometDungeon1`、原生 `CometDungeon1Spawner`、波次 `0`、生命 `9/9`，活动牌组、合法空缓存 `()` 和 DeckRun 均写入并通过校验。进入第二小关后文件未自动覆盖，轨迹也没有任何原生回调调度记录，因此具体 UFunction 钩子同样不是正常推进的可靠自动保存入口。
+
+v0.9.5 每 750 ms 只筛选一次活动 `BP_CardEngine_C`，从其 `mEnemySpawnController` 权威引用读取 `currentWaveIndex`；仅在战斗为 `OPEN` 且 Spawner 实例、World 或波次变化时调度一次 1.5 秒延迟捕获。它不猜测事件函数，也不在每帧执行完整检查点捕获。原生 `spawnWaveIndex` 前置钩子仍仅用于检验恢复重载是否经过可重定向入口。
 
 ## 已识别的关键 API
 
@@ -106,9 +148,9 @@ CXX SDK 进一步确认：已公开的卡牌状态修改函数主要是 `Action_
 
 ## 下一步需要获得的证据
 
-1. 在实际非零场景验证通用/特殊计数器，并收集带持续效果与特殊 Spawner 的样本。
-2. 区分效果显示状态与权威效果执行状态，定位安全的读取与写回 API。
-3. 把 UE `ExportTextItem` 输出转换为版本化、可校验的结构化检查点数据。
-4. 验证从菜单进入指定流程/关卡的安全路径与加载时机，并设计完整恢复事务的暂停、依赖顺序和失败回滚。
+1. 在真实普通 `DUNGEON` 连续执行至少三轮“自动/手动保存 → 返回菜单或重启 → 读取 → 正常完成小关”，核对恢复报告和日志。
+2. 分别覆盖目标生命低于、等于和高于新战斗初始生命的样本，并确认 UI 与权威 getter 一致。
+3. 用 v0.9.5 先确认第一、第二小关分别自动写入波次 `0/1`，再执行“确认文件存在 → 战斗内读取”的分段复测；若仍失败，以 `route-c-trace.log` 的最后阶段和原因文本为准继续收敛。
+4. C 路线稳定后再决定 UI、检查点生命周期及精确恢复的下一条最小增量。
 
 具体构建要求和当前阻塞见 [cpp-development.md](cpp-development.md)。
