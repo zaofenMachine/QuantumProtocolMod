@@ -34,8 +34,10 @@
 #include <Input/Handler.hpp>
 #include <Mod/CppUserModBase.hpp>
 #include <UE4SSProgram.hpp>
+#include <Unreal/AActor.hpp>
 #include <Unreal/FProperty.hpp>
 #include <Unreal/FOutputDevice.hpp>
+#include <Unreal/Hooks.hpp>
 #include <Unreal/Property/FArrayProperty.hpp>
 #include <Unreal/Property/FObjectProperty.hpp>
 #include <Unreal/UClass.hpp>
@@ -68,22 +70,51 @@ namespace QuantumCheckpoint
         enum class RouteCRestorePhase
         {
             AwaitingWaveIntercept,
+            AwaitingBattleInfrastructure,
             AwaitingStableBattle,
-            AwaitingBoardReset,
-            AwaitingPlayerLoad,
             AwaitingVerification,
+            AwaitingPostRestoreStability,
         };
+
+        auto route_c_restore_phase_name(RouteCRestorePhase phase) -> std::string_view
+        {
+            switch (phase)
+            {
+            case RouteCRestorePhase::AwaitingWaveIntercept:
+                return "wave-intercept";
+            case RouteCRestorePhase::AwaitingBattleInfrastructure:
+                return "battle-infrastructure";
+            case RouteCRestorePhase::AwaitingStableBattle:
+                return "stable-battle";
+            case RouteCRestorePhase::AwaitingVerification:
+                return "verification";
+            case RouteCRestorePhase::AwaitingPostRestoreStability:
+                return "post-restore-stability";
+            }
+            return "unknown";
+        }
 
         struct PendingRouteCRestore
         {
             RouteCCheckpoint checkpoint{};
+            std::vector<std::string> loot_drops{};
             RouteCRestorePhase phase{RouteCRestorePhase::AwaitingWaveIntercept};
             std::chrono::steady_clock::time_point started_at{};
             std::chrono::steady_clock::time_point phase_ready_at{};
             UObject* intercepted_spawner{};
             const void* intercepted_world{};
-            UObject* card_engine{};
-            bool action_queue_paused{};
+            bool auto_spawn_suppressed{};
+            bool game_instance_reimported_at_card_engine_begin_play{};
+            bool game_instance_reimported_at_begin_play{};
+            bool character_card_slot_observed{};
+            std::optional<std::int32_t> character_card_charge{};
+            std::optional<std::int32_t> character_card_charge_requirement{};
+            std::optional<std::string> character_ability_ok{};
+            std::optional<std::chrono::steady_clock::time_point> empty_player_state_since{};
+            std::string original_auto_spawn{};
+            std::string interception_error{};
+            std::string last_diagnostic{};
+            std::chrono::steady_clock::time_point next_diagnostic_at{};
             std::string status{"running"};
             std::string reason{};
         };
@@ -104,9 +135,12 @@ namespace QuantumCheckpoint
 
         std::optional<ExecutableFingerprint> g_executable_fingerprint{};
         std::optional<PendingRouteCRestore> g_pending_route_c_restore{};
+        std::optional<RouteCCheckpoint> g_last_completed_route_c_checkpoint{};
         std::optional<PendingRouteCCapture> g_pending_route_c_capture{};
         std::optional<RouteCWaveObservation> g_route_c_wave_observation{};
         std::chrono::steady_clock::time_point g_next_route_c_wave_poll{};
+        bool g_adopt_next_route_c_wave_without_capture{};
+        bool g_begin_play_callbacks_registered{};
         UFunction* g_spawn_wave_index_function{};
         UFunction* g_spawn_next_wave_function{};
         UClass* g_spawn_controller_class{};
@@ -117,9 +151,10 @@ namespace QuantumCheckpoint
         auto classify(std::string_view full_name) -> std::string;
         auto object_class_name(UObject* object) -> std::string;
 
-        constexpr std::array<std::string_view, 17> RelevantClassPrefixes{
+        constexpr std::array<std::string_view, 18> RelevantClassPrefixes{
             "BP_CardEngine_C ",
             "BP_BottomBar_C ",
+            "BP_ControllerCharacterCardSlot_C ",
             "BP_ControllerDeck_C ",
             "BP_ControllerHand_C ",
             "BP_ControllerStorage_C ",
@@ -199,14 +234,23 @@ namespace QuantumCheckpoint
             STR("boardSide"),
         };
 
-        constexpr std::array<StringViewType, 3> GameInstanceGetters{
+        constexpr std::array<StringViewType, 5> GameInstanceGetters{
             STR("getCurrentDeckRun"),
             STR("getActiveDecklistInstances"),
             STR("getActiveStorage"),
+            STR("getLootDrops"),
+            STR("getLootDropInstances"),
         };
 
         constexpr std::array<StringViewType, 1> CardGroupGetters{
             STR("getCardInstanceListSorted"),
+        };
+
+        constexpr std::array<StringViewType, 4> CharacterCardSlotGetters{
+            STR("getCardInstanceListSorted"),
+            STR("getCurrentCharacterCardCharge"),
+            STR("getAmountPerCharacterCard"),
+            STR("isCharacterAbilityOk"),
         };
 
         constexpr std::array<StringViewType, 6> InGameCardGetters{
@@ -688,6 +732,14 @@ namespace QuantumCheckpoint
                         "Required reflected function argument was not found: "
                         + to_string(argument.name)};
                 }
+                if (argument.value == "()" && property->IsA<FArrayProperty>())
+                {
+                    // UE 4.27 exports an empty TArray return as empty text. Route C persists
+                    // that value canonically as "()", but importing "()" into an array of
+                    // structs can construct one default element. The parameter buffer already
+                    // owns a correctly initialized zero-length TArray, so leave it untouched.
+                    continue;
+                }
                 const auto wide_value = to_wstring(argument.value);
                 FOutputDevice errors{};
                 if (!property->ImportText(
@@ -712,6 +764,7 @@ namespace QuantumCheckpoint
             UObject* card_engine{};
             UObject* spawner{};
             UObject* bottom_bar{};
+            UObject* character_card_slot{};
         };
 
         auto reflected_object_property(UObject* owner, StringViewType property_name) -> UObject*
@@ -779,6 +832,13 @@ namespace QuantumCheckpoint
                              || static_cast<const void*>(object->GetWorld()) == preferred_world))
                 {
                     result.bottom_bar = object;
+                }
+                else if (role == "BP_ControllerCharacterCardSlot_C"
+                         && is_live_instance(full_name, role)
+                         && (!preferred_world
+                             || static_cast<const void*>(object->GetWorld()) == preferred_world))
+                {
+                    result.character_card_slot = object;
                 }
                 return LoopAction::Continue;
             });
@@ -1363,7 +1423,7 @@ namespace QuantumCheckpoint
             if (const auto unsafe_companion = find_route_c_unsafe_companion())
             {
                 throw std::runtime_error{
-                    "Route C v1 refuses a tutorial or boss encounter companion: "
+                    "Route C refuses a tutorial or boss encounter companion: "
                     + *unsafe_companion};
             }
 
@@ -1408,17 +1468,21 @@ namespace QuantumCheckpoint
                 || checkpoint.active_stage_info.contains("Type=DUNGEON_EVENT"))
             {
                 throw std::runtime_error{
-                    "Route C v1 supports ordinary DUNGEON battles only"};
+                    "Route C supports ordinary DUNGEON battles only"};
             }
 
             append_route_c_trace("capture.get-active-decklist.begin");
-            checkpoint.active_decklist = required_getter_text(
-                objects.game_instance, STR("getActiveDecklist"));
+            checkpoint.active_decklist = route_c_startup_decklist(
+                required_getter_text(objects.game_instance, STR("getActiveDecklist")));
             append_route_c_trace("capture.get-active-decklist.complete");
             append_route_c_trace("capture.get-active-storage.begin");
             checkpoint.active_storage = required_getter_text(
                 objects.game_instance, STR("getActiveStorage"));
             append_route_c_trace("capture.get-active-storage.complete");
+            append_route_c_trace("capture.get-loot-drops.begin");
+            checkpoint.loot_drops = required_getter_text(
+                objects.game_instance, STR("getLootDrops"));
+            append_route_c_trace("capture.get-loot-drops.complete");
             append_route_c_trace("capture.get-current-deck-run.begin");
             checkpoint.deck_run = required_getter_text(
                 objects.game_instance, STR("getCurrentDeckRun"));
@@ -1488,6 +1552,45 @@ namespace QuantumCheckpoint
                    << "  \"waveIndex\": " << restore.checkpoint.wave_index << ",\n"
                    << "  \"spawnerClass\": \""
                    << json_escape(restore.checkpoint.spawner_class) << "\",\n"
+                   << "  \"lootDropCount\": " << restore.loot_drops.size() << ",\n"
+                   << "  \"gameInstanceReimportedAtCardEngineBeginPlay\": "
+                   << (restore.game_instance_reimported_at_card_engine_begin_play
+                           ? "true"
+                           : "false")
+                   << ",\n"
+                   << "  \"gameInstanceReimportedAtBeginPlay\": "
+                   << (restore.game_instance_reimported_at_begin_play ? "true" : "false")
+                   << ",\n"
+                   << "  \"characterCardSlotObserved\": "
+                   << (restore.character_card_slot_observed ? "true" : "false") << ",\n"
+                   << "  \"characterCardCharge\": ";
+            if (restore.character_card_charge)
+            {
+                output << *restore.character_card_charge;
+            }
+            else
+            {
+                output << "null";
+            }
+            output << ",\n  \"characterCardChargeRequirement\": ";
+            if (restore.character_card_charge_requirement)
+            {
+                output << *restore.character_card_charge_requirement;
+            }
+            else
+            {
+                output << "null";
+            }
+            output << ",\n  \"characterAbilityOk\": ";
+            if (restore.character_ability_ok)
+            {
+                output << "\"" << json_escape(*restore.character_ability_ok) << "\"";
+            }
+            else
+            {
+                output << "null";
+            }
+            output << ",\n"
                    << "  \"targetHealth\": " << restore.checkpoint.player_health << "\n"
                    << "}\n";
             write_file_atomically(path, output.str());
@@ -1504,30 +1607,46 @@ namespace QuantumCheckpoint
             completed.status = std::move(status);
             completed.reason = std::move(reason);
 
-            if (completed.action_queue_paused && completed.card_engine)
+            if (completed.auto_spawn_suppressed && !completed.original_auto_spawn.empty())
             {
                 try
                 {
                     const auto live_objects = find_route_c_objects();
-                    if (live_objects.card_engine != completed.card_engine)
+                    if (!live_objects.spawner
+                        || object_class_name(live_objects.spawner)
+                            != completed.checkpoint.spawner_class)
                     {
                         throw std::runtime_error{
-                            "the paused CardEngine is no longer the live battle object"};
+                            "the controlled SpawnController is no longer the live battle object"};
                     }
-                    call_reflected(live_objects.card_engine,
-                                   STR("setActionQueueSystemPaused"),
-                                   {{STR("IsPaused"), "False"}});
+                    import_property_text(live_objects.spawner,
+                                         STR("autoSpawn"),
+                                         completed.original_auto_spawn);
+                    completed.auto_spawn_suppressed = false;
                 }
                 catch (...)
                 {
                     if (completed.status == "passed")
                     {
                         completed.status = "failed";
-                        completed.reason = "restore completed but the action queue could not be resumed";
+                        completed.reason =
+                            "restore completed but SpawnController.autoSpawn could not be restored";
                     }
                 }
             }
 
+            // The replacement battle must not overwrite the checkpoint merely because its
+            // Spawner is a new object. The next stable observation becomes the baseline; a
+            // subsequent genuine wave change can auto-save normally.
+            g_adopt_next_route_c_wave_without_capture = true;
+            if (completed.status == "passed")
+            {
+                // A passed restore has already verified the live deck and storage against this
+                // exact payload. Reuse that known-good state as rollback input for another load
+                // in the same process; repeatedly calling getActiveDecklist here can deadlock in
+                // the game's stale post-travel DeckRun state.
+                g_last_completed_route_c_checkpoint = completed.checkpoint;
+            }
             g_pending_route_c_restore.reset();
             try
             {
@@ -1581,14 +1700,37 @@ namespace QuantumCheckpoint
             const auto original_source_level = required_text(
                 export_property_text(objects.game_instance, STR("sourceLevelName")),
                 "original GameInstance.sourceLevelName");
-            append_route_c_trace("restore.original-deck.begin");
-            const auto original_deck = required_getter_text(
-                objects.game_instance, STR("getActiveDecklist"));
-            append_route_c_trace("restore.original-deck.complete");
-            append_route_c_trace("restore.original-storage.begin");
-            const auto original_storage = required_getter_text(
-                objects.game_instance, STR("getActiveStorage"));
-            append_route_c_trace("restore.original-storage.complete");
+            std::string original_deck{};
+            std::string original_storage{};
+            if (g_last_completed_route_c_checkpoint
+                && g_last_completed_route_c_checkpoint->payload_checksum
+                    == checkpoint.payload_checksum)
+            {
+                original_deck = g_last_completed_route_c_checkpoint->active_decklist;
+                original_storage = g_last_completed_route_c_checkpoint->active_storage;
+                append_route_c_trace(
+                    "restore.original-run-state.reused-last-verified-checkpoint");
+            }
+            else
+            {
+                append_route_c_trace("restore.original-deck.begin");
+                original_deck = required_getter_text(
+                    objects.game_instance, STR("getActiveDecklist"));
+                append_route_c_trace("restore.original-deck.complete");
+                append_route_c_trace("restore.original-storage.begin");
+                original_storage = required_getter_text(
+                    objects.game_instance, STR("getActiveStorage"));
+                append_route_c_trace("restore.original-storage.complete");
+            }
+            const auto startup_decklist = route_c_startup_decklist(
+                checkpoint.active_decklist);
+            std::string loot_error{};
+            auto loot_drops = split_route_c_unreal_array(checkpoint.loot_drops, loot_error);
+            if (!loot_drops)
+            {
+                throw std::runtime_error{
+                    "Route C checkpoint lootDrops could not be prepared: " + loot_error};
+            }
 
             const auto rollback_game_instance = [&]() {
                 const auto attempt = [](auto&& operation) {
@@ -1638,7 +1780,12 @@ namespace QuantumCheckpoint
                                      checkpoint.source_level_name);
                 call_reflected(objects.game_instance,
                                STR("setActiveDecklist"),
-                               {{STR("newDecklist"), checkpoint.active_decklist}});
+                               {{STR("newDecklist"), startup_decklist}});
+                if (startup_decklist != checkpoint.active_decklist)
+                {
+                    append_route_c_trace(
+                        "restore.startup-deck.dungeon-tools-suppressed");
+                }
                 call_reflected(objects.game_instance,
                                STR("updateBench"),
                                {{STR("newCards"), checkpoint.active_storage}});
@@ -1654,6 +1801,7 @@ namespace QuantumCheckpoint
             g_pending_route_c_capture.reset();
             g_pending_route_c_restore.emplace(PendingRouteCRestore{
                 .checkpoint = std::move(checkpoint),
+                .loot_drops = std::move(*loot_drops),
                 .phase = RouteCRestorePhase::AwaitingWaveIntercept,
                 .started_at = now,
                 .phase_ready_at = now,
@@ -1672,7 +1820,7 @@ namespace QuantumCheckpoint
                 throw;
             }
             Output::send<LogLevel::Verbose>(
-                STR("[QuantumCheckpoint] Route C reload requested; waiting to redirect the initial wave to {}.\n"),
+                STR("[QuantumCheckpoint] Route C reload requested; waiting for native startup to select wave {}.\n"),
                 g_pending_route_c_restore->checkpoint.wave_index);
         }
 
@@ -1800,7 +1948,7 @@ namespace QuantumCheckpoint
                 return;
             }
             const auto now = std::chrono::steady_clock::now();
-            if (now - g_pending_route_c_restore->started_at > std::chrono::seconds{45})
+            if (now - g_pending_route_c_restore->started_at > std::chrono::seconds{90})
             {
                 finish_route_c_restore("failed", "restore timed out before verification");
                 return;
@@ -1813,92 +1961,330 @@ namespace QuantumCheckpoint
             try
             {
                 auto& restore = *g_pending_route_c_restore;
+                if (!restore.interception_error.empty())
+                {
+                    throw std::runtime_error{restore.interception_error};
+                }
                 if (restore.phase == RouteCRestorePhase::AwaitingWaveIntercept)
                 {
                     return;
                 }
+                // Object discovery and reflected getters are deliberately sampled rather than
+                // run on every frame while the replacement PersistentLevel is being assembled.
+                restore.phase_ready_at = now + std::chrono::milliseconds{100};
 
-                const auto objects = find_route_c_objects(restore.intercepted_world);
-                if (!objects.card_engine || !objects.spawner || !objects.bottom_bar)
+                const auto objects = find_route_c_objects();
+                const auto game_state = objects.card_engine
+                    ? export_property_text(objects.card_engine, STR("currentGameState"))
+                    : std::nullopt;
+                const auto wave_text = objects.spawner
+                    ? export_property_text(objects.spawner, STR("currentWaveIndex"))
+                    : std::nullopt;
+                const auto wave = wave_text ? parse_int32(*wave_text) : std::nullopt;
+                const auto auto_spawn = objects.spawner
+                    ? export_property_text(objects.spawner, STR("autoSpawn"))
+                    : std::nullopt;
+
+                std::optional<std::int32_t> health{};
+                std::optional<std::int32_t> maximum{};
+                if (objects.card_engine)
                 {
-                    return;
+                    if (const auto value = export_zero_argument_getter(
+                            objects.card_engine, STR("getCurrentHealth")))
+                    {
+                        health = parse_int32(value->value);
+                    }
+                    if (const auto value = export_zero_argument_getter(
+                            objects.card_engine, STR("getMaxHealth")))
+                    {
+                        maximum = parse_int32(value->value);
+                    }
                 }
-                const auto game_state = export_property_text(
-                    objects.card_engine, STR("currentGameState"));
-                if (!game_state || *game_state != "OPEN")
+
+                std::optional<std::int32_t> character_card_charge{};
+                std::optional<std::int32_t> character_card_charge_requirement{};
+                std::optional<std::string> character_ability_ok{};
+                if (objects.character_card_slot)
+                {
+                    restore.character_card_slot_observed = true;
+                    if (const auto value = export_zero_argument_getter(
+                            objects.character_card_slot,
+                            STR("getCurrentCharacterCardCharge")))
+                    {
+                        character_card_charge = parse_int32(value->value);
+                        restore.character_card_charge = character_card_charge;
+                    }
+                    if (const auto value = export_zero_argument_getter(
+                            objects.character_card_slot,
+                            STR("getAmountPerCharacterCard")))
+                    {
+                        character_card_charge_requirement = parse_int32(value->value);
+                        restore.character_card_charge_requirement =
+                            character_card_charge_requirement;
+                    }
+                    if (const auto value = export_zero_argument_getter(
+                            objects.character_card_slot,
+                            STR("isCharacterAbilityOk")))
+                    {
+                        character_ability_ok = value->value;
+                        restore.character_ability_ok = character_ability_ok;
+                    }
+                }
+
+                std::ostringstream diagnostic{};
+                diagnostic << "phase=" << route_c_restore_phase_name(restore.phase)
+                           << " gi=" << (objects.game_instance ? "yes" : "no")
+                           << " cardEngine=" << static_cast<const void*>(objects.card_engine)
+                           << " spawner=" << static_cast<const void*>(objects.spawner)
+                           << " beginPlaySpawner="
+                           << static_cast<const void*>(restore.intercepted_spawner)
+                           << " sameSpawner="
+                           << (objects.spawner && objects.spawner == restore.intercepted_spawner
+                                   ? "yes"
+                                   : "no")
+                           << " sameWorld="
+                           << (objects.spawner && restore.intercepted_world
+                                   && static_cast<const void*>(objects.spawner->GetWorld())
+                                       == restore.intercepted_world
+                                   ? "yes"
+                                   : "no")
+                           << " bottomBar=" << (objects.bottom_bar ? "yes" : "no")
+                           << " characterCardSlot="
+                           << static_cast<const void*>(objects.character_card_slot)
+                           << " characterCharge="
+                           << (character_card_charge
+                                   ? std::to_string(*character_card_charge)
+                                   : "unavailable")
+                           << "/"
+                           << (character_card_charge_requirement
+                                   ? std::to_string(*character_card_charge_requirement)
+                                   : "unavailable")
+                           << " characterAbilityOk="
+                           << (character_ability_ok ? *character_ability_ok : "unavailable")
+                           << " state=" << (game_state ? *game_state : "unavailable")
+                           << " wave=" << (wave_text ? *wave_text : "unavailable")
+                           << " autoSpawn="
+                           << (auto_spawn ? *auto_spawn : "unavailable")
+                           << " health="
+                           << (health ? std::to_string(*health) : "unavailable") << "/"
+                           << (maximum ? std::to_string(*maximum) : "unavailable");
+                const auto diagnostic_text = diagnostic.str();
+                if (diagnostic_text != restore.last_diagnostic
+                    || now >= restore.next_diagnostic_at)
+                {
+                    append_route_c_trace_failure("restore.observe", diagnostic_text);
+                    restore.last_diagnostic = diagnostic_text;
+                    restore.next_diagnostic_at = now + std::chrono::seconds{5};
+                }
+
+                if (!objects.game_instance || !objects.card_engine || !objects.spawner
+                    || !objects.bottom_bar)
                 {
                     return;
                 }
                 if (object_class_name(objects.spawner) != restore.checkpoint.spawner_class)
                 {
-                    throw std::runtime_error{"Restored spawner class does not match the checkpoint"};
+                    return;
                 }
+
+                if (restore.phase == RouteCRestorePhase::AwaitingBattleInfrastructure)
+                {
+                    // The unrestricted scan is needed because some HUD/CardEngine objects are
+                    // not reported in the BeginPlay actor's world early in travel. Do not,
+                    // however, let a still-reachable object from the previous PersistentLevel
+                    // become the controlled spawner.
+                    if (objects.spawner != restore.intercepted_spawner)
+                    {
+                        return;
+                    }
+                    if (!auto_spawn || (*auto_spawn != "True" && *auto_spawn != "False"))
+                    {
+                        return;
+                    }
+                    if (*auto_spawn != "False")
+                    {
+                        import_property_text(objects.spawner, STR("autoSpawn"), "False");
+                        const auto suppressed = required_text(
+                            export_property_text(objects.spawner, STR("autoSpawn")),
+                            "controlled SpawnController.autoSpawn");
+                        if (suppressed != "False")
+                        {
+                            throw std::runtime_error{
+                                "SpawnController.autoSpawn suppression did not verify"};
+                        }
+                    }
+                    restore.intercepted_spawner = objects.spawner;
+                    restore.intercepted_world = objects.spawner->GetWorld();
+                    restore.auto_spawn_suppressed = true;
+
+                    if (!wave)
+                    {
+                        return;
+                    }
+                    const auto expected_seed = restore.checkpoint.wave_index - 1;
+                    if (*wave != expected_seed && *wave != restore.checkpoint.wave_index)
+                    {
+                        throw std::runtime_error{
+                            "SpawnController changed away from the controlled Route C seed"};
+                    }
+                    append_route_c_trace_failure(
+                        "restore.controlled-wave.awaiting-native-start",
+                        "seed=" + std::to_string(*wave) + " target="
+                            + std::to_string(restore.checkpoint.wave_index));
+                    restore.phase = RouteCRestorePhase::AwaitingStableBattle;
+                    restore.phase_ready_at = now + std::chrono::milliseconds{100};
+                    return;
+                }
+
                 if (objects.spawner != restore.intercepted_spawner)
                 {
                     throw std::runtime_error{
-                        "The live spawner is not the instance intercepted during restore"};
+                        "The controlled SpawnController was replaced during restore"};
                 }
-                const auto wave = parse_int32(required_text(
-                    export_property_text(objects.spawner, STR("currentWaveIndex")),
-                    "restored SpawnController.currentWaveIndex"));
+
+                if (!game_state || *game_state != "OPEN" || !wave)
+                {
+                    return;
+                }
                 if (!wave || *wave != restore.checkpoint.wave_index)
                 {
+                    if (*wave < restore.checkpoint.wave_index
+                        && restore.phase == RouteCRestorePhase::AwaitingStableBattle)
+                    {
+                        return;
+                    }
                     throw std::runtime_error{"Restored wave index does not match the checkpoint"};
+                }
+
+                if (restore.phase == RouteCRestorePhase::AwaitingStableBattle
+                    && maximum && *maximum == 0)
+                {
+                    if (!restore.empty_player_state_since)
+                    {
+                        restore.empty_player_state_since = now;
+                        append_route_c_trace(
+                            "restore.player-initialization.empty-state-observed");
+                        return;
+                    }
+                    if (now - *restore.empty_player_state_since > std::chrono::seconds{5})
+                    {
+                        throw std::runtime_error{
+                            "Native player initialization remained empty after BeginPlay re-import"};
+                    }
+                    return;
                 }
 
                 if (restore.phase == RouteCRestorePhase::AwaitingStableBattle)
                 {
-                    restore.card_engine = objects.card_engine;
-                    call_reflected(
-                        objects.card_engine,
-                        STR("setActionQueueSystemPaused"),
-                        {{STR("IsPaused"), "True"}});
-                    restore.action_queue_paused = true;
-                    call_reflected(objects.card_engine, STR("resetPlayerBoard"));
-                    restore.phase = RouteCRestorePhase::AwaitingBoardReset;
-                    restore.phase_ready_at = now + std::chrono::milliseconds{1000};
-                    return;
-                }
-                if (restore.phase == RouteCRestorePhase::AwaitingBoardReset)
-                {
-                    call_reflected(objects.card_engine, STR("LoadPlayerCardsStart"));
-                    restore.phase = RouteCRestorePhase::AwaitingPlayerLoad;
-                    restore.phase_ready_at = now + std::chrono::milliseconds{2500};
-                    return;
-                }
-                if (restore.phase == RouteCRestorePhase::AwaitingPlayerLoad)
-                {
+                    if (!health || !maximum || *health <= 0 || *maximum <= 0)
+                    {
+                        return;
+                    }
+                    if (*maximum != restore.checkpoint.player_max_health)
+                    {
+                        throw std::runtime_error{
+                            "Native startup produced a different maximum health"};
+                    }
+                    append_route_c_trace_failure(
+                        "restore.loot-drops.begin",
+                        "count=" + std::to_string(restore.loot_drops.size()));
+                    call_reflected(objects.game_instance, STR("clearLootDrops"));
+                    try
+                    {
+                        for (const auto& loot_drop : restore.loot_drops)
+                        {
+                            call_reflected(objects.game_instance,
+                                           STR("addLootDrop"),
+                                           {{STR("newLoot"), loot_drop}});
+                        }
+                    }
+                    catch (...)
+                    {
+                        try
+                        {
+                            call_reflected(objects.game_instance, STR("clearLootDrops"));
+                        }
+                        catch (...)
+                        {
+                        }
+                        throw;
+                    }
+                    append_route_c_trace("restore.loot-drops.complete");
                     apply_route_c_health(restore.checkpoint, objects);
-                    call_reflected(
-                        objects.card_engine,
-                        STR("setActionQueueSystemPaused"),
-                        {{STR("IsPaused"), "False"}});
-                    restore.action_queue_paused = false;
                     restore.phase = RouteCRestorePhase::AwaitingVerification;
                     restore.phase_ready_at = now + std::chrono::milliseconds{750};
                     return;
                 }
 
-                const auto health = parse_int32(required_getter_text(
-                    objects.card_engine, STR("getCurrentHealth")));
-                const auto maximum = parse_int32(required_getter_text(
-                    objects.card_engine, STR("getMaxHealth")));
                 if (!health || !maximum
+                    || *maximum != restore.checkpoint.player_max_health
                     || *health != std::clamp(restore.checkpoint.player_health, 1, *maximum))
                 {
-                    throw std::runtime_error{"Restored player health did not verify"};
+                    throw std::runtime_error{
+                        "Restored player health or maximum health did not verify"};
                 }
-                if (required_getter_text(objects.game_instance, STR("getActiveDecklist"))
-                        != restore.checkpoint.active_decklist
-                    || required_getter_text(objects.game_instance, STR("getActiveStorage"))
-                        != restore.checkpoint.active_storage)
+                const auto restored_deck = required_getter_text(
+                    objects.game_instance, STR("getActiveDecklist"));
+                const auto canonical_restored_deck = route_c_startup_decklist(restored_deck);
+                if (canonical_restored_deck != restore.checkpoint.active_decklist)
                 {
-                    throw std::runtime_error{"Restored deck or storage did not verify"};
+                    append_route_c_trace_failure(
+                        "restore.verification.deck-mismatch",
+                        "expectedLength="
+                            + std::to_string(restore.checkpoint.active_decklist.size())
+                            + " actualLength=" + std::to_string(restored_deck.size())
+                            + " canonicalActualLength="
+                            + std::to_string(canonical_restored_deck.size()));
+                    throw std::runtime_error{"Restored active deck did not verify"};
+                }
+                const auto restored_storage = required_getter_text(
+                    objects.game_instance, STR("getActiveStorage"));
+                if (restored_storage != restore.checkpoint.active_storage)
+                {
+                    append_route_c_trace_failure(
+                        "restore.verification.storage-mismatch",
+                        "expected=" + restore.checkpoint.active_storage
+                            + " actual=" + restored_storage);
+                    throw std::runtime_error{"Restored active storage did not verify"};
+                }
+                const auto restored_loot_drops = required_getter_text(
+                    objects.game_instance, STR("getLootDrops"));
+                if (restored_loot_drops != restore.checkpoint.loot_drops)
+                {
+                    append_route_c_trace_failure(
+                        "restore.verification.loot-drops-mismatch",
+                        "expected=" + restore.checkpoint.loot_drops
+                            + " actual=" + restored_loot_drops);
+                    throw std::runtime_error{"Restored new loot drops did not verify"};
+                }
+
+                if (restore.phase == RouteCRestorePhase::AwaitingVerification)
+                {
+                    if (restore.auto_spawn_suppressed)
+                    {
+                        import_property_text(objects.spawner,
+                                             STR("autoSpawn"),
+                                             restore.original_auto_spawn);
+                        const auto restored = required_text(
+                            export_property_text(objects.spawner, STR("autoSpawn")),
+                            "restored SpawnController.autoSpawn");
+                        if (restored != restore.original_auto_spawn)
+                        {
+                            throw std::runtime_error{
+                                "SpawnController.autoSpawn restoration did not verify"};
+                        }
+                        restore.auto_spawn_suppressed = false;
+                    }
+                    restore.phase = RouteCRestorePhase::AwaitingPostRestoreStability;
+                    restore.phase_ready_at = now + std::chrono::seconds{3};
+                    append_route_c_trace(
+                        "restore.post-restore-stability.begin");
+                    return;
                 }
 
                 finish_route_c_restore(
                     "passed",
-                    "ordinary substage, player deck, storage, and health were restored");
+                    "ordinary substage, player deck, storage, new loot drops, and health were restored");
             }
             catch (const std::exception& error)
             {
@@ -1929,6 +2315,217 @@ namespace QuantumCheckpoint
                 Output::send<LogLevel::Warning>(
                     STR("[QuantumCheckpoint] Automatic Route C checkpoint refused: {}\n"),
                     to_wstring(error.what()));
+            }
+        }
+
+        auto route_c_actor_begin_play_pre(AActor* actor) -> void
+        {
+            try
+            {
+                if (!actor || !g_pending_route_c_restore
+                    || (g_pending_route_c_restore->phase
+                            != RouteCRestorePhase::AwaitingWaveIntercept
+                        && g_pending_route_c_restore->phase
+                            != RouteCRestorePhase::AwaitingBattleInfrastructure))
+                {
+                    return;
+                }
+                auto& restore = *g_pending_route_c_restore;
+                auto* candidate = static_cast<UObject*>(actor);
+                const auto candidate_name = to_string(candidate->GetFullName());
+                const auto candidate_role = classify(candidate_name);
+                if (candidate_role == "BP_CardEngine_C"
+                    && is_live_instance(candidate_name, candidate_role)
+                    && !restore.game_instance_reimported_at_card_engine_begin_play)
+                {
+                    // Character setup happens during CardEngine BeginPlay, earlier than the
+                    // SpawnController point used for deck initialization. Put the semantic run
+                    // data back before that lifecycle runs so the native character ability slot
+                    // can be constructed normally. The later Spawner re-import remains the guard
+                    // against old-world EndPlay clearing the GameInstance after this point.
+                    append_route_c_trace(
+                        "restore.card-engine-begin-play.game-instance-reimport.begin");
+                    auto* game_instance = find_route_c_objects().game_instance;
+                    if (!game_instance)
+                    {
+                        throw std::runtime_error{
+                            "Quantum GameInstance was unavailable during CardEngine BeginPlay"};
+                    }
+                    import_property_text(game_instance,
+                                         STR("activeCharacterInfo"),
+                                         restore.checkpoint.active_character_info);
+                    import_property_text(game_instance,
+                                         STR("activeStageInfo"),
+                                         restore.checkpoint.active_stage_info);
+                    import_property_text(game_instance,
+                                         STR("sourceLevelName"),
+                                         restore.checkpoint.source_level_name);
+                    call_reflected(game_instance,
+                                   STR("setActiveDecklist"),
+                                   {{STR("newDecklist"),
+                                     route_c_startup_decklist(
+                                         restore.checkpoint.active_decklist)}});
+                    call_reflected(game_instance,
+                                   STR("updateBench"),
+                                   {{STR("newCards"),
+                                     restore.checkpoint.active_storage}});
+                    restore.game_instance_reimported_at_card_engine_begin_play = true;
+                    append_route_c_trace(
+                        "restore.card-engine-begin-play.game-instance-reimport.complete");
+                    return;
+                }
+
+                auto* spawner = candidate;
+                if (!is_route_c_spawn_controller(spawner)
+                    || object_class_name(spawner) != restore.checkpoint.spawner_class)
+                {
+                    return;
+                }
+
+                const auto initial_text = export_property_text(
+                    spawner, STR("currentWaveIndex"));
+                const auto initial_wave = initial_text
+                    ? parse_int32(*initial_text)
+                    : std::nullopt;
+                if (!initial_wave || *initial_wave < -1 || *initial_wave > 1000)
+                {
+                    throw std::runtime_error{
+                        "SpawnController BeginPlay exposed an invalid initial wave index"};
+                }
+                const auto original_auto_spawn = required_text(
+                    export_property_text(spawner, STR("autoSpawn")),
+                    "SpawnController BeginPlay autoSpawn");
+                if (original_auto_spawn != "True" && original_auto_spawn != "False")
+                {
+                    throw std::runtime_error{
+                        "SpawnController BeginPlay exposed an invalid autoSpawn value"};
+                }
+
+                // When reloadBattleArea() is invoked from an already restored battle, the old
+                // CardEngine's EndPlay can clear the GameInstance deck after the pre-travel
+                // import. Reapply the semantic run data after old-world teardown but before the
+                // new controller starts its delayed native player initialization.
+                append_route_c_trace(
+                    "restore.spawn-controller-begin-play.game-instance-reimport.begin");
+                auto* game_instance = find_route_c_objects().game_instance;
+                if (!game_instance)
+                {
+                    throw std::runtime_error{
+                        "Quantum GameInstance was unavailable during SpawnController BeginPlay"};
+                }
+                import_property_text(game_instance,
+                                     STR("activeCharacterInfo"),
+                                     restore.checkpoint.active_character_info);
+                import_property_text(game_instance,
+                                     STR("activeStageInfo"),
+                                     restore.checkpoint.active_stage_info);
+                import_property_text(game_instance,
+                                     STR("sourceLevelName"),
+                                     restore.checkpoint.source_level_name);
+                call_reflected(game_instance,
+                               STR("setActiveDecklist"),
+                               {{STR("newDecklist"),
+                                 restore.checkpoint.active_decklist}});
+                call_reflected(game_instance,
+                               STR("updateBench"),
+                               {{STR("newCards"),
+                                 restore.checkpoint.active_storage}});
+                restore.game_instance_reimported_at_begin_play = true;
+                append_route_c_trace(
+                    "restore.spawn-controller-begin-play.game-instance-reimport.complete");
+
+                import_property_text(spawner, STR("autoSpawn"), "False");
+                const auto verified_auto_spawn = required_text(
+                    export_property_text(spawner, STR("autoSpawn")),
+                    "suppressed SpawnController BeginPlay autoSpawn");
+                if (verified_auto_spawn != "False")
+                {
+                    throw std::runtime_error{
+                        "SpawnController BeginPlay autoSpawn suppression did not verify"};
+                }
+                const auto controlled_seed = static_cast<std::int64_t>(
+                    restore.checkpoint.wave_index) - 1;
+                if (controlled_seed < -1 || controlled_seed > 1000)
+                {
+                    throw std::runtime_error{
+                        "SpawnController BeginPlay controlled wave seed exceeded its safe range"};
+                }
+                import_property_text(spawner,
+                                     STR("currentWaveIndex"),
+                                     std::to_string(controlled_seed));
+                const auto verified_seed = parse_int32(required_text(
+                    export_property_text(spawner, STR("currentWaveIndex")),
+                    "controlled SpawnController BeginPlay wave seed"));
+                if (!verified_seed || *verified_seed != controlled_seed)
+                {
+                    throw std::runtime_error{
+                        "SpawnController BeginPlay controlled wave seed did not verify"};
+                }
+
+                if (restore.original_auto_spawn.empty())
+                {
+                    restore.original_auto_spawn = original_auto_spawn;
+                }
+                restore.intercepted_spawner = spawner;
+                restore.intercepted_world = spawner->GetWorld();
+                restore.auto_spawn_suppressed = true;
+                restore.phase = RouteCRestorePhase::AwaitingBattleInfrastructure;
+                restore.phase_ready_at = std::chrono::steady_clock::now();
+                append_route_c_trace_failure(
+                    "restore.spawn-controller-begin-play.auto-spawn-suppressed",
+                    "currentWaveIndex=" + std::to_string(*initial_wave)
+                        + " controlledSeed=" + std::to_string(*verified_seed)
+                        + " originalAutoSpawn=" + original_auto_spawn);
+                Output::send<LogLevel::Verbose>(
+                    STR("[QuantumCheckpoint] Route C suppressed SpawnController BeginPlay autoSpawn and set wave seed {} -> {}; target is {}.\n"),
+                    *initial_wave,
+                    *verified_seed,
+                    restore.checkpoint.wave_index);
+            }
+            catch (const std::exception& error)
+            {
+                if (g_pending_route_c_restore)
+                {
+                    g_pending_route_c_restore->interception_error = error.what();
+                }
+                append_route_c_trace_failure(
+                    "restore.spawn-controller-begin-play.failed", error.what());
+            }
+            catch (...)
+            {
+                if (g_pending_route_c_restore)
+                {
+                    g_pending_route_c_restore->interception_error =
+                        "unknown exception during SpawnController BeginPlay autoSpawn suppression";
+                }
+                append_route_c_trace(
+                    "restore.spawn-controller-begin-play.failed-unknown");
+            }
+        }
+
+        auto route_c_actor_begin_play_post(AActor* actor) -> void
+        {
+            try
+            {
+                if (!actor || !g_pending_route_c_restore
+                    || g_pending_route_c_restore->intercepted_spawner != actor)
+                {
+                    return;
+                }
+                const auto wave = export_property_text(
+                    actor, STR("currentWaveIndex"));
+                const auto auto_spawn = export_property_text(
+                    actor, STR("autoSpawn"));
+                append_route_c_trace_failure(
+                    "restore.spawn-controller-begin-play.completed",
+                    std::string{"currentWaveIndex="}
+                        + (wave ? *wave : "unavailable") + " autoSpawn="
+                        + (auto_spawn ? *auto_spawn : "unavailable"));
+            }
+            catch (...)
+            {
+                append_route_c_trace(
+                    "restore.spawn-controller-begin-play.post-failed");
             }
         }
 
@@ -2017,6 +2614,12 @@ namespace QuantumCheckpoint
                 .world = world,
                 .wave_index = *wave,
             });
+            if (g_adopt_next_route_c_wave_without_capture)
+            {
+                g_adopt_next_route_c_wave_without_capture = false;
+                append_route_c_trace("auto-capture.skipped.restore-settle");
+                return;
+            }
             g_pending_route_c_capture.emplace(PendingRouteCCapture{
                 .spawner = spawner,
                 .wave_index = *wave,
@@ -2032,13 +2635,7 @@ namespace QuantumCheckpoint
             -> void
         {
             if (!g_pending_route_c_restore || !function || function != g_spawn_wave_index_function
-                || !context || !parameters
-                || g_pending_route_c_restore->phase != RouteCRestorePhase::AwaitingWaveIntercept)
-            {
-                return;
-            }
-            auto& restore = *g_pending_route_c_restore;
-            if (object_class_name(context) != restore.checkpoint.spawner_class)
+                || !context || !parameters || !is_route_c_spawn_controller(context))
             {
                 return;
             }
@@ -2052,14 +2649,9 @@ namespace QuantumCheckpoint
             {
                 return;
             }
-            *wave_index = restore.checkpoint.wave_index;
-            restore.intercepted_spawner = context;
-            restore.intercepted_world = context->GetWorld();
-            restore.phase = RouteCRestorePhase::AwaitingStableBattle;
-            restore.phase_ready_at = std::chrono::steady_clock::now();
-            Output::send<LogLevel::Verbose>(
-                STR("[QuantumCheckpoint] Route C redirected initial wave generation to {}.\n"),
-                *wave_index);
+            append_route_c_trace_failure(
+                "restore.native.spawn-wave-index.pre",
+                "waveIndex=" + std::to_string(*wave_index));
         }
 
         auto route_c_process_event_post(UObject* context, UFunction* function, void* parameters)
@@ -2069,11 +2661,6 @@ namespace QuantumCheckpoint
             {
                 return;
             }
-            if (g_pending_route_c_restore)
-            {
-                return;
-            }
-
             std::optional<std::int32_t> wave_index{};
             std::string_view trigger{};
             if (function == g_spawn_wave_index_function && parameters)
@@ -2100,6 +2687,15 @@ namespace QuantumCheckpoint
 
             if (!wave_index || *wave_index < 0 || *wave_index > 1000)
             {
+                return;
+            }
+            if (g_pending_route_c_restore)
+            {
+                append_route_c_trace_failure(
+                    trigger == "spawn-next-wave"
+                        ? "restore.native.spawn-next-wave.post"
+                        : "restore.native.spawn-wave-index.post",
+                    "currentWaveIndex=" + std::to_string(*wave_index));
                 return;
             }
             g_pending_route_c_capture.emplace(PendingRouteCCapture{
@@ -2198,6 +2794,10 @@ namespace QuantumCheckpoint
                 if (role == "GI_Quantum_C" && full_name.contains("/Engine/Transient."))
                 {
                     append_getters(snapshot, object, GameInstanceGetters);
+                }
+                else if (role == "BP_ControllerCharacterCardSlot_C")
+                {
+                    append_getters(snapshot, object, CharacterCardSlotGetters);
                 }
                 else if (role.starts_with("BP_Controller") && role != "BP_ControllerBoard_C"
                          && role != "BP_FieldSlot_C")
@@ -3110,7 +3710,7 @@ namespace QuantumCheckpoint
         QuantumCheckpointMod()
         {
             ModName = STR("QuantumCheckpoint");
-            ModVersion = STR("0.9.5-dev");
+            ModVersion = STR("0.9.13-dev");
             ModDescription = STR("Route C semantic substage checkpoint prototype");
             ModAuthors = STR("zaofenMachine and contributors");
             ModIntendedSDKVersion = STR("3.0.1");
@@ -3189,6 +3789,18 @@ namespace QuantumCheckpoint
                 nullptr,
                 nullptr,
                 STR("/Script/Quantum.SpawnController"));
+            try
+            {
+                Hook::RegisterBeginPlayPreCallback(route_c_actor_begin_play_pre);
+                Hook::RegisterBeginPlayPostCallback(route_c_actor_begin_play_post);
+                g_begin_play_callbacks_registered = true;
+                append_route_c_trace("spawn-controller-begin-play-hooks.ready");
+            }
+            catch (const std::exception& error)
+            {
+                append_route_c_trace_failure(
+                    "spawn-controller-begin-play-hooks.failed", error.what());
+            }
             g_unreal_ready.store(true, std::memory_order_release);
             if (g_spawn_wave_index_function && g_spawn_next_wave_function
                 && g_spawn_controller_class)
@@ -3258,10 +3870,10 @@ namespace QuantumCheckpoint
                     append_route_c_trace("manual-load.dispatch");
                     try
                     {
-                    if (!g_spawn_wave_index_function || !g_spawn_controller_class
-                        || !g_spawn_wave_index_hook_ids)
+                    if (!g_spawn_controller_class || !g_begin_play_callbacks_registered)
                         {
-                            throw std::runtime_error{"Route C wave hook is unavailable"};
+                            throw std::runtime_error{
+                                "Route C SpawnController BeginPlay hook is unavailable"};
                         }
                         begin_route_c_restore();
                     }

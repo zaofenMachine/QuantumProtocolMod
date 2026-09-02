@@ -9,7 +9,7 @@
 namespace QuantumCheckpoint
 {
     inline constexpr int SchemaVersion = 5;
-    inline constexpr int RouteCSchemaVersion = 1;
+    inline constexpr int RouteCSchemaVersion = 2;
     inline constexpr std::string_view RouteCCheckpointKind = "route-c-substage-restart";
     inline constexpr std::string_view RouteCSupportedMode = "DUNGEON";
     inline constexpr std::size_t RouteCMaximumFileBytes = 2U * 1024U * 1024U;
@@ -50,6 +50,7 @@ namespace QuantumCheckpoint
         std::string active_stage_info{};
         std::string active_decklist{};
         std::string active_storage{};
+        std::string loot_drops{};
         std::string deck_run{};
         std::int32_t player_health{};
         std::int32_t player_max_health{};

@@ -5,6 +5,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace QuantumCheckpoint
 {
@@ -14,4 +15,7 @@ namespace QuantumCheckpoint
         -> std::optional<RouteCCheckpoint>;
     auto validate_route_c_checkpoint(const RouteCCheckpoint& checkpoint, std::string& error)
         -> bool;
+    auto route_c_startup_decklist(std::string_view active_decklist) -> std::string;
+    auto split_route_c_unreal_array(std::string_view value, std::string& error)
+        -> std::optional<std::vector<std::string>>;
 } // namespace QuantumCheckpoint

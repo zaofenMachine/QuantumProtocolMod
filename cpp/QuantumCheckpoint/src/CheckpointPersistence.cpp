@@ -372,6 +372,188 @@ namespace QuantumCheckpoint
         }
     } // namespace
 
+    auto route_c_startup_decklist(std::string_view active_decklist) -> std::string
+    {
+        // During an active dungeon getActiveDecklist() contains the already-expanded
+        // dungeon-tool cards in cardList while retaining the dungeonTools recipe. Passing that
+        // value unchanged through setActiveDecklist() before a fresh battle makes native startup
+        // append those tools a second time. Preserve cardList and temporarily hide the recipe.
+        constexpr std::string_view marker{"dungeonTools="};
+        const auto marker_position = active_decklist.find(marker);
+        if (marker_position == std::string_view::npos)
+        {
+            return std::string{active_decklist};
+        }
+        const auto value_start = marker_position + marker.size();
+        if (value_start >= active_decklist.size() || active_decklist[value_start] != '(')
+        {
+            throw std::runtime_error{
+                "Route C active deck exposed an invalid dungeonTools field"};
+        }
+
+        std::size_t value_end = std::string_view::npos;
+        std::int32_t depth{};
+        bool in_quotes{};
+        bool escaped{};
+        for (auto index = value_start; index < active_decklist.size(); ++index)
+        {
+            const auto character = active_decklist[index];
+            if (in_quotes)
+            {
+                if (escaped)
+                {
+                    escaped = false;
+                }
+                else if (character == '\\')
+                {
+                    escaped = true;
+                }
+                else if (character == '"')
+                {
+                    in_quotes = false;
+                }
+                continue;
+            }
+            if (character == '"')
+            {
+                in_quotes = true;
+            }
+            else if (character == '(')
+            {
+                ++depth;
+            }
+            else if (character == ')')
+            {
+                --depth;
+                if (depth == 0)
+                {
+                    value_end = index + 1;
+                    break;
+                }
+                if (depth < 0)
+                {
+                    break;
+                }
+            }
+        }
+        if (value_end == std::string_view::npos || in_quotes || depth != 0)
+        {
+            throw std::runtime_error{
+                "Route C active deck exposed an unterminated dungeonTools field"};
+        }
+
+        std::string startup_decklist{active_decklist};
+        startup_decklist.replace(value_start, value_end - value_start, "()");
+        return startup_decklist;
+    }
+
+    auto split_route_c_unreal_array(std::string_view value, std::string& error)
+        -> std::optional<std::vector<std::string>>
+    {
+        const auto trim = [](std::string_view text) {
+            while (!text.empty()
+                   && std::isspace(static_cast<unsigned char>(text.front())))
+            {
+                text.remove_prefix(1);
+            }
+            while (!text.empty()
+                   && std::isspace(static_cast<unsigned char>(text.back())))
+            {
+                text.remove_suffix(1);
+            }
+            return text;
+        };
+
+        value = trim(value);
+        if (value.size() < 2 || value.front() != '(' || value.back() != ')')
+        {
+            error = "reflected lootDrops is not an Unreal array";
+            return std::nullopt;
+        }
+
+        const auto contents = trim(value.substr(1, value.size() - 2));
+        if (contents.empty())
+        {
+            return std::vector<std::string>{};
+        }
+
+        std::vector<std::string> elements{};
+        std::size_t element_start{};
+        std::int32_t depth{};
+        bool in_quotes{};
+        bool escaped{};
+        for (std::size_t index{}; index <= contents.size(); ++index)
+        {
+            const bool at_end = index == contents.size();
+            const auto character = at_end ? '\0' : contents[index];
+            if (!at_end && in_quotes)
+            {
+                if (escaped)
+                {
+                    escaped = false;
+                }
+                else if (character == '\\')
+                {
+                    escaped = true;
+                }
+                else if (character == '"')
+                {
+                    in_quotes = false;
+                }
+                continue;
+            }
+            if (!at_end && character == '"')
+            {
+                in_quotes = true;
+                continue;
+            }
+            if (!at_end && character == '(')
+            {
+                ++depth;
+                continue;
+            }
+            if (!at_end && character == ')')
+            {
+                if (--depth < 0)
+                {
+                    error = "reflected lootDrops has unbalanced parentheses";
+                    return std::nullopt;
+                }
+                continue;
+            }
+            if (!at_end && (character != ',' || depth != 0))
+            {
+                continue;
+            }
+
+            auto element = trim(contents.substr(element_start, index - element_start));
+            if (element.empty())
+            {
+                error = "reflected lootDrops contains an empty element";
+                return std::nullopt;
+            }
+            if (element.front() != '(' || element.back() != ')')
+            {
+                error = "reflected lootDrops contains a non-struct element";
+                return std::nullopt;
+            }
+            elements.emplace_back(element);
+            if (elements.size() > 1024)
+            {
+                error = "reflected lootDrops contains too many elements";
+                return std::nullopt;
+            }
+            element_start = index + 1;
+        }
+
+        if (in_quotes || escaped || depth != 0)
+        {
+            error = "reflected lootDrops is unterminated or unbalanced";
+            return std::nullopt;
+        }
+        return elements;
+    }
+
     auto route_c_payload_checksum(const RouteCCheckpoint& checkpoint) -> std::string
     {
         std::uint64_t hash = 14695981039346656037ULL;
@@ -386,6 +568,7 @@ namespace QuantumCheckpoint
         append_hash_bytes(hash, checkpoint.active_stage_info);
         append_hash_bytes(hash, checkpoint.active_decklist);
         append_hash_bytes(hash, checkpoint.active_storage);
+        append_hash_bytes(hash, checkpoint.loot_drops);
         append_hash_bytes(hash, checkpoint.deck_run);
         append_hash_number(hash, checkpoint.player_health);
         append_hash_number(hash, checkpoint.player_max_health);
@@ -416,6 +599,7 @@ namespace QuantumCheckpoint
                << "  \"activeStageInfo\": \"" << json_escape(checkpoint.active_stage_info) << "\",\n"
                << "  \"activeDecklist\": \"" << json_escape(checkpoint.active_decklist) << "\",\n"
                << "  \"activeStorage\": \"" << json_escape(checkpoint.active_storage) << "\",\n"
+               << "  \"lootDrops\": \"" << json_escape(checkpoint.loot_drops) << "\",\n"
                << "  \"deckRun\": \"" << json_escape(checkpoint.deck_run) << "\",\n"
                << "  \"playerHealth\": " << checkpoint.player_health << ",\n"
                << "  \"playerMaxHealth\": " << checkpoint.player_max_health << ",\n"
@@ -459,9 +643,15 @@ namespace QuantumCheckpoint
         }
         if (checkpoint.active_character_info.empty() || checkpoint.active_stage_info.empty()
             || checkpoint.active_decklist.empty() || checkpoint.active_storage.empty()
-            || checkpoint.deck_run.empty())
+            || checkpoint.loot_drops.empty() || checkpoint.deck_run.empty())
         {
             error = "checkpoint is missing required reflected run data";
+            return false;
+        }
+        std::string loot_error{};
+        if (!split_route_c_unreal_array(checkpoint.loot_drops, loot_error))
+        {
+            error = "checkpoint lootDrops is invalid: " + loot_error;
             return false;
         }
         if (checkpoint.player_health <= 0 || checkpoint.player_max_health <= 0
@@ -512,6 +702,11 @@ namespace QuantumCheckpoint
         do { auto value = required_integer<Type>(*values, JsonName, error); if (!value) return std::nullopt; checkpoint.Field = *value; } while (false)
 
         READ_INTEGER(schema_version, "schemaVersion", int);
+        if (checkpoint.schema_version != RouteCSchemaVersion)
+        {
+            error = "unsupported Route C checkpoint schema version";
+            return std::nullopt;
+        }
         READ_STRING(kind, "kind");
         READ_STRING(captured_at_utc, "capturedAtUtc");
         READ_STRING(game_executable_sha256, "gameExecutableSha256");
@@ -522,6 +717,7 @@ namespace QuantumCheckpoint
         READ_STRING(active_stage_info, "activeStageInfo");
         READ_STRING(active_decklist, "activeDecklist");
         READ_STRING(active_storage, "activeStorage");
+        READ_STRING(loot_drops, "lootDrops");
         READ_STRING(deck_run, "deckRun");
         READ_INTEGER(player_health, "playerHealth", std::int32_t);
         READ_INTEGER(player_max_health, "playerMaxHealth", std::int32_t);
