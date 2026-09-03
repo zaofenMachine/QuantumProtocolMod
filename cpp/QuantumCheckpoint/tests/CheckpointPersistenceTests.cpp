@@ -38,6 +38,24 @@ namespace
             std::exit(1);
         }
     }
+
+    auto sample_exact_spawn_plan(const QuantumCheckpoint::RouteCCheckpoint& route_c)
+        -> QuantumCheckpoint::ExactSpawnPlanCheckpoint
+    {
+        return {
+            .captured_at_utc = route_c.captured_at_utc,
+            .route_c_payload_checksum = route_c.payload_checksum,
+            .game_executable_sha256 = route_c.game_executable_sha256,
+            .game_executable_size = route_c.game_executable_size,
+            .source_level_name = route_c.source_level_name,
+            .wave_index = 1,
+            .spawner_class = route_c.spawner_class,
+            .spawner_class_size = route_c.spawner_class_size,
+            .spawn_list =
+                "((cardsToSpawn=((cardName=\"enemy,a\",placement=(Index=1)))),"
+                "(cardsToSpawn=((cardName=\"enemy(b)\",placement=(Index=2)))))",
+        };
+    }
 }
 
 int main()
@@ -125,6 +143,36 @@ int main()
     error.clear();
     require(!parse_route_c_checkpoint(serialize_route_c_checkpoint(stateful_spawner), error),
             "stateful spawner is rejected");
+
+    original.payload_checksum = route_c_payload_checksum(original);
+    auto exact = sample_exact_spawn_plan(original);
+    const auto exact_json = serialize_exact_spawn_plan_checkpoint(exact);
+    error.clear();
+    const auto parsed_exact = parse_exact_spawn_plan_checkpoint(exact_json, error);
+    require(parsed_exact.has_value(), error.c_str());
+    require(parsed_exact->route_c_payload_checksum == original.payload_checksum,
+            "exact spawn plan preserves Route C linkage");
+    require(parsed_exact->spawn_list == exact.spawn_list, "exact spawn list round trip");
+    require(parsed_exact->payload_checksum == exact_spawn_plan_payload_checksum(*parsed_exact),
+            "exact spawn-plan checksum round trip");
+
+    auto missing_saved_wave = exact;
+    missing_saved_wave.wave_index = 2;
+    missing_saved_wave.payload_checksum = exact_spawn_plan_payload_checksum(missing_saved_wave);
+    error.clear();
+    require(!parse_exact_spawn_plan_checkpoint(
+                serialize_exact_spawn_plan_checkpoint(missing_saved_wave), error),
+            "exact spawn list must contain the saved wave");
+
+    auto corrupt_exact = exact_json;
+    const auto first_enemy = corrupt_exact.find("enemy,a");
+    require(first_enemy != std::string::npos, "exact fixture contains first enemy");
+    corrupt_exact.replace(first_enemy, std::string{"enemy,a"}.size(), "enemy,z");
+    error.clear();
+    require(!parse_exact_spawn_plan_checkpoint(corrupt_exact, error),
+            "corrupted exact spawn plan is rejected");
+    require(error.find("checksum") != std::string::npos,
+            "exact spawn-plan corruption reports checksum error");
 
     std::cout << "Route C checkpoint persistence tests passed\n";
     return 0;

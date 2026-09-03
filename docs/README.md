@@ -19,5 +19,6 @@
 - [phase-5-guarded-health-write.md](phase-5-guarded-health-write.md)：带版本门禁的临时生命写入、失败扫描路径与自动回滚验证。
 - [phase-6-guarded-turn-write.md](phase-6-guarded-turn-write.md)：回合计数私有字段、跨帧 UI 同步、并发变化保护与自动回滚验证。
 - [phase-7-route-c-vertical-slice.md](phase-7-route-c-vertical-slice.md)：普通地牢小关语义检查点的跨进程格式、恢复事务、安全门与真实验收步骤。
+- [phase-8-exact-state-gap.md](phase-8-exact-state-gap.md)：同波次恢复前后语义差异、离线比较工具，以及首个精确 `spawnList` 补充切片的回滚与实机验证。
 
 维护规则：需求发生变化时先更新 `requirements.md`；技术实验产生新证据时更新 `technical-status.md` 并补充对应阶段报告；正式选定恢复路线后在 `architecture-options.md` 记录决定与理由。

@@ -320,9 +320,9 @@ namespace QuantumCheckpoint
             append_hash_bytes(hash, std::to_string(value));
         }
 
-        auto is_sha256(std::string_view value) -> bool
+        auto is_hex_digest(std::string_view value, std::size_t expected_size) -> bool
         {
-            if (value.size() != 64)
+            if (value.size() != expected_size)
             {
                 return false;
             }
@@ -334,6 +334,11 @@ namespace QuantumCheckpoint
                 }
             }
             return true;
+        }
+
+        auto is_sha256(std::string_view value) -> bool
+        {
+            return is_hex_digest(value, 64);
         }
 
         auto required_string(const std::unordered_map<std::string, JsonValue>& values,
@@ -730,6 +735,163 @@ namespace QuantumCheckpoint
 #undef READ_STRING
 
         if (!validate_route_c_checkpoint(checkpoint, error))
+        {
+            return std::nullopt;
+        }
+        return checkpoint;
+    }
+
+    auto exact_spawn_plan_payload_checksum(const ExactSpawnPlanCheckpoint& checkpoint)
+        -> std::string
+    {
+        std::uint64_t hash = 14695981039346656037ULL;
+        append_hash_number(hash, checkpoint.schema_version);
+        append_hash_bytes(hash, checkpoint.kind);
+        append_hash_bytes(hash, checkpoint.captured_at_utc);
+        append_hash_bytes(hash, checkpoint.route_c_payload_checksum);
+        append_hash_bytes(hash, checkpoint.game_executable_sha256);
+        append_hash_number(hash, checkpoint.game_executable_size);
+        append_hash_bytes(hash, checkpoint.source_level_name);
+        append_hash_number(hash, checkpoint.wave_index);
+        append_hash_bytes(hash, checkpoint.spawner_class);
+        append_hash_number(hash, checkpoint.spawner_class_size);
+        append_hash_bytes(hash, checkpoint.spawn_list);
+
+        std::ostringstream output{};
+        output << std::hex << std::uppercase << std::setw(16) << std::setfill('0') << hash;
+        return output.str();
+    }
+
+    auto serialize_exact_spawn_plan_checkpoint(ExactSpawnPlanCheckpoint checkpoint)
+        -> std::string
+    {
+        checkpoint.payload_checksum = exact_spawn_plan_payload_checksum(checkpoint);
+        std::ostringstream output{};
+        output << "{\n"
+               << "  \"schemaVersion\": " << checkpoint.schema_version << ",\n"
+               << "  \"kind\": \"" << json_escape(checkpoint.kind) << "\",\n"
+               << "  \"capturedAtUtc\": \"" << json_escape(checkpoint.captured_at_utc)
+               << "\",\n"
+               << "  \"routeCPayloadChecksum\": \""
+               << json_escape(checkpoint.route_c_payload_checksum) << "\",\n"
+               << "  \"gameExecutableSha256\": \""
+               << json_escape(checkpoint.game_executable_sha256) << "\",\n"
+               << "  \"gameExecutableSize\": " << checkpoint.game_executable_size << ",\n"
+               << "  \"sourceLevelName\": \"" << json_escape(checkpoint.source_level_name)
+               << "\",\n"
+               << "  \"waveIndex\": " << checkpoint.wave_index << ",\n"
+               << "  \"spawnerClass\": \"" << json_escape(checkpoint.spawner_class)
+               << "\",\n"
+               << "  \"spawnerClassSize\": " << checkpoint.spawner_class_size << ",\n"
+               << "  \"spawnList\": \"" << json_escape(checkpoint.spawn_list) << "\",\n"
+               << "  \"payloadChecksum\": \"" << checkpoint.payload_checksum << "\"\n"
+               << "}\n";
+        return output.str();
+    }
+
+    auto validate_exact_spawn_plan_checkpoint(const ExactSpawnPlanCheckpoint& checkpoint,
+                                              std::string& error) -> bool
+    {
+        if (checkpoint.schema_version != ExactSpawnPlanSchemaVersion)
+        {
+            error = "unsupported exact spawn-plan schema version";
+            return false;
+        }
+        if (checkpoint.kind != ExactSpawnPlanCheckpointKind)
+        {
+            error = "checkpoint kind is not an exact spawn plan";
+            return false;
+        }
+        if (checkpoint.captured_at_utc.empty()
+            || !is_hex_digest(checkpoint.route_c_payload_checksum, 16))
+        {
+            error = "exact spawn plan has invalid Route C linkage";
+            return false;
+        }
+        if (!is_sha256(checkpoint.game_executable_sha256)
+            || checkpoint.game_executable_size == 0)
+        {
+            error = "exact spawn plan game executable fingerprint is invalid";
+            return false;
+        }
+        if (checkpoint.source_level_name.empty() || checkpoint.source_level_name == "None"
+            || checkpoint.source_level_name.size() > 256)
+        {
+            error = "exact spawn plan source level name is invalid";
+            return false;
+        }
+        if (checkpoint.wave_index < 0 || checkpoint.wave_index > 1000)
+        {
+            error = "exact spawn plan wave index is outside the supported range";
+            return false;
+        }
+        if (checkpoint.spawner_class.empty() || checkpoint.spawner_class.size() > 256
+            || checkpoint.spawner_class_size < 0x270
+            || checkpoint.spawner_class_size > 0x280)
+        {
+            error = "exact spawn plan does not describe an ordinary spawner";
+            return false;
+        }
+        std::string array_error{};
+        const auto waves = split_route_c_unreal_array(checkpoint.spawn_list, array_error);
+        if (!waves || waves->empty()
+            || static_cast<std::size_t>(checkpoint.wave_index) >= waves->size())
+        {
+            error = "exact spawnList is invalid or does not contain the saved wave: "
+                + array_error;
+            return false;
+        }
+        if (checkpoint.payload_checksum != exact_spawn_plan_payload_checksum(checkpoint))
+        {
+            error = "exact spawn-plan payload checksum does not match";
+            return false;
+        }
+        return true;
+    }
+
+    auto parse_exact_spawn_plan_checkpoint(std::string_view json, std::string& error)
+        -> std::optional<ExactSpawnPlanCheckpoint>
+    {
+        if (json.empty() || json.size() > RouteCMaximumFileBytes)
+        {
+            error = "exact spawn-plan file is empty or exceeds the 2 MiB limit";
+            return std::nullopt;
+        }
+
+        auto values = FlatJsonParser{json}.parse(error);
+        if (!values)
+        {
+            return std::nullopt;
+        }
+
+        ExactSpawnPlanCheckpoint checkpoint{};
+#define READ_EXACT_STRING(Field, JsonName) \
+        do { auto value = required_string(*values, JsonName, error); if (!value) return std::nullopt; checkpoint.Field = std::move(*value); } while (false)
+#define READ_EXACT_INTEGER(Field, JsonName, Type) \
+        do { auto value = required_integer<Type>(*values, JsonName, error); if (!value) return std::nullopt; checkpoint.Field = *value; } while (false)
+
+        READ_EXACT_INTEGER(schema_version, "schemaVersion", int);
+        if (checkpoint.schema_version != ExactSpawnPlanSchemaVersion)
+        {
+            error = "unsupported exact spawn-plan schema version";
+            return std::nullopt;
+        }
+        READ_EXACT_STRING(kind, "kind");
+        READ_EXACT_STRING(captured_at_utc, "capturedAtUtc");
+        READ_EXACT_STRING(route_c_payload_checksum, "routeCPayloadChecksum");
+        READ_EXACT_STRING(game_executable_sha256, "gameExecutableSha256");
+        READ_EXACT_INTEGER(game_executable_size, "gameExecutableSize", std::uint64_t);
+        READ_EXACT_STRING(source_level_name, "sourceLevelName");
+        READ_EXACT_INTEGER(wave_index, "waveIndex", std::int32_t);
+        READ_EXACT_STRING(spawner_class, "spawnerClass");
+        READ_EXACT_INTEGER(spawner_class_size, "spawnerClassSize", std::uint32_t);
+        READ_EXACT_STRING(spawn_list, "spawnList");
+        READ_EXACT_STRING(payload_checksum, "payloadChecksum");
+
+#undef READ_EXACT_INTEGER
+#undef READ_EXACT_STRING
+
+        if (!validate_exact_spawn_plan_checkpoint(checkpoint, error))
         {
             return std::nullopt;
         }

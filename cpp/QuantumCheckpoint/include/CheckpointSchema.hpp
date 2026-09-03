@@ -11,6 +11,9 @@ namespace QuantumCheckpoint
     inline constexpr int SchemaVersion = 5;
     inline constexpr int RouteCSchemaVersion = 2;
     inline constexpr std::string_view RouteCCheckpointKind = "route-c-substage-restart";
+    inline constexpr int ExactSpawnPlanSchemaVersion = 1;
+    inline constexpr std::string_view ExactSpawnPlanCheckpointKind =
+        "route-c-exact-spawn-plan";
     inline constexpr std::string_view RouteCSupportedMode = "DUNGEON";
     inline constexpr std::size_t RouteCMaximumFileBytes = 2U * 1024U * 1024U;
 
@@ -57,6 +60,25 @@ namespace QuantumCheckpoint
         std::int32_t wave_index{};
         std::string spawner_class{};
         std::uint32_t spawner_class_size{};
+        std::string payload_checksum{};
+    };
+
+    // The exact layer is deliberately separate from the proven Route C payload.
+    // A missing, stale, or rejected supplement must never invalidate the semantic
+    // substage checkpoint it references.
+    struct ExactSpawnPlanCheckpoint
+    {
+        int schema_version{ExactSpawnPlanSchemaVersion};
+        std::string kind{ExactSpawnPlanCheckpointKind};
+        std::string captured_at_utc{};
+        std::string route_c_payload_checksum{};
+        std::string game_executable_sha256{};
+        std::uint64_t game_executable_size{};
+        std::string source_level_name{};
+        std::int32_t wave_index{};
+        std::string spawner_class{};
+        std::uint32_t spawner_class_size{};
+        std::string spawn_list{};
         std::string payload_checksum{};
     };
 } // namespace QuantumCheckpoint

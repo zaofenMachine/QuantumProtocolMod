@@ -97,6 +97,7 @@ namespace QuantumCheckpoint
         struct PendingRouteCRestore
         {
             RouteCCheckpoint checkpoint{};
+            std::optional<ExactSpawnPlanCheckpoint> exact_spawn_plan{};
             std::vector<std::string> loot_drops{};
             RouteCRestorePhase phase{RouteCRestorePhase::AwaitingWaveIntercept};
             std::chrono::steady_clock::time_point started_at{};
@@ -112,6 +113,9 @@ namespace QuantumCheckpoint
             std::optional<std::string> character_ability_ok{};
             std::optional<std::chrono::steady_clock::time_point> empty_player_state_since{};
             std::string original_auto_spawn{};
+            std::string original_spawn_list{};
+            std::string exact_spawn_plan_status{"unavailable"};
+            std::string exact_spawn_plan_reason{};
             std::string interception_error{};
             std::string last_diagnostic{};
             std::chrono::steady_clock::time_point next_diagnostic_at{};
@@ -924,6 +928,14 @@ namespace QuantumCheckpoint
                 / STR("route-c.json");
         }
 
+        auto exact_spawn_plan_checkpoint_path() -> std::filesystem::path
+        {
+            const auto mods_directory = std::filesystem::path{
+                UE4SSProgram::get_program().get_mods_directory()};
+            return mods_directory / STR("QuantumCheckpoint") / STR("Checkpoint")
+                / STR("route-c-exact-spawn-plan.json");
+        }
+
         auto append_route_c_trace(std::string_view event) noexcept -> void
         {
             try
@@ -1091,6 +1103,87 @@ namespace QuantumCheckpoint
             }
             append_route_c_trace("restore.read.complete");
             return std::move(*checkpoint);
+        }
+
+        auto try_read_exact_spawn_plan_checkpoint(const RouteCCheckpoint& route_c,
+                                                  std::string& reason)
+            -> std::optional<ExactSpawnPlanCheckpoint>
+        {
+            try
+            {
+                const auto path = exact_spawn_plan_checkpoint_path();
+                std::error_code file_error{};
+                if (!std::filesystem::exists(path, file_error))
+                {
+                    reason = file_error
+                        ? "exact spawn-plan path could not be inspected"
+                        : "exact spawn-plan supplement does not exist";
+                    append_route_c_trace_failure(
+                        "restore.exact-spawn-plan.unavailable", reason);
+                    return std::nullopt;
+                }
+
+                const auto size = std::filesystem::file_size(path, file_error);
+                if (file_error || size == 0 || size > RouteCMaximumFileBytes)
+                {
+                    reason = "exact spawn-plan supplement has an invalid size";
+                    append_route_c_trace_failure(
+                        "restore.exact-spawn-plan.rejected", reason);
+                    return std::nullopt;
+                }
+
+                std::ifstream input{path, std::ios::binary};
+                if (!input)
+                {
+                    reason = "exact spawn-plan supplement could not be opened";
+                    append_route_c_trace_failure(
+                        "restore.exact-spawn-plan.rejected", reason);
+                    return std::nullopt;
+                }
+                std::string contents(static_cast<std::size_t>(size), '\0');
+                input.read(contents.data(), static_cast<std::streamsize>(contents.size()));
+                if (!input)
+                {
+                    reason = "exact spawn-plan supplement could not be read completely";
+                    append_route_c_trace_failure(
+                        "restore.exact-spawn-plan.rejected", reason);
+                    return std::nullopt;
+                }
+
+                std::string parse_error{};
+                auto exact = parse_exact_spawn_plan_checkpoint(contents, parse_error);
+                if (!exact)
+                {
+                    reason = "exact spawn-plan supplement was rejected: " + parse_error;
+                    append_route_c_trace_failure(
+                        "restore.exact-spawn-plan.rejected", reason);
+                    return std::nullopt;
+                }
+                if (exact->route_c_payload_checksum != route_c.payload_checksum
+                    || exact->game_executable_sha256 != route_c.game_executable_sha256
+                    || exact->game_executable_size != route_c.game_executable_size
+                    || exact->source_level_name != route_c.source_level_name
+                    || exact->wave_index != route_c.wave_index
+                    || exact->spawner_class != route_c.spawner_class
+                    || exact->spawner_class_size != route_c.spawner_class_size)
+                {
+                    reason = "exact spawn-plan supplement does not match the Route C checkpoint";
+                    append_route_c_trace_failure(
+                        "restore.exact-spawn-plan.stale", reason);
+                    return std::nullopt;
+                }
+
+                reason = "linked exact spawn-plan supplement loaded";
+                append_route_c_trace("restore.exact-spawn-plan.loaded");
+                return exact;
+            }
+            catch (const std::exception& error)
+            {
+                reason = std::string{"exact spawn-plan supplement was ignored: "} + error.what();
+                append_route_c_trace_failure(
+                    "restore.exact-spawn-plan.rejected", reason);
+                return std::nullopt;
+            }
         }
 
         auto parse_int32(std::string_view value) -> std::optional<std::int32_t>
@@ -1526,10 +1619,57 @@ namespace QuantumCheckpoint
                     "Route C checkpoint validation failed: " + validation_error};
             }
 
+            std::optional<ExactSpawnPlanCheckpoint> exact_spawn_plan{};
+            try
+            {
+                ExactSpawnPlanCheckpoint exact{};
+                exact.captured_at_utc = checkpoint.captured_at_utc;
+                exact.route_c_payload_checksum = checkpoint.payload_checksum;
+                exact.game_executable_sha256 = checkpoint.game_executable_sha256;
+                exact.game_executable_size = checkpoint.game_executable_size;
+                exact.source_level_name = checkpoint.source_level_name;
+                exact.wave_index = checkpoint.wave_index;
+                exact.spawner_class = checkpoint.spawner_class;
+                exact.spawner_class_size = checkpoint.spawner_class_size;
+                exact.spawn_list = required_text(
+                    export_property_text(objects.spawner, STR("spawnList")),
+                    "SpawnController.spawnList");
+                exact.payload_checksum = exact_spawn_plan_payload_checksum(exact);
+                std::string exact_validation_error{};
+                if (!validate_exact_spawn_plan_checkpoint(exact, exact_validation_error))
+                {
+                    throw std::runtime_error{exact_validation_error};
+                }
+                exact_spawn_plan = std::move(exact);
+            }
+            catch (const std::exception& error)
+            {
+                // Route C is the stable fallback. Failure to capture its optional exact
+                // supplement must not prevent the semantic checkpoint from being committed.
+                append_route_c_trace_failure(
+                    "capture.exact-spawn-plan.skipped", error.what());
+            }
+
             const auto path = route_c_checkpoint_path();
             append_route_c_trace("capture.write.begin");
-            write_file_atomically(path, serialize_route_c_checkpoint(std::move(checkpoint)));
+            write_file_atomically(path, serialize_route_c_checkpoint(checkpoint));
             append_route_c_trace("capture.complete");
+            if (exact_spawn_plan)
+            {
+                try
+                {
+                    append_route_c_trace("capture.exact-spawn-plan.write.begin");
+                    write_file_atomically(
+                        exact_spawn_plan_checkpoint_path(),
+                        serialize_exact_spawn_plan_checkpoint(std::move(*exact_spawn_plan)));
+                    append_route_c_trace("capture.exact-spawn-plan.write.complete");
+                }
+                catch (const std::exception& error)
+                {
+                    append_route_c_trace_failure(
+                        "capture.exact-spawn-plan.write.failed", error.what());
+                }
+            }
             return path;
         }
 
@@ -1591,6 +1731,12 @@ namespace QuantumCheckpoint
                 output << "null";
             }
             output << ",\n"
+                   << "  \"exactSpawnPlanSupplementPresent\": "
+                   << (restore.exact_spawn_plan ? "true" : "false") << ",\n"
+                   << "  \"exactSpawnPlanStatus\": \""
+                   << json_escape(restore.exact_spawn_plan_status) << "\",\n"
+                   << "  \"exactSpawnPlanReason\": \""
+                   << json_escape(restore.exact_spawn_plan_reason) << "\",\n"
                    << "  \"targetHealth\": " << restore.checkpoint.player_health << "\n"
                    << "}\n";
             write_file_atomically(path, output.str());
@@ -1684,6 +1830,9 @@ namespace QuantumCheckpoint
                 throw std::runtime_error{
                     "Route C checkpoint belongs to a different game executable"};
             }
+            std::string exact_spawn_plan_reason{};
+            auto exact_spawn_plan = try_read_exact_spawn_plan_checkpoint(
+                checkpoint, exact_spawn_plan_reason);
 
             const auto objects = find_route_c_objects();
             if (!objects.game_instance)
@@ -1798,13 +1947,18 @@ namespace QuantumCheckpoint
             }
 
             const auto now = std::chrono::steady_clock::now();
+            const bool exact_spawn_plan_available = exact_spawn_plan.has_value();
             g_pending_route_c_capture.reset();
             g_pending_route_c_restore.emplace(PendingRouteCRestore{
                 .checkpoint = std::move(checkpoint),
+                .exact_spawn_plan = std::move(exact_spawn_plan),
                 .loot_drops = std::move(*loot_drops),
                 .phase = RouteCRestorePhase::AwaitingWaveIntercept,
                 .started_at = now,
                 .phase_ready_at = now,
+                .exact_spawn_plan_status = exact_spawn_plan_available
+                    ? "pending" : "unavailable",
+                .exact_spawn_plan_reason = std::move(exact_spawn_plan_reason),
             });
 
             try
@@ -1937,6 +2091,122 @@ namespace QuantumCheckpoint
                 {
                     restore_original_health();
                     throw;
+                }
+            }
+        }
+
+        auto verify_exact_spawn_plan_or_rollback(PendingRouteCRestore& restore,
+                                                 UObject* spawner) -> void
+        {
+            if (!restore.exact_spawn_plan
+                || (restore.exact_spawn_plan_status != "applied"
+                    && restore.exact_spawn_plan_status != "verified"))
+            {
+                return;
+            }
+
+            const auto live_spawn_list = export_property_text(spawner, STR("spawnList"));
+            if (live_spawn_list
+                && *live_spawn_list == restore.exact_spawn_plan->spawn_list)
+            {
+                if (restore.exact_spawn_plan_status != "verified")
+                {
+                    restore.exact_spawn_plan_status = "verified";
+                    restore.exact_spawn_plan_reason =
+                        "exact future spawn plan remained equal after native wave startup";
+                    append_route_c_trace("restore.exact-spawn-plan.verified");
+                }
+                return;
+            }
+
+            const std::string failure = live_spawn_list
+                ? "exact spawnList changed after import"
+                : "exact spawnList was unavailable during verification";
+            if (restore.original_spawn_list.empty())
+            {
+                throw std::runtime_error{
+                    "exact spawn-plan verification failed without rollback material"};
+            }
+
+            import_property_text(
+                spawner, STR("spawnList"), restore.original_spawn_list);
+            const auto rolled_back = required_text(
+                export_property_text(spawner, STR("spawnList")),
+                "rolled-back SpawnController.spawnList");
+            if (rolled_back != restore.original_spawn_list)
+            {
+                throw std::runtime_error{
+                    "exact spawn-plan verification failed and rollback did not verify"};
+            }
+            restore.exact_spawn_plan_status = "failed-rolled-back";
+            restore.exact_spawn_plan_reason = failure;
+            append_route_c_trace_failure(
+                "restore.exact-spawn-plan.verification-failed-rolled-back", failure);
+        }
+
+        auto try_apply_exact_spawn_plan(PendingRouteCRestore& restore,
+                                        UObject* spawner) -> bool
+        {
+            if (!restore.exact_spawn_plan
+                || restore.exact_spawn_plan_status != "pending")
+            {
+                return true;
+            }
+
+            const auto original = export_property_text(spawner, STR("spawnList"));
+            if (!original || original->empty())
+            {
+                return false;
+            }
+
+            restore.original_spawn_list = *original;
+            try
+            {
+                append_route_c_trace("restore.exact-spawn-plan.import.begin");
+                import_property_text(
+                    spawner, STR("spawnList"), restore.exact_spawn_plan->spawn_list);
+                const auto verified = required_text(
+                    export_property_text(spawner, STR("spawnList")),
+                    "imported SpawnController.spawnList");
+                if (verified != restore.exact_spawn_plan->spawn_list)
+                {
+                    throw std::runtime_error{
+                        "imported exact spawnList did not verify"};
+                }
+                restore.exact_spawn_plan_status = "applied";
+                restore.exact_spawn_plan_reason =
+                    "exact future spawn plan imported before controlled wave startup";
+                append_route_c_trace("restore.exact-spawn-plan.import.complete");
+                return true;
+            }
+            catch (const std::exception& error)
+            {
+                try
+                {
+                    import_property_text(
+                        spawner, STR("spawnList"), restore.original_spawn_list);
+                    const auto rolled_back = required_text(
+                        export_property_text(spawner, STR("spawnList")),
+                        "rolled-back SpawnController.spawnList");
+                    if (rolled_back != restore.original_spawn_list)
+                    {
+                        throw std::runtime_error{"spawnList rollback did not verify"};
+                    }
+                    restore.exact_spawn_plan_status = "failed-rolled-back";
+                    restore.exact_spawn_plan_reason = error.what();
+                    append_route_c_trace_failure(
+                        "restore.exact-spawn-plan.failed-rolled-back",
+                        restore.exact_spawn_plan_reason);
+                    return true;
+                }
+                catch (const std::exception& rollback_error)
+                {
+                    restore.exact_spawn_plan_status = "rollback-failed";
+                    restore.exact_spawn_plan_reason =
+                        std::string{error.what()} + "; rollback: "
+                        + rollback_error.what();
+                    throw std::runtime_error{
+                        "exact spawn-plan write could not be rolled back"};
                 }
             }
         }
@@ -2117,6 +2387,20 @@ namespace QuantumCheckpoint
                     restore.intercepted_world = objects.spawner->GetWorld();
                     restore.auto_spawn_suppressed = true;
 
+                    if (!try_apply_exact_spawn_plan(restore, objects.spawner))
+                    {
+                        if (now - restore.started_at <= std::chrono::seconds{5})
+                        {
+                            return;
+                        }
+                        restore.exact_spawn_plan_status = "failed-no-write";
+                        restore.exact_spawn_plan_reason =
+                            "replacement SpawnController did not expose spawnList within five seconds";
+                        append_route_c_trace_failure(
+                            "restore.exact-spawn-plan.failed-no-write",
+                            restore.exact_spawn_plan_reason);
+                    }
+
                     if (!wave)
                     {
                         return;
@@ -2173,6 +2457,17 @@ namespace QuantumCheckpoint
                     }
                     return;
                 }
+
+                if (restore.exact_spawn_plan_status == "pending")
+                {
+                    restore.exact_spawn_plan_status = "failed-no-write";
+                    restore.exact_spawn_plan_reason =
+                        "SpawnController BeginPlay completed without applying the exact supplement";
+                    append_route_c_trace_failure(
+                        "restore.exact-spawn-plan.failed-no-write",
+                        restore.exact_spawn_plan_reason);
+                }
+                verify_exact_spawn_plan_or_rollback(restore, objects.spawner);
 
                 if (restore.phase == RouteCRestorePhase::AwaitingStableBattle)
                 {
@@ -2284,7 +2579,9 @@ namespace QuantumCheckpoint
 
                 finish_route_c_restore(
                     "passed",
-                    "ordinary substage, player deck, storage, new loot drops, and health were restored");
+                    restore.exact_spawn_plan_status == "verified"
+                        ? "ordinary substage semantics and the exact future spawn plan were restored"
+                        : "ordinary substage, player deck, storage, new loot drops, and health were restored");
             }
             catch (const std::exception& error)
             {
@@ -3710,8 +4007,8 @@ namespace QuantumCheckpoint
         QuantumCheckpointMod()
         {
             ModName = STR("QuantumCheckpoint");
-            ModVersion = STR("0.9.13-dev");
-            ModDescription = STR("Route C semantic substage checkpoint prototype");
+            ModVersion = STR("0.10.1-dev");
+            ModDescription = STR("Route C checkpoint with optional exact-state supplements");
             ModAuthors = STR("zaofenMachine and contributors");
             ModIntendedSDKVersion = STR("3.0.1");
         }
