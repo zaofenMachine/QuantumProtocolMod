@@ -56,6 +56,21 @@ namespace
                 "(cardsToSpawn=((cardName=\"enemy(b)\",placement=(Index=2)))))",
         };
     }
+
+    auto sample_exact_player_zones(const QuantumCheckpoint::RouteCCheckpoint& route_c)
+        -> QuantumCheckpoint::ExactPlayerZonesCheckpoint
+    {
+        return {
+            .captured_at_utc = route_c.captured_at_utc,
+            .route_c_payload_checksum = route_c.payload_checksum,
+            .game_executable_sha256 = route_c.game_executable_sha256,
+            .game_executable_size = route_c.game_executable_size,
+            .source_level_name = route_c.source_level_name,
+            .wave_index = route_c.wave_index,
+            .player_deck = "((CardInfo=(Tag=\"a\")))",
+            .player_hand = "((CardInfo=(Tag=\"a\")))",
+        };
+    }
 }
 
 int main()
@@ -173,6 +188,54 @@ int main()
             "corrupted exact spawn plan is rejected");
     require(error.find("checksum") != std::string::npos,
             "exact spawn-plan corruption reports checksum error");
+
+    auto zones_route = original;
+    zones_route.active_decklist =
+        "(deckTag=\"fixed-test\",cardList=((cardName=\"a\",count=2)))";
+    zones_route.payload_checksum = route_c_payload_checksum(zones_route);
+    auto zones = sample_exact_player_zones(zones_route);
+    const auto zones_json = serialize_exact_player_zones_checkpoint(zones);
+    error.clear();
+    const auto parsed_zones = parse_exact_player_zones_checkpoint(zones_json, error);
+    require(parsed_zones.has_value(), error.c_str());
+    require(parsed_zones->player_deck == zones.player_deck, "exact player deck round trip");
+    require(parsed_zones->player_hand == zones.player_hand, "exact player hand round trip");
+    require(parsed_zones->payload_checksum == exact_player_zones_payload_checksum(*parsed_zones),
+            "exact player-zones checksum round trip");
+
+    error.clear();
+    const auto fixed_startup = exact_player_zones_startup_decklist(
+        zones_route.active_decklist, zones.player_deck, zones.player_hand, error);
+    require(fixed_startup.has_value(), error.c_str());
+    require(*fixed_startup
+                == "(deckTag=\"fixed-test\",cardList=((cardName=\"a\",count=1),"
+                   "(cardName=\"a\",count=1)),fixedOrder=True)",
+            "exact player zones create an expanded fixed-order startup deck");
+
+    const std::string ordered_active =
+        "(deckTag=\"ordered\",cardList=((cardName=\"a\",count=2),"
+        "(cardName=\"b\",count=1,upgradeLevel=1)),fixedOrder=False,"
+        "dungeonTools=((cardName=\"tool\",count=1)))";
+    const std::string ordered_deck = "((CardInfo=(Tag=\"a\")))";
+    const std::string ordered_hand =
+        "((CardInfo=(Tag=\"b\"),upgradeLevel=1),(CardInfo=(Tag=\"a\")))";
+    error.clear();
+    const auto ordered_startup = exact_player_zones_startup_decklist(
+        ordered_active, ordered_deck, ordered_hand, error);
+    require(ordered_startup.has_value(), error.c_str());
+    require(*ordered_startup
+                == "(deckTag=\"ordered\",cardList=((cardName=\"a\",count=1),"
+                   "(cardName=\"a\",count=1),(cardName=\"b\",count=1,upgradeLevel=1)),"
+                   "fixedOrder=True,dungeonTools=())",
+            "fixed-order startup preserves the deck then reverses the hand draw order");
+
+    error.clear();
+    require(!exact_player_zones_startup_decklist(
+                zones_route.active_decklist,
+                zones.player_deck,
+                "((CardInfo=(Tag=\"different\")))",
+                error),
+            "exact player zones reject a different card multiset");
 
     std::cout << "Route C checkpoint persistence tests passed\n";
     return 0;

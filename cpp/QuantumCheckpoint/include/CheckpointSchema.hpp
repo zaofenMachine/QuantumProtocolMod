@@ -14,6 +14,9 @@ namespace QuantumCheckpoint
     inline constexpr int ExactSpawnPlanSchemaVersion = 1;
     inline constexpr std::string_view ExactSpawnPlanCheckpointKind =
         "route-c-exact-spawn-plan";
+    inline constexpr int ExactPlayerZonesSchemaVersion = 1;
+    inline constexpr std::string_view ExactPlayerZonesCheckpointKind =
+        "route-c-exact-player-zones";
     inline constexpr std::string_view RouteCSupportedMode = "DUNGEON";
     inline constexpr std::size_t RouteCMaximumFileBytes = 2U * 1024U * 1024U;
 
@@ -79,6 +82,21 @@ namespace QuantumCheckpoint
         std::string spawner_class{};
         std::uint32_t spawner_class_size{};
         std::string spawn_list{};
+        std::string payload_checksum{};
+    };
+
+    struct ExactPlayerZonesCheckpoint
+    {
+        int schema_version{ExactPlayerZonesSchemaVersion};
+        std::string kind{ExactPlayerZonesCheckpointKind};
+        std::string captured_at_utc{};
+        std::string route_c_payload_checksum{};
+        std::string game_executable_sha256{};
+        std::uint64_t game_executable_size{};
+        std::string source_level_name{};
+        std::int32_t wave_index{};
+        std::string player_deck{};
+        std::string player_hand{};
         std::string payload_checksum{};
     };
 } // namespace QuantumCheckpoint

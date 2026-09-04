@@ -1,5 +1,6 @@
 #include "CheckpointPersistence.hpp"
 
+#include <algorithm>
 #include <array>
 #include <charconv>
 #include <cctype>
@@ -375,6 +376,183 @@ namespace QuantumCheckpoint
             }
             return static_cast<Number>(value);
         }
+
+        auto parenthesized_field_span(std::string_view text, std::string_view marker,
+                                      std::string& error)
+            -> std::optional<std::pair<std::size_t, std::size_t>>
+        {
+            const auto marker_position = text.find(marker);
+            if (marker_position == std::string_view::npos)
+            {
+                error = "missing Unreal field: " + std::string{marker};
+                return std::nullopt;
+            }
+            const auto value_start = marker_position + marker.size();
+            if (value_start >= text.size() || text[value_start] != '(')
+            {
+                error = "Unreal field is not parenthesized: " + std::string{marker};
+                return std::nullopt;
+            }
+
+            std::int32_t depth{};
+            bool in_quotes{};
+            bool escaped{};
+            for (auto index = value_start; index < text.size(); ++index)
+            {
+                const auto character = text[index];
+                if (in_quotes)
+                {
+                    if (escaped)
+                    {
+                        escaped = false;
+                    }
+                    else if (character == '\\')
+                    {
+                        escaped = true;
+                    }
+                    else if (character == '"')
+                    {
+                        in_quotes = false;
+                    }
+                    continue;
+                }
+                if (character == '"')
+                {
+                    in_quotes = true;
+                }
+                else if (character == '(')
+                {
+                    ++depth;
+                }
+                else if (character == ')')
+                {
+                    if (--depth == 0)
+                    {
+                        return std::pair{value_start, index + 1};
+                    }
+                    if (depth < 0)
+                    {
+                        break;
+                    }
+                }
+            }
+            error = "Unreal field is unterminated: " + std::string{marker};
+            return std::nullopt;
+        }
+
+        auto quoted_field(std::string_view text, std::string_view marker,
+                          std::string& error) -> std::optional<std::string>
+        {
+            const auto position = text.find(marker);
+            if (position == std::string_view::npos)
+            {
+                error = "card entry is missing field: " + std::string{marker};
+                return std::nullopt;
+            }
+            const auto begin = position + marker.size();
+            const auto end = text.find('"', begin);
+            if (end == std::string_view::npos || end == begin)
+            {
+                error = "card entry has an invalid quoted field: " + std::string{marker};
+                return std::nullopt;
+            }
+            const auto value = text.substr(begin, end - begin);
+            for (const unsigned char character : value)
+            {
+                if (!(std::isalnum(character) || character == '_'))
+                {
+                    error = "card tag contains an unsupported character";
+                    return std::nullopt;
+                }
+            }
+            return std::string{value};
+        }
+
+        auto integer_field_or_default(std::string_view text, std::string_view marker,
+                                      std::int32_t fallback, std::string& error)
+            -> std::optional<std::int32_t>
+        {
+            const auto position = text.find(marker);
+            if (position == std::string_view::npos)
+            {
+                return fallback;
+            }
+            const auto begin = position + marker.size();
+            auto end = begin;
+            while (end < text.size()
+                   && (std::isdigit(static_cast<unsigned char>(text[end]))
+                       || (end == begin && text[end] == '-')))
+            {
+                ++end;
+            }
+            std::int32_t value{};
+            const auto parsed = std::from_chars(text.data() + begin, text.data() + end, value);
+            if (begin == end || parsed.ec != std::errc{} || parsed.ptr != text.data() + end)
+            {
+                error = "card entry has an invalid integer field: " + std::string{marker};
+                return std::nullopt;
+            }
+            return value;
+        }
+
+        struct OrderedCard
+        {
+            std::string tag{};
+            std::int32_t upgrade_level{};
+        };
+
+        auto exact_card_from_instance(std::string_view text, std::string& error)
+            -> std::optional<OrderedCard>
+        {
+            auto tag = quoted_field(text, "Tag=\"", error);
+            auto upgrade = integer_field_or_default(text, "upgradeLevel=", 0, error);
+            if (!tag || !upgrade || *upgrade < 0 || *upgrade > 1000)
+            {
+                if (error.empty())
+                {
+                    error = "card upgrade level is outside the supported range";
+                }
+                return std::nullopt;
+            }
+            return OrderedCard{.tag = std::move(*tag), .upgrade_level = *upgrade};
+        }
+
+        auto decklist_card_from_entry(std::string_view text, std::int32_t& count,
+                                      std::string& error) -> std::optional<OrderedCard>
+        {
+            auto tag = quoted_field(text, "cardName=\"", error);
+            auto parsed_count = integer_field_or_default(text, "count=", 1, error);
+            auto upgrade = integer_field_or_default(text, "upgradeLevel=", 0, error);
+            if (!tag || !parsed_count || !upgrade || *parsed_count <= 0
+                || *parsed_count > 128 || *upgrade < 0 || *upgrade > 1000)
+            {
+                if (error.empty())
+                {
+                    error = "DecklistCard count or upgrade level is outside the supported range";
+                }
+                return std::nullopt;
+            }
+            count = *parsed_count;
+            return OrderedCard{.tag = std::move(*tag), .upgrade_level = *upgrade};
+        }
+
+        auto ordered_card_key(const OrderedCard& card) -> std::string
+        {
+            return card.tag + "@" + std::to_string(card.upgrade_level);
+        }
+
+        auto decklist_card_text(const OrderedCard& card) -> std::string
+        {
+            std::string result{"(cardName=\""};
+            result += card.tag;
+            result += "\",count=1";
+            if (card.upgrade_level != 0)
+            {
+                result += ",upgradeLevel=" + std::to_string(card.upgrade_level);
+            }
+            result += ')';
+            return result;
+        }
     } // namespace
 
     auto route_c_startup_decklist(std::string_view active_decklist) -> std::string
@@ -557,6 +735,133 @@ namespace QuantumCheckpoint
             return std::nullopt;
         }
         return elements;
+    }
+
+    auto exact_player_zones_startup_decklist(std::string_view active_decklist,
+                                             std::string_view player_deck,
+                                             std::string_view player_hand,
+                                             std::string& error)
+        -> std::optional<std::string>
+    {
+        error.clear();
+        auto startup = route_c_startup_decklist(active_decklist);
+        auto card_list_span = parenthesized_field_span(startup, "cardList=", error);
+        if (!card_list_span)
+        {
+            return std::nullopt;
+        }
+
+        auto deck_elements = split_route_c_unreal_array(player_deck, error);
+        if (!deck_elements)
+        {
+            error = "exact player deck is invalid: " + error;
+            return std::nullopt;
+        }
+        auto hand_elements = split_route_c_unreal_array(player_hand, error);
+        if (!hand_elements)
+        {
+            error = "exact player hand is invalid: " + error;
+            return std::nullopt;
+        }
+        if (deck_elements->empty() || hand_elements->empty()
+            || deck_elements->size() + hand_elements->size() > 128)
+        {
+            error = "exact player zones require a non-empty deck and hand with at most 128 cards";
+            return std::nullopt;
+        }
+
+        std::vector<OrderedCard> deck_cards{};
+        std::vector<OrderedCard> hand_cards{};
+        std::unordered_map<std::string, std::int32_t> exact_counts{};
+        const auto append_exact = [&](const std::vector<std::string>& source,
+                                      std::vector<OrderedCard>& destination) -> bool {
+            destination.reserve(source.size());
+            for (const auto& element : source)
+            {
+                auto card = exact_card_from_instance(element, error);
+                if (!card)
+                {
+                    return false;
+                }
+                ++exact_counts[ordered_card_key(*card)];
+                destination.push_back(std::move(*card));
+            }
+            return true;
+        };
+        if (!append_exact(*deck_elements, deck_cards)
+            || !append_exact(*hand_elements, hand_cards))
+        {
+            return std::nullopt;
+        }
+
+        const auto active_card_list = std::string_view{startup}.substr(
+            card_list_span->first,
+            card_list_span->second - card_list_span->first);
+        auto active_elements = split_route_c_unreal_array(active_card_list, error);
+        if (!active_elements)
+        {
+            error = "active Decklist.cardList is invalid: " + error;
+            return std::nullopt;
+        }
+        std::unordered_map<std::string, std::int32_t> active_counts{};
+        std::size_t active_total{};
+        for (const auto& element : *active_elements)
+        {
+            std::int32_t count{};
+            auto card = decklist_card_from_entry(element, count, error);
+            if (!card)
+            {
+                return std::nullopt;
+            }
+            active_counts[ordered_card_key(*card)] += count;
+            active_total += static_cast<std::size_t>(count);
+        }
+        if (active_total != deck_cards.size() + hand_cards.size()
+            || active_counts != exact_counts)
+        {
+            error = "exact player zones do not match the active deck card multiset";
+            return std::nullopt;
+        }
+
+        // The guarded fixed-order experiment models native draws as TArray::Pop().
+        // Its post-startup zone comparison decides whether this orientation is valid.
+        std::vector<OrderedCard> fixed_order{};
+        fixed_order.reserve(deck_cards.size() + hand_cards.size());
+        fixed_order.insert(fixed_order.end(), deck_cards.begin(), deck_cards.end());
+        fixed_order.insert(fixed_order.end(), hand_cards.rbegin(), hand_cards.rend());
+        std::string replacement{"("};
+        for (std::size_t index{}; index < fixed_order.size(); ++index)
+        {
+            if (index != 0)
+            {
+                replacement += ',';
+            }
+            replacement += decklist_card_text(fixed_order[index]);
+        }
+        replacement += ')';
+        startup.replace(
+            card_list_span->first,
+            card_list_span->second - card_list_span->first,
+            replacement);
+
+        constexpr std::string_view fixed_marker{"fixedOrder="};
+        const auto fixed_position = startup.find(fixed_marker);
+        if (fixed_position == std::string::npos)
+        {
+            startup.insert(card_list_span->first + replacement.size(), ",fixedOrder=True");
+        }
+        else
+        {
+            const auto value_start = fixed_position + fixed_marker.size();
+            const auto value_end = startup.find_first_of(",)", value_start);
+            if (value_end == std::string::npos || value_end == value_start)
+            {
+                error = "active Decklist.fixedOrder field is invalid";
+                return std::nullopt;
+            }
+            startup.replace(value_start, value_end - value_start, "True");
+        }
+        return startup;
     }
 
     auto route_c_payload_checksum(const RouteCCheckpoint& checkpoint) -> std::string
@@ -892,6 +1197,165 @@ namespace QuantumCheckpoint
 #undef READ_EXACT_STRING
 
         if (!validate_exact_spawn_plan_checkpoint(checkpoint, error))
+        {
+            return std::nullopt;
+        }
+        return checkpoint;
+    }
+
+    auto exact_player_zones_payload_checksum(const ExactPlayerZonesCheckpoint& checkpoint)
+        -> std::string
+    {
+        std::uint64_t hash = 14695981039346656037ULL;
+        append_hash_number(hash, checkpoint.schema_version);
+        append_hash_bytes(hash, checkpoint.kind);
+        append_hash_bytes(hash, checkpoint.captured_at_utc);
+        append_hash_bytes(hash, checkpoint.route_c_payload_checksum);
+        append_hash_bytes(hash, checkpoint.game_executable_sha256);
+        append_hash_number(hash, checkpoint.game_executable_size);
+        append_hash_bytes(hash, checkpoint.source_level_name);
+        append_hash_number(hash, checkpoint.wave_index);
+        append_hash_bytes(hash, checkpoint.player_deck);
+        append_hash_bytes(hash, checkpoint.player_hand);
+
+        std::ostringstream output{};
+        output << std::hex << std::uppercase << std::setw(16) << std::setfill('0') << hash;
+        return output.str();
+    }
+
+    auto serialize_exact_player_zones_checkpoint(ExactPlayerZonesCheckpoint checkpoint)
+        -> std::string
+    {
+        checkpoint.payload_checksum = exact_player_zones_payload_checksum(checkpoint);
+        std::ostringstream output{};
+        output << "{\n"
+               << "  \"schemaVersion\": " << checkpoint.schema_version << ",\n"
+               << "  \"kind\": \"" << json_escape(checkpoint.kind) << "\",\n"
+               << "  \"capturedAtUtc\": \"" << json_escape(checkpoint.captured_at_utc)
+               << "\",\n"
+               << "  \"routeCPayloadChecksum\": \""
+               << json_escape(checkpoint.route_c_payload_checksum) << "\",\n"
+               << "  \"gameExecutableSha256\": \""
+               << json_escape(checkpoint.game_executable_sha256) << "\",\n"
+               << "  \"gameExecutableSize\": " << checkpoint.game_executable_size << ",\n"
+               << "  \"sourceLevelName\": \"" << json_escape(checkpoint.source_level_name)
+               << "\",\n"
+               << "  \"waveIndex\": " << checkpoint.wave_index << ",\n"
+               << "  \"playerDeck\": \"" << json_escape(checkpoint.player_deck) << "\",\n"
+               << "  \"playerHand\": \"" << json_escape(checkpoint.player_hand) << "\",\n"
+               << "  \"payloadChecksum\": \"" << checkpoint.payload_checksum << "\"\n"
+               << "}\n";
+        return output.str();
+    }
+
+    auto validate_exact_player_zones_checkpoint(const ExactPlayerZonesCheckpoint& checkpoint,
+                                                std::string& error) -> bool
+    {
+        if (checkpoint.schema_version != ExactPlayerZonesSchemaVersion)
+        {
+            error = "unsupported exact player-zones schema version";
+            return false;
+        }
+        if (checkpoint.kind != ExactPlayerZonesCheckpointKind)
+        {
+            error = "checkpoint kind is not exact player zones";
+            return false;
+        }
+        if (checkpoint.captured_at_utc.empty()
+            || !is_hex_digest(checkpoint.route_c_payload_checksum, 16))
+        {
+            error = "exact player zones have invalid Route C linkage";
+            return false;
+        }
+        if (!is_sha256(checkpoint.game_executable_sha256)
+            || checkpoint.game_executable_size == 0)
+        {
+            error = "exact player zones have an invalid game executable fingerprint";
+            return false;
+        }
+        if (checkpoint.source_level_name.empty() || checkpoint.source_level_name == "None"
+            || checkpoint.source_level_name.size() > 256 || checkpoint.wave_index < 0
+            || checkpoint.wave_index > 1000)
+        {
+            error = "exact player zones have invalid level or wave data";
+            return false;
+        }
+
+        std::string array_error{};
+        const auto deck = split_route_c_unreal_array(checkpoint.player_deck, array_error);
+        if (!deck || deck->empty())
+        {
+            error = "exact player deck is invalid: " + array_error;
+            return false;
+        }
+        array_error.clear();
+        const auto hand = split_route_c_unreal_array(checkpoint.player_hand, array_error);
+        if (!hand || hand->empty() || deck->size() + hand->size() > 128)
+        {
+            error = "exact player hand is invalid: " + array_error;
+            return false;
+        }
+        for (const auto* zone : {&*deck, &*hand})
+        {
+            for (const auto& element : *zone)
+            {
+                array_error.clear();
+                if (!exact_card_from_instance(element, array_error))
+                {
+                    error = "exact player zone contains an invalid card: " + array_error;
+                    return false;
+                }
+            }
+        }
+        if (checkpoint.payload_checksum != exact_player_zones_payload_checksum(checkpoint))
+        {
+            error = "exact player-zones payload checksum does not match";
+            return false;
+        }
+        return true;
+    }
+
+    auto parse_exact_player_zones_checkpoint(std::string_view json, std::string& error)
+        -> std::optional<ExactPlayerZonesCheckpoint>
+    {
+        if (json.empty() || json.size() > RouteCMaximumFileBytes)
+        {
+            error = "exact player-zones file is empty or exceeds the 2 MiB limit";
+            return std::nullopt;
+        }
+        auto values = FlatJsonParser{json}.parse(error);
+        if (!values)
+        {
+            return std::nullopt;
+        }
+
+        ExactPlayerZonesCheckpoint checkpoint{};
+#define READ_ZONES_STRING(Field, JsonName) \
+        do { auto value = required_string(*values, JsonName, error); if (!value) return std::nullopt; checkpoint.Field = std::move(*value); } while (false)
+#define READ_ZONES_INTEGER(Field, JsonName, Type) \
+        do { auto value = required_integer<Type>(*values, JsonName, error); if (!value) return std::nullopt; checkpoint.Field = *value; } while (false)
+
+        READ_ZONES_INTEGER(schema_version, "schemaVersion", int);
+        if (checkpoint.schema_version != ExactPlayerZonesSchemaVersion)
+        {
+            error = "unsupported exact player-zones schema version";
+            return std::nullopt;
+        }
+        READ_ZONES_STRING(kind, "kind");
+        READ_ZONES_STRING(captured_at_utc, "capturedAtUtc");
+        READ_ZONES_STRING(route_c_payload_checksum, "routeCPayloadChecksum");
+        READ_ZONES_STRING(game_executable_sha256, "gameExecutableSha256");
+        READ_ZONES_INTEGER(game_executable_size, "gameExecutableSize", std::uint64_t);
+        READ_ZONES_STRING(source_level_name, "sourceLevelName");
+        READ_ZONES_INTEGER(wave_index, "waveIndex", std::int32_t);
+        READ_ZONES_STRING(player_deck, "playerDeck");
+        READ_ZONES_STRING(player_hand, "playerHand");
+        READ_ZONES_STRING(payload_checksum, "payloadChecksum");
+
+#undef READ_ZONES_INTEGER
+#undef READ_ZONES_STRING
+
+        if (!validate_exact_player_zones_checkpoint(checkpoint, error))
         {
             return std::nullopt;
         }

@@ -7,7 +7,7 @@
 - 游戏：Quantum Protocol，Windows / Unreal Engine 4。
 - 已测试安装目录：`F:\SteamLibrary\steamapps\common\Quantum Protocol`。
 - 注入/反射工具：UE4SS 3.0.1 zDEV。
-- 当前实现：C++ v0.9.13 路线 C 核心垂直切片已闭环。v0.10.1 在不改动主 schema 2 的前提下增加独立精确 `spawnList` 补充文件；实机报告为 `passed / verified`，未来 29 个小关计划恢复前后逐项一致。手牌/牌库仍会重洗，是当前最直接的精确差异。
+- 当前实现：C++ v0.9.13 路线 C 核心垂直切片已闭环。v0.10.1 增加独立精确 `spawnList` 补充；v0.11.3 使用游戏原生 `FDecklist.fixedOrder` 增加纯净小关开头的精确牌库/手牌补充。完全重启后从主菜单直接恢复报告为 `passed`，两项精确状态均为 `verified`。
 - 正式跨进程恢复倾向 UE4SS C++ Mod。只读导出器 v0.1–v0.5 已使用 RE-UE4SS v3.0.1、UEPseudo、MSVC 14.38 和固定 Rust nightly 完成构建、部署与真实战斗验证，均未导致游戏崩溃。v0.5 复杂样本包含 141 个相关对象和 17 张活动卡。
 - Windows 11 SDK `10.0.28000.0` 已被 CMake 正确选中并以 Windows `10.0.19045` 为目标完成构建，不需要额外安装 Windows 10 SDK。
 - 已在战斗场景成功生成 CXX SDK：662 个头文件，关键 Quantum 类、结构和函数签名均已取得。详细证据见 [sdk-analysis.md](sdk-analysis.md)。
@@ -32,6 +32,7 @@
 - `scripts/Compare-BattleInventories.ps1` 可把两份 `Ctrl+F1` 清单归一化为结构化差异，忽略地址、对象序号、函数指针和预期重建的 GUID，同时比较关卡上下文、引擎状态、牌区、单卡状态、槽位、生命、回合、计数器、效果、特殊资源及未来波次计划。
 - 未加精确层的同波次样本中，当前敌人/引擎/生命/特殊资源相同，但玩家手牌与牌库不同，且 29 项 `spawnList` 中有 6 项换序。v0.10.1 把 `spawnList` 存入与 Route C 校验和绑定的独立 schema 1 补充文件，在新 Spawner 基础设施就绪后导入并双阶段读回验证；最终样本 29/29 项一致。
 - v0.10.0 尝试在 SpawnController BeginPlay 后置回调应用时发现属性尚不可用，安全报告 `failed-no-write` 且路线 C 继续通过。v0.10.1 把应用时点后移约 50 ms 后成功，证明精确层的失败降级边界有效。详见 [phase-8-exact-state-gap.md](phase-8-exact-state-gap.md)。
+- `loadDeck` 反汇编确认 `FDecklist.fixedOrder=True` 会跳过原生洗牌动作。v0.11.3 将保存牌库与反向手牌展开成临时固定 Decklist，原生加载完成后恢复普通活动牌组；最终牌库、手牌及单卡状态均匹配。v0.11.0 的 UObject `GetWorld()` 筛选顺序崩溃、v0.11.1 的过早验证假阴性、v0.11.2 的恢复后旧 DeckRun 导出卡住均已闭合，详见 [phase-9-fixed-player-zones.md](phase-9-fixed-player-zones.md)。
 
 - C++ 模组可由 UE4SS 3.0.1 正常加载；首份 `Ctrl+F11` 报告成功写入 `Mods/QuantumCheckpoint/Reports`。游戏自身也会把 `F11` 解释为窗口模式切换，因此后续版本改用 `Ctrl+F1`。
 - 第一版 C++ 报告成功读取实时生命 `9/9`、战斗状态 `OPEN`、无限模式 Spawner 的波次索引与倒计时等字段。
@@ -153,9 +154,9 @@ CXX SDK 进一步确认：已公开的卡牌状态修改函数主要是 `Action_
 
 ## 下一步需要获得的证据
 
-1. 定位玩家手牌/牌库的权威容器或定向原生移动入口；公开 `ControllerCardGroup` 目前只有读取 Getter，`Action_MoveCard_Resolve_Visuals` 只是表现层，不能直接用作恢复实现。
-2. 在任何牌区写入前，先建立只读所有权/偏移验证及单张卡自动回滚探针；首个目标只处理第一小关的手牌/牌库分配，不同时扩展到场上、墓地和效果。
-3. 单独确认恢复后保留的 `lastLevelChangeType=FAST` 是否会影响后续玩法；若只是已消费的加载方式标记，则从精确玩法签名中降为诊断差异。
-4. 作为发布前回归矩阵补测非满生命的向上/向下恢复、更多普通 Spawner，以及标题与完全重启入口。
+1. 单独确认恢复后保留的 `lastLevelChangeType=FAST` 是否会影响后续玩法；若只是已消费的加载方式标记，则从精确玩法签名中降为诊断差异。
+2. 选择玩家场上/墓地或受伤敌人之一建立新的只读差异样本；在任何写入前先证明权威所有权、动作队列时序和失败回滚，不能调用 `Action_*_Visuals` 冒充状态修改。
+3. 扩大固定顺序牌区回归：含升级卡、不同起手数量和更多普通牌组；有场上/墓地卡时必须继续跳过精确牌区补充。
+4. 作为发布前回归矩阵补测非满生命的向上/向下恢复、更多普通 Spawner，以及标题入口；完全重启后主菜单直接恢复已通过一个代表性样本。
 
 具体构建要求见 [cpp-development.md](cpp-development.md)。

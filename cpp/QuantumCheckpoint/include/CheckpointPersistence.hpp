@@ -26,4 +26,17 @@ namespace QuantumCheckpoint
         -> std::optional<ExactSpawnPlanCheckpoint>;
     auto validate_exact_spawn_plan_checkpoint(const ExactSpawnPlanCheckpoint& checkpoint,
                                               std::string& error) -> bool;
+    auto exact_player_zones_payload_checksum(const ExactPlayerZonesCheckpoint& checkpoint)
+        -> std::string;
+    auto serialize_exact_player_zones_checkpoint(ExactPlayerZonesCheckpoint checkpoint)
+        -> std::string;
+    auto parse_exact_player_zones_checkpoint(std::string_view json, std::string& error)
+        -> std::optional<ExactPlayerZonesCheckpoint>;
+    auto validate_exact_player_zones_checkpoint(const ExactPlayerZonesCheckpoint& checkpoint,
+                                                std::string& error) -> bool;
+    auto exact_player_zones_startup_decklist(std::string_view active_decklist,
+                                             std::string_view player_deck,
+                                             std::string_view player_hand,
+                                             std::string& error)
+        -> std::optional<std::string>;
 } // namespace QuantumCheckpoint

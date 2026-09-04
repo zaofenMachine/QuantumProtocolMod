@@ -2,7 +2,7 @@
 
 《Quantum Protocol》局内检查点 Mod 的可行性研究与实验原型。
 
-当前路线 C“普通地牢小关语义重开”的核心垂直切片已经闭环。v0.9.13 使用 schema 2 独立检查点、原子写入、完整 EXE 门禁、新战斗重载、BeginPlay 分阶段语义重放、原生波次生成，以及牌组/缓存/新掉落物/生命恢复。v0.10.1 又以独立、可降级的精确补充文件恢复 `SpawnController.spawnList`，首份实机对照中未来 29 个小关计划逐项一致。项目仍不保证手牌/牌库和中途战场的完整精确复原；更多普通关卡、非满生命和入口矩阵也仍属于发布前回归范围。
+当前路线 C“普通地牢小关语义重开”的核心垂直切片已经闭环。v0.9.13 使用 schema 2 独立检查点、原子写入、完整 EXE 门禁、新战斗重载、BeginPlay 分阶段语义重放、原生波次生成，以及牌组/缓存/新掉落物/生命恢复。v0.10.1 以独立补充文件恢复未来 `spawnList`；v0.11.3 又通过原生 `FDecklist.fixedOrder` 恢复纯净小关开头的精确牌库与手牌。主菜单直接恢复实测 `passed`，两项精确层均为 `verified`。玩家已有场上/墓地状态的中途战场仍未支持精确复原。
 
 ## 当前结论
 
@@ -25,6 +25,7 @@
 - [受控回合计数写入验证](docs/phase-6-guarded-turn-write.md)
 - [路线 C 垂直切片](docs/phase-7-route-c-vertical-slice.md)
 - [精确状态差异与未来小关计划](docs/phase-8-exact-state-gap.md)
+- [固定顺序恢复初始牌库与手牌](docs/phase-9-fixed-player-zones.md)
 - [文档索引](docs/README.md)
 
 ## 目录
@@ -84,17 +85,18 @@ C++ 构建前提、已验证工具链和反射结构提取方法见 [C++ 开发�
 
 安装器会把 DLL 部署为 `Mods\QuantumCheckpoint\dlls\main.dll`，在现有 `mods.txt` 中加入 `QuantumCheckpoint : 1`，并把精确回滚材料保存在被 Git 忽略的 `backups/cpp` 与 `runtime` 目录。若旧 Lua 研究探针存在，安装器会在本次 C++ 部署中将其禁用；回滚时会恢复部署前配置。
 
-v0.10.1 路线 C 与首个精确补充切片的热键和输出：
+v0.11.3 路线 C 与精确补充切片的热键和输出：
 
 - `Ctrl+Shift+F5`：在受支持的稳定普通小关手动保存；每次正常波次生成后也会自动保存。
 - `Ctrl+Shift+F6`：读取唯一检查点并执行语义重开。
 - `Ctrl+F1`：保留只读对象报告。
 - 检查点：`Mods\QuantumCheckpoint\Checkpoint\route-c.json`，原子替换并保留 `.bak`。
 - 精确补充：`Mods\QuantumCheckpoint\Checkpoint\route-c-exact-spawn-plan.json`；与主检查点校验和绑定，缺失或失败时安全降级为路线 C。
+- 初始牌区补充：`Mods\QuantumCheckpoint\Checkpoint\route-c-exact-player-zones.json`；只在所有活动玩家卡仍位于牌库/手牌且总集合完全匹配时生成。
 - 恢复结果：`Mods\QuantumCheckpoint\Reports\route-c-restore-*.json`。
 - 诊断轨迹：`Mods\QuantumCheckpoint\route-c-trace.log`；F5/F6 和各高风险阶段都会立即刷盘。
 
-当前 schema 2 主检查点仅接受已验证游戏 EXE 的完整 SHA-256，且只允许普通 `DUNGEON`、无活动提示、稳定 `OPEN` 状态和无额外状态的普通 Spawner。schema 1 精确补充已经验证可恢复完整未来小关计划；读取仍会重洗牌并重抽，尚未恢复保存瞬间的手牌/牌库分配及中途卡牌战场。
+当前 schema 2 主检查点仅接受已验证游戏 EXE 的完整 SHA-256，且只允许普通 `DUNGEON`、无活动提示、稳定 `OPEN` 状态和无额外状态的普通 Spawner。两个独立 schema 1 补充已验证可恢复完整未来小关计划，以及纯净小关开头的牌库/手牌顺序；有玩家场上、墓地或待处理卡牌时，牌区补充会安全跳过。
 
 旧的生命与回合写入探针仍保留用于可丢弃测试局，但不属于路线 C 的日常操作。路线 C 的实现和验收步骤见 [第七阶段报告](docs/phase-7-route-c-vertical-slice.md)。
 

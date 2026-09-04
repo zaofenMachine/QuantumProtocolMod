@@ -98,6 +98,8 @@ namespace QuantumCheckpoint
         {
             RouteCCheckpoint checkpoint{};
             std::optional<ExactSpawnPlanCheckpoint> exact_spawn_plan{};
+            std::optional<ExactPlayerZonesCheckpoint> exact_player_zones{};
+            std::string exact_player_startup_decklist{};
             std::vector<std::string> loot_drops{};
             RouteCRestorePhase phase{RouteCRestorePhase::AwaitingWaveIntercept};
             std::chrono::steady_clock::time_point started_at{};
@@ -112,10 +114,15 @@ namespace QuantumCheckpoint
             std::optional<std::int32_t> character_card_charge_requirement{};
             std::optional<std::string> character_ability_ok{};
             std::optional<std::chrono::steady_clock::time_point> empty_player_state_since{};
+            std::optional<std::chrono::steady_clock::time_point>
+                exact_player_zone_mismatch_since{};
             std::string original_auto_spawn{};
             std::string original_spawn_list{};
             std::string exact_spawn_plan_status{"unavailable"};
             std::string exact_spawn_plan_reason{};
+            std::string exact_player_zones_status{"unavailable"};
+            std::string exact_player_zones_reason{};
+            bool active_decklist_restored_after_exact_startup{};
             std::string interception_error{};
             std::string last_diagnostic{};
             std::chrono::steady_clock::time_point next_diagnostic_at{};
@@ -144,6 +151,7 @@ namespace QuantumCheckpoint
         std::optional<RouteCWaveObservation> g_route_c_wave_observation{};
         std::chrono::steady_clock::time_point g_next_route_c_wave_poll{};
         bool g_adopt_next_route_c_wave_without_capture{};
+        bool g_route_c_travel_occurred_in_process{};
         bool g_begin_play_callbacks_registered{};
         UFunction* g_spawn_wave_index_function{};
         UFunction* g_spawn_next_wave_function{};
@@ -241,6 +249,12 @@ namespace QuantumCheckpoint
         constexpr std::array<StringViewType, 5> GameInstanceGetters{
             STR("getCurrentDeckRun"),
             STR("getActiveDecklistInstances"),
+            STR("getActiveStorage"),
+            STR("getLootDrops"),
+            STR("getLootDropInstances"),
+        };
+
+        constexpr std::array<StringViewType, 3> PostTravelSafeGameInstanceGetters{
             STR("getActiveStorage"),
             STR("getLootDrops"),
             STR("getLootDropInstances"),
@@ -771,6 +785,12 @@ namespace QuantumCheckpoint
             UObject* character_card_slot{};
         };
 
+        struct RouteCPlayerZoneObjects
+        {
+            UObject* deck{};
+            UObject* hand{};
+        };
+
         auto reflected_object_property(UObject* owner, StringViewType property_name) -> UObject*
         {
             if (!owner)
@@ -873,6 +893,41 @@ namespace QuantumCheckpoint
             return result;
         }
 
+        auto find_route_c_player_zone_objects(const void* preferred_world)
+            -> RouteCPlayerZoneObjects
+        {
+            RouteCPlayerZoneObjects result{};
+            UObjectGlobals::ForEachUObject([&](UObject* object,
+                                                [[maybe_unused]] int32_t object_index,
+                                                [[maybe_unused]] int32_t chunk_index) {
+                if (!object || object->IsUnreachable()
+                    || object->HasAnyFlags(
+                        static_cast<EObjectFlags>(RF_BeginDestroyed | RF_FinishDestroyed)))
+                {
+                    return LoopAction::Continue;
+                }
+                const auto full_name = to_string(object->GetFullName());
+                const auto role = classify(full_name);
+                if ((role != "BP_ControllerDeck_C" && role != "BP_ControllerHand_C")
+                    || !is_live_instance(full_name, role)
+                    || (preferred_world
+                        && static_cast<const void*>(object->GetWorld()) != preferred_world))
+                {
+                    return LoopAction::Continue;
+                }
+                if (role == "BP_ControllerDeck_C")
+                {
+                    result.deck = object;
+                }
+                else if (role == "BP_ControllerHand_C")
+                {
+                    result.hand = object;
+                }
+                return LoopAction::Continue;
+            });
+            return result;
+        }
+
         auto find_route_c_unsafe_companion() -> std::optional<std::string>
         {
             constexpr std::array<std::string_view, 5> unsupported_classes{
@@ -934,6 +989,14 @@ namespace QuantumCheckpoint
                 UE4SSProgram::get_program().get_mods_directory()};
             return mods_directory / STR("QuantumCheckpoint") / STR("Checkpoint")
                 / STR("route-c-exact-spawn-plan.json");
+        }
+
+        auto exact_player_zones_checkpoint_path() -> std::filesystem::path
+        {
+            const auto mods_directory = std::filesystem::path{
+                UE4SSProgram::get_program().get_mods_directory()};
+            return mods_directory / STR("QuantumCheckpoint") / STR("Checkpoint")
+                / STR("route-c-exact-player-zones.json");
         }
 
         auto append_route_c_trace(std::string_view event) noexcept -> void
@@ -1182,6 +1245,83 @@ namespace QuantumCheckpoint
                 reason = std::string{"exact spawn-plan supplement was ignored: "} + error.what();
                 append_route_c_trace_failure(
                     "restore.exact-spawn-plan.rejected", reason);
+                return std::nullopt;
+            }
+        }
+
+        auto try_read_exact_player_zones_checkpoint(const RouteCCheckpoint& route_c,
+                                                    std::string& reason)
+            -> std::optional<ExactPlayerZonesCheckpoint>
+        {
+            try
+            {
+                const auto path = exact_player_zones_checkpoint_path();
+                std::error_code file_error{};
+                if (!std::filesystem::exists(path, file_error))
+                {
+                    reason = file_error
+                        ? "exact player-zones path could not be inspected"
+                        : "exact player-zones supplement does not exist";
+                    append_route_c_trace_failure(
+                        "restore.exact-player-zones.unavailable", reason);
+                    return std::nullopt;
+                }
+                const auto size = std::filesystem::file_size(path, file_error);
+                if (file_error || size == 0 || size > RouteCMaximumFileBytes)
+                {
+                    reason = "exact player-zones supplement has an invalid size";
+                    append_route_c_trace_failure(
+                        "restore.exact-player-zones.rejected", reason);
+                    return std::nullopt;
+                }
+                std::ifstream input{path, std::ios::binary};
+                if (!input)
+                {
+                    reason = "exact player-zones supplement could not be opened";
+                    append_route_c_trace_failure(
+                        "restore.exact-player-zones.rejected", reason);
+                    return std::nullopt;
+                }
+                std::string contents(static_cast<std::size_t>(size), '\0');
+                input.read(contents.data(), static_cast<std::streamsize>(contents.size()));
+                if (!input)
+                {
+                    reason = "exact player-zones supplement could not be read completely";
+                    append_route_c_trace_failure(
+                        "restore.exact-player-zones.rejected", reason);
+                    return std::nullopt;
+                }
+
+                std::string parse_error{};
+                auto exact = parse_exact_player_zones_checkpoint(contents, parse_error);
+                if (!exact)
+                {
+                    reason = "exact player-zones supplement was rejected: " + parse_error;
+                    append_route_c_trace_failure(
+                        "restore.exact-player-zones.rejected", reason);
+                    return std::nullopt;
+                }
+                if (exact->route_c_payload_checksum != route_c.payload_checksum
+                    || exact->game_executable_sha256 != route_c.game_executable_sha256
+                    || exact->game_executable_size != route_c.game_executable_size
+                    || exact->source_level_name != route_c.source_level_name
+                    || exact->wave_index != route_c.wave_index)
+                {
+                    reason = "exact player-zones supplement does not match the Route C checkpoint";
+                    append_route_c_trace_failure(
+                        "restore.exact-player-zones.stale", reason);
+                    return std::nullopt;
+                }
+                reason = "linked exact player-zones supplement loaded";
+                append_route_c_trace("restore.exact-player-zones.loaded");
+                return exact;
+            }
+            catch (const std::exception& error)
+            {
+                reason = std::string{"exact player-zones supplement was ignored: "}
+                    + error.what();
+                append_route_c_trace_failure(
+                    "restore.exact-player-zones.rejected", reason);
                 return std::nullopt;
             }
         }
@@ -1622,6 +1762,7 @@ namespace QuantumCheckpoint
             std::optional<ExactSpawnPlanCheckpoint> exact_spawn_plan{};
             try
             {
+                append_route_c_trace("capture.exact-spawn-plan.prepare.begin");
                 ExactSpawnPlanCheckpoint exact{};
                 exact.captured_at_utc = checkpoint.captured_at_utc;
                 exact.route_c_payload_checksum = checkpoint.payload_checksum;
@@ -1641,6 +1782,7 @@ namespace QuantumCheckpoint
                     throw std::runtime_error{exact_validation_error};
                 }
                 exact_spawn_plan = std::move(exact);
+                append_route_c_trace("capture.exact-spawn-plan.prepare.complete");
             }
             catch (const std::exception& error)
             {
@@ -1648,6 +1790,56 @@ namespace QuantumCheckpoint
                 // supplement must not prevent the semantic checkpoint from being committed.
                 append_route_c_trace_failure(
                     "capture.exact-spawn-plan.skipped", error.what());
+            }
+
+            std::optional<ExactPlayerZonesCheckpoint> exact_player_zones{};
+            try
+            {
+                append_route_c_trace("capture.exact-player-zones.prepare.begin");
+                const auto zones = find_route_c_player_zone_objects(
+                    static_cast<const void*>(objects.card_engine->GetWorld()));
+                if (!zones.deck || !zones.hand)
+                {
+                    throw std::runtime_error{
+                        "live player deck and hand controllers were not found"};
+                }
+                append_route_c_trace("capture.exact-player-zones.controllers.found");
+                ExactPlayerZonesCheckpoint exact{};
+                exact.captured_at_utc = checkpoint.captured_at_utc;
+                exact.route_c_payload_checksum = checkpoint.payload_checksum;
+                exact.game_executable_sha256 = checkpoint.game_executable_sha256;
+                exact.game_executable_size = checkpoint.game_executable_size;
+                exact.source_level_name = checkpoint.source_level_name;
+                exact.wave_index = checkpoint.wave_index;
+                append_route_c_trace("capture.exact-player-zones.get-deck.begin");
+                exact.player_deck = required_getter_text(
+                    zones.deck, STR("getCardInstanceListSorted"));
+                append_route_c_trace("capture.exact-player-zones.get-deck.complete");
+                append_route_c_trace("capture.exact-player-zones.get-hand.begin");
+                exact.player_hand = required_getter_text(
+                    zones.hand, STR("getCardInstanceListSorted"));
+                append_route_c_trace("capture.exact-player-zones.get-hand.complete");
+                exact.payload_checksum = exact_player_zones_payload_checksum(exact);
+                std::string exact_validation_error{};
+                if (!validate_exact_player_zones_checkpoint(exact, exact_validation_error))
+                {
+                    throw std::runtime_error{exact_validation_error};
+                }
+                if (!exact_player_zones_startup_decklist(
+                        checkpoint.active_decklist,
+                        exact.player_deck,
+                        exact.player_hand,
+                        exact_validation_error))
+                {
+                    throw std::runtime_error{exact_validation_error};
+                }
+                exact_player_zones = std::move(exact);
+                append_route_c_trace("capture.exact-player-zones.prepare.complete");
+            }
+            catch (const std::exception& error)
+            {
+                append_route_c_trace_failure(
+                    "capture.exact-player-zones.skipped", error.what());
             }
 
             const auto path = route_c_checkpoint_path();
@@ -1667,7 +1859,24 @@ namespace QuantumCheckpoint
                 catch (const std::exception& error)
                 {
                     append_route_c_trace_failure(
-                        "capture.exact-spawn-plan.write.failed", error.what());
+                    "capture.exact-spawn-plan.write.failed", error.what());
+                }
+            }
+            if (exact_player_zones)
+            {
+                try
+                {
+                    append_route_c_trace("capture.exact-player-zones.write.begin");
+                    write_file_atomically(
+                        exact_player_zones_checkpoint_path(),
+                        serialize_exact_player_zones_checkpoint(
+                            std::move(*exact_player_zones)));
+                    append_route_c_trace("capture.exact-player-zones.write.complete");
+                }
+                catch (const std::exception& error)
+                {
+                    append_route_c_trace_failure(
+                        "capture.exact-player-zones.write.failed", error.what());
                 }
             }
             return path;
@@ -1737,6 +1946,15 @@ namespace QuantumCheckpoint
                    << json_escape(restore.exact_spawn_plan_status) << "\",\n"
                    << "  \"exactSpawnPlanReason\": \""
                    << json_escape(restore.exact_spawn_plan_reason) << "\",\n"
+                   << "  \"exactPlayerZonesSupplementPresent\": "
+                   << (restore.exact_player_zones ? "true" : "false") << ",\n"
+                   << "  \"exactPlayerZonesStatus\": \""
+                   << json_escape(restore.exact_player_zones_status) << "\",\n"
+                   << "  \"exactPlayerZonesReason\": \""
+                   << json_escape(restore.exact_player_zones_reason) << "\",\n"
+                   << "  \"activeDecklistRestoredAfterExactStartup\": "
+                   << (restore.active_decklist_restored_after_exact_startup
+                           ? "true" : "false") << ",\n"
                    << "  \"targetHealth\": " << restore.checkpoint.player_health << "\n"
                    << "}\n";
             write_file_atomically(path, output.str());
@@ -1833,6 +2051,9 @@ namespace QuantumCheckpoint
             std::string exact_spawn_plan_reason{};
             auto exact_spawn_plan = try_read_exact_spawn_plan_checkpoint(
                 checkpoint, exact_spawn_plan_reason);
+            std::string exact_player_zones_reason{};
+            auto exact_player_zones = try_read_exact_player_zones_checkpoint(
+                checkpoint, exact_player_zones_reason);
 
             const auto objects = find_route_c_objects();
             if (!objects.game_instance)
@@ -1871,8 +2092,32 @@ namespace QuantumCheckpoint
                     objects.game_instance, STR("getActiveStorage"));
                 append_route_c_trace("restore.original-storage.complete");
             }
-            const auto startup_decklist = route_c_startup_decklist(
-                checkpoint.active_decklist);
+            auto startup_decklist = route_c_startup_decklist(checkpoint.active_decklist);
+            if (exact_player_zones)
+            {
+                std::string fixed_order_error{};
+                auto fixed_order = exact_player_zones_startup_decklist(
+                    checkpoint.active_decklist,
+                    exact_player_zones->player_deck,
+                    exact_player_zones->player_hand,
+                    fixed_order_error);
+                if (fixed_order)
+                {
+                    startup_decklist = std::move(*fixed_order);
+                    exact_player_zones_reason =
+                        "linked exact player zones prepared a fixed-order startup deck";
+                    append_route_c_trace("restore.exact-player-zones.prepared");
+                }
+                else
+                {
+                    exact_player_zones_reason =
+                        "exact player-zones supplement was ignored: " + fixed_order_error;
+                    append_route_c_trace_failure(
+                        "restore.exact-player-zones.rejected",
+                        exact_player_zones_reason);
+                    exact_player_zones.reset();
+                }
+            }
             std::string loot_error{};
             auto loot_drops = split_route_c_unreal_array(checkpoint.loot_drops, loot_error);
             if (!loot_drops)
@@ -1948,10 +2193,13 @@ namespace QuantumCheckpoint
 
             const auto now = std::chrono::steady_clock::now();
             const bool exact_spawn_plan_available = exact_spawn_plan.has_value();
+            const bool exact_player_zones_available = exact_player_zones.has_value();
             g_pending_route_c_capture.reset();
             g_pending_route_c_restore.emplace(PendingRouteCRestore{
                 .checkpoint = std::move(checkpoint),
                 .exact_spawn_plan = std::move(exact_spawn_plan),
+                .exact_player_zones = std::move(exact_player_zones),
+                .exact_player_startup_decklist = startup_decklist,
                 .loot_drops = std::move(*loot_drops),
                 .phase = RouteCRestorePhase::AwaitingWaveIntercept,
                 .started_at = now,
@@ -1959,12 +2207,16 @@ namespace QuantumCheckpoint
                 .exact_spawn_plan_status = exact_spawn_plan_available
                     ? "pending" : "unavailable",
                 .exact_spawn_plan_reason = std::move(exact_spawn_plan_reason),
+                .exact_player_zones_status = exact_player_zones_available
+                    ? "pending" : "unavailable",
+                .exact_player_zones_reason = std::move(exact_player_zones_reason),
             });
 
             try
             {
                 append_route_c_trace("restore.reload-battle-area.begin");
                 call_reflected(objects.game_instance, STR("reloadBattleArea"));
+                g_route_c_travel_occurred_in_process = true;
                 append_route_c_trace("restore.reload-battle-area.returned");
             }
             catch (...)
@@ -2209,6 +2461,122 @@ namespace QuantumCheckpoint
                         "exact spawn-plan write could not be rolled back"};
                 }
             }
+        }
+
+        auto verify_exact_player_zones(PendingRouteCRestore& restore,
+                                       const RouteCBattleObjects& objects,
+                                       std::chrono::steady_clock::time_point now) -> bool
+        {
+            if (!restore.exact_player_zones
+                || restore.exact_player_zones_status != "pending")
+            {
+                return true;
+            }
+
+            const auto fail_without_zone_write = [&](std::string reason) {
+                if (now - restore.started_at <= std::chrono::seconds{5})
+                {
+                    return false;
+                }
+                call_reflected(objects.game_instance,
+                               STR("setActiveDecklist"),
+                               {{STR("newDecklist"), restore.checkpoint.active_decklist}});
+                restore.active_decklist_restored_after_exact_startup = true;
+                restore.exact_player_zones_status = "failed-no-zone-observation";
+                restore.exact_player_zones_reason = std::move(reason);
+                append_route_c_trace_failure(
+                    "restore.exact-player-zones.failed-no-zone-observation",
+                    restore.exact_player_zones_reason);
+                return true;
+            };
+
+            const auto zones = find_route_c_player_zone_objects(
+                static_cast<const void*>(objects.card_engine->GetWorld()));
+            if (!zones.deck || !zones.hand)
+            {
+                return fail_without_zone_write(
+                    "player deck and hand controllers were unavailable after five seconds");
+            }
+            const auto actual_deck = export_zero_argument_getter(
+                zones.deck, STR("getCardInstanceListSorted"));
+            const auto actual_hand = export_zero_argument_getter(
+                zones.hand, STR("getCardInstanceListSorted"));
+            if (!actual_deck || !actual_hand)
+            {
+                return fail_without_zone_write(
+                    "player deck and hand getters were unavailable after five seconds");
+            }
+
+            std::string array_error{};
+            const auto expected_deck = split_route_c_unreal_array(
+                restore.exact_player_zones->player_deck, array_error);
+            const auto expected_hand = split_route_c_unreal_array(
+                restore.exact_player_zones->player_hand, array_error);
+            const auto live_deck = split_route_c_unreal_array(
+                actual_deck->value, array_error);
+            const auto live_hand = split_route_c_unreal_array(
+                actual_hand->value, array_error);
+            if (!expected_deck || !expected_hand || !live_deck || !live_hand)
+            {
+                throw std::runtime_error{
+                    "exact player-zone verification exposed an invalid Unreal array"};
+            }
+
+            const auto expected_total = expected_deck->size() + expected_hand->size();
+            const auto live_total = live_deck->size() + live_hand->size();
+            if (live_total != expected_total
+                && now - restore.started_at <= std::chrono::seconds{5})
+            {
+                return false;
+            }
+
+            const bool exact_match = live_total == expected_total
+                && actual_deck->value == restore.exact_player_zones->player_deck
+                && actual_hand->value == restore.exact_player_zones->player_hand;
+
+            if (!exact_match)
+            {
+                if (!restore.exact_player_zone_mismatch_since)
+                {
+                    restore.exact_player_zone_mismatch_since = now;
+                    append_route_c_trace(
+                        "restore.exact-player-zones.awaiting-stable-order");
+                    return false;
+                }
+                if (now - *restore.exact_player_zone_mismatch_since
+                    <= std::chrono::seconds{2})
+                {
+                    return false;
+                }
+            }
+
+            append_route_c_trace("restore.exact-player-zones.active-deck-rollback.begin");
+            call_reflected(objects.game_instance,
+                           STR("setActiveDecklist"),
+                           {{STR("newDecklist"), restore.checkpoint.active_decklist}});
+            restore.active_decklist_restored_after_exact_startup = true;
+            append_route_c_trace("restore.exact-player-zones.active-deck-rollback.complete");
+
+            if (exact_match)
+            {
+                restore.exact_player_zones_status = "verified";
+                restore.exact_player_zones_reason =
+                    "fixed-order native startup reproduced the saved deck and hand";
+                append_route_c_trace("restore.exact-player-zones.verified");
+            }
+            else
+            {
+                restore.exact_player_zones_status = "mismatch-semantic-fallback";
+                restore.exact_player_zones_reason =
+                    "fixed-order startup preserved the card multiset but not the saved zone order";
+                append_route_c_trace_failure(
+                    "restore.exact-player-zones.mismatch-semantic-fallback",
+                    "expectedDeck=" + restore.exact_player_zones->player_deck
+                        + " actualDeck=" + actual_deck->value
+                        + " expectedHand=" + restore.exact_player_zones->player_hand
+                        + " actualHand=" + actual_hand->value);
+            }
+            return true;
         }
 
         auto update_route_c_restore() -> void
@@ -2458,6 +2826,11 @@ namespace QuantumCheckpoint
                     return;
                 }
 
+                if (!verify_exact_player_zones(restore, objects, now))
+                {
+                    return;
+                }
+
                 if (restore.exact_spawn_plan_status == "pending")
                 {
                     restore.exact_spawn_plan_status = "failed-no-write";
@@ -2580,8 +2953,11 @@ namespace QuantumCheckpoint
                 finish_route_c_restore(
                     "passed",
                     restore.exact_spawn_plan_status == "verified"
-                        ? "ordinary substage semantics and the exact future spawn plan were restored"
-                        : "ordinary substage, player deck, storage, new loot drops, and health were restored");
+                            && restore.exact_player_zones_status == "verified"
+                        ? "ordinary substage semantics, exact future spawn plan, and exact initial player zones were restored"
+                        : restore.exact_spawn_plan_status == "verified"
+                            ? "ordinary substage semantics and the exact future spawn plan were restored"
+                            : "ordinary substage, player deck, storage, new loot drops, and health were restored");
             }
             catch (const std::exception& error)
             {
@@ -2660,8 +3036,10 @@ namespace QuantumCheckpoint
                     call_reflected(game_instance,
                                    STR("setActiveDecklist"),
                                    {{STR("newDecklist"),
-                                     route_c_startup_decklist(
-                                         restore.checkpoint.active_decklist)}});
+                                     restore.exact_player_zones
+                                         ? restore.exact_player_startup_decklist
+                                         : route_c_startup_decklist(
+                                             restore.checkpoint.active_decklist)}});
                     call_reflected(game_instance,
                                    STR("updateBench"),
                                    {{STR("newCards"),
@@ -2722,7 +3100,9 @@ namespace QuantumCheckpoint
                 call_reflected(game_instance,
                                STR("setActiveDecklist"),
                                {{STR("newDecklist"),
-                                 restore.checkpoint.active_decklist}});
+                                 restore.exact_player_zones
+                                     ? restore.exact_player_startup_decklist
+                                     : restore.checkpoint.active_decklist}});
                 call_reflected(game_instance,
                                STR("updateBench"),
                                {{STR("newCards"),
@@ -3090,7 +3470,18 @@ namespace QuantumCheckpoint
 
                 if (role == "GI_Quantum_C" && full_name.contains("/Engine/Transient."))
                 {
-                    append_getters(snapshot, object, GameInstanceGetters);
+                    if (g_route_c_travel_occurred_in_process)
+                    {
+                        snapshot.properties.push_back({
+                            "nativeDiagnostic:postTravelComplexGettersSkipped",
+                            "getCurrentDeckRun,getActiveDecklistInstances",
+                        });
+                        append_getters(snapshot, object, PostTravelSafeGameInstanceGetters);
+                    }
+                    else
+                    {
+                        append_getters(snapshot, object, GameInstanceGetters);
+                    }
                 }
                 else if (role == "BP_ControllerCharacterCardSlot_C")
                 {
@@ -3199,15 +3590,18 @@ namespace QuantumCheckpoint
         {
             try
             {
+                append_route_c_trace("inventory-export.begin");
                 auto inventory = collect_inventory();
                 if (inventory.objects.empty())
                 {
+                    append_route_c_trace("inventory-export.skipped-empty");
                     Output::send<LogLevel::Warning>(
                         STR("[QuantumCheckpoint] No active battle objects found; report not written.\n"));
                     return;
                 }
 
                 const auto report_path = write_inventory(inventory);
+                append_route_c_trace("inventory-export.complete");
                 Output::send<LogLevel::Verbose>(
                     STR("[QuantumCheckpoint] Wrote read-only inventory with {} objects: {}\n"),
                     inventory.objects.size(),
@@ -3215,6 +3609,7 @@ namespace QuantumCheckpoint
             }
             catch (const std::exception& error)
             {
+                append_route_c_trace_failure("inventory-export.failed", error.what());
                 Output::send<LogLevel::Error>(
                     STR("[QuantumCheckpoint] Inventory export failed: {}\n"),
                     to_wstring(error.what()));
@@ -4007,7 +4402,7 @@ namespace QuantumCheckpoint
         QuantumCheckpointMod()
         {
             ModName = STR("QuantumCheckpoint");
-            ModVersion = STR("0.10.1-dev");
+            ModVersion = STR("0.11.3-dev");
             ModDescription = STR("Route C checkpoint with optional exact-state supplements");
             ModAuthors = STR("zaofenMachine and contributors");
             ModIntendedSDKVersion = STR("3.0.1");
@@ -4040,7 +4435,10 @@ namespace QuantumCheckpoint
             UE4SSProgram::get_program().register_keydown_event(
                 Input::Key::F1,
                 {Input::ModifierKey::CONTROL},
-                []() { g_export_requested.store(true, std::memory_order_release); });
+                []() {
+                    append_route_c_trace("hotkey.export.received");
+                    g_export_requested.store(true, std::memory_order_release);
+                });
 
             UE4SSProgram::get_program().register_keydown_event(
                 Input::Key::F12,
@@ -4185,6 +4583,7 @@ namespace QuantumCheckpoint
 
                 if (g_export_requested.exchange(false, std::memory_order_acq_rel))
                 {
+                    append_route_c_trace("inventory-export.dispatch");
                     if (g_unreal_ready.load(std::memory_order_acquire))
                     {
                         export_inventory();

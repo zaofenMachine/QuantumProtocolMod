@@ -341,8 +341,6 @@ function ConvertTo-NormalizedInventory {
     $spawnList = Get-SnapshotProperty $spawner 'spawnList'
     $spawnWaves = @(Split-UnrealArray $spawnList)
     $spawnWaveHashes = @($spawnWaves | ForEach-Object { Get-TextSha256 $_ })
-    $deckRun = Get-SnapshotProperty $gameInstance 'getter:getCurrentDeckRun'
-    $deckRunWithoutTimestamp = $deckRun -replace '(?i)Timestamp="[^"]*",?', ''
 
     $playerCards = @($cards | Where-Object { -not $_.location.StartsWith('ENEMY_') })
     $enemyCards = @($cards | Where-Object { $_.location.StartsWith('ENEMY_') })
@@ -359,11 +357,9 @@ function ConvertTo-NormalizedInventory {
             levelChangeType = Get-SnapshotProperty $gameInstance 'lastLevelChangeType'
             characterHash = Get-TextSha256 (Get-SnapshotProperty $gameInstance 'activeCharacterInfo')
             stageHash = Get-TextSha256 (Get-SnapshotProperty $gameInstance 'activeStageInfo')
-            activeDeck = @(ConvertTo-CardArray (Get-SnapshotProperty $gameInstance 'getter:getActiveDecklistInstances'))
             activeStorageHash = Get-TextSha256 (Get-SnapshotProperty $gameInstance 'getter:getActiveStorage')
             lootDropsHash = Get-TextSha256 (Get-SnapshotProperty $gameInstance 'getter:getLootDrops')
             lootDropInstancesHash = Get-TextSha256 (Get-SnapshotProperty $gameInstance 'getter:getLootDropInstances')
-            deckRunIgnoringTimestampHash = Get-TextSha256 $deckRunWithoutTimestamp
         }
         engine = [ordered]@{
             gameState = Get-SnapshotProperty $engine 'currentGameState'
