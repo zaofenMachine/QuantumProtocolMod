@@ -204,7 +204,11 @@ function Get-CardStateSignature {
         $parts.Add(('field={0}' -f $Card.field))
     }
     $parts.Add(('health={0}' -f $Card.health))
+    $parts.Add(('baseHealth={0}' -f $Card.baseHealth))
     $parts.Add(('turn={0}' -f $Card.turn))
+    $parts.Add(('turnBase={0}' -f $Card.turnBase))
+    $parts.Add(('turnAdjustment={0}' -f $Card.turnAdjustment))
+    $parts.Add(('turnActive={0}' -f $Card.turnActive))
     $parts.Add(('generic={0}' -f $Card.genericCounters))
     $parts.Add(('special={0}' -f $Card.specialCounters))
     $parts.Add(('modifiers={0}' -f $Card.modifiers))
@@ -290,7 +294,11 @@ function ConvertTo-NormalizedInventory {
             location = Get-SnapshotProperty $card 'getter:getCardLocation'
             field = $field
             health = Get-SnapshotProperty $card 'getter:getCurrentHealth'
+            baseHealth = Get-SnapshotProperty $card 'nativeDiagnostic:baseHealth'
             turn = Get-SnapshotProperty $card 'getter:getCurrentTurnCounter'
+            turnBase = Get-SnapshotProperty $card 'nativeDiagnostic:turnBase'
+            turnAdjustment = Get-SnapshotProperty $card 'nativeDiagnostic:turnAdjustment'
+            turnActive = Get-SnapshotProperty $card 'getter:isTurnActive'
             genericCounters = if ($null -ne $genericCounter) {
                 Get-SnapshotProperty $genericCounter 'getter:getCurrentCounters'
             } else { $null }

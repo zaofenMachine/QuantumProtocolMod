@@ -7,7 +7,7 @@
 - 游戏：Quantum Protocol，Windows / Unreal Engine 4。
 - 已测试安装目录：`F:\SteamLibrary\steamapps\common\Quantum Protocol`。
 - 注入/反射工具：UE4SS 3.0.1 zDEV。
-- 当前实现：C++ v0.9.13 路线 C 核心垂直切片已闭环。v0.10.1 增加独立精确 `spawnList` 补充；v0.11.3 使用游戏原生 `FDecklist.fixedOrder` 增加纯净小关开头的精确牌库/手牌补充。完全重启后从主菜单直接恢复报告为 `passed`，两项精确状态均为 `verified`。
+- 当前实现：C++ v0.10.1 已恢复精确 `spawnList`，v0.11.3 已恢复纯净小关开头的牌库/手牌，v0.12.1 已在复杂 wave 2 样本中把玩家生命从原生 8/8 向下恢复到 5/8。完全重启后从主菜单直接恢复报告为 `passed`。
 - 正式跨进程恢复倾向 UE4SS C++ Mod。只读导出器 v0.1–v0.5 已使用 RE-UE4SS v3.0.1、UEPseudo、MSVC 14.38 和固定 Rust nightly 完成构建、部署与真实战斗验证，均未导致游戏崩溃。v0.5 复杂样本包含 141 个相关对象和 17 张活动卡。
 - Windows 11 SDK `10.0.28000.0` 已被 CMake 正确选中并以 Windows `10.0.19045` 为目标完成构建，不需要额外安装 Windows 10 SDK。
 - 已在战斗场景成功生成 CXX SDK：662 个头文件，关键 Quantum 类、结构和函数签名均已取得。详细证据见 [sdk-analysis.md](sdk-analysis.md)。
@@ -33,6 +33,7 @@
 - 未加精确层的同波次样本中，当前敌人/引擎/生命/特殊资源相同，但玩家手牌与牌库不同，且 29 项 `spawnList` 中有 6 项换序。v0.10.1 把 `spawnList` 存入与 Route C 校验和绑定的独立 schema 1 补充文件，在新 Spawner 基础设施就绪后导入并双阶段读回验证；最终样本 29/29 项一致。
 - v0.10.0 尝试在 SpawnController BeginPlay 后置回调应用时发现属性尚不可用，安全报告 `failed-no-write` 且路线 C 继续通过。v0.10.1 把应用时点后移约 50 ms 后成功，证明精确层的失败降级边界有效。详见 [phase-8-exact-state-gap.md](phase-8-exact-state-gap.md)。
 - `loadDeck` 反汇编确认 `FDecklist.fixedOrder=True` 会跳过原生洗牌动作。v0.11.3 将保存牌库与反向手牌展开成临时固定 Decklist，原生加载完成后恢复普通活动牌组；最终牌库、手牌及单卡状态均匹配。v0.11.0 的 UObject `GetWorld()` 筛选顺序崩溃、v0.11.1 的过早验证假阴性、v0.11.2 的恢复后旧 DeckRun 导出卡住均已闭合，详见 [phase-9-fixed-player-zones.md](phase-9-fixed-player-zones.md)。
+- v0.12.0 复杂样本加入 `isTurnActive`，覆盖玩家场上 3 张、墓地 3、缓存 2、5/8 生命、特殊资源 4/6、四个敌人及伤势/回合/效果。首轮向下生命恢复因把 `state+0x24` 的回合倒计时误作最大生命而安全拒绝；v0.12.1 按 `getMaxHealth` 反汇编改为 `state+0x20`，5/8 Getter 与 UI 均通过。详见 [phase-10-complex-combat-gap.md](phase-10-complex-combat-gap.md)。
 
 - C++ 模组可由 UE4SS 3.0.1 正常加载；首份 `Ctrl+F11` 报告成功写入 `Mods/QuantumCheckpoint/Reports`。游戏自身也会把 `F11` 解释为窗口模式切换，因此后续版本改用 `Ctrl+F1`。
 - 第一版 C++ 报告成功读取实时生命 `9/9`、战斗状态 `OPEN`、无限模式 Spawner 的波次索引与倒计时等字段。

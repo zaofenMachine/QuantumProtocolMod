@@ -271,13 +271,14 @@ namespace QuantumCheckpoint
             STR("isCharacterAbilityOk"),
         };
 
-        constexpr std::array<StringViewType, 6> InGameCardGetters{
+        constexpr std::array<StringViewType, 7> InGameCardGetters{
             STR("getTag"),
             STR("getId"),
             STR("getCurrentTurnCounter"),
             STR("getCurrentHealth"),
             STR("getCardLocation"),
             STR("getCardInfoInstance"),
+            STR("isTurnActive"),
         };
 
         constexpr std::array<StringViewType, 3> CardEngineGetters{
@@ -316,11 +317,12 @@ namespace QuantumCheckpoint
         constexpr std::uintptr_t CurrentHealthGetterThunkRva = 0x102D100;
         constexpr std::uintptr_t CurrentTurnGetterThunkRva = 0x102D130;
         constexpr std::uintptr_t CardEngineCurrentHealthGetterThunkRva = 0x1019930;
+        constexpr std::uintptr_t CardEngineMaxHealthGetterThunkRva = 0x1019CD0;
         constexpr std::uintptr_t NativeCurrentTurnGetterRva = 0xE323C0;
         constexpr std::uintptr_t SetCurrentHealthRva = 0xE522E0;
         constexpr std::size_t CardEngineHealthStatePointerOffset = 0x268;
         constexpr std::size_t PlayerStateCurrentHealthOffset = 0x1C;
-        constexpr std::size_t PlayerStateMaxHealthOffset = 0x24;
+        constexpr std::size_t PlayerStateMaxHealthOffset = 0x20;
         constexpr auto TimedHealthProbeHold = std::chrono::milliseconds{1000};
         constexpr auto TimedTurnProbeHold = std::chrono::milliseconds{1000};
         constexpr std::array<std::uint8_t, 7> SetCurrentHealthSignature{
@@ -2259,10 +2261,15 @@ namespace QuantumCheckpoint
                 const auto module = GetModuleHandleW(L"Quantum-Win64-Shipping.exe");
                 auto* health_getter = objects.card_engine->GetFunctionByNameInChain(
                     STR("getCurrentHealth"));
-                if (!module || !health_getter
+                auto* max_health_getter = objects.card_engine->GetFunctionByNameInChain(
+                    STR("getMaxHealth"));
+                if (!module || !health_getter || !max_health_getter
                     || reinterpret_cast<std::uintptr_t>(health_getter->GetFuncPtr())
                         != reinterpret_cast<std::uintptr_t>(module)
                             + CardEngineCurrentHealthGetterThunkRva
+                    || reinterpret_cast<std::uintptr_t>(max_health_getter->GetFuncPtr())
+                        != reinterpret_cast<std::uintptr_t>(module)
+                            + CardEngineMaxHealthGetterThunkRva
                     || objects.card_engine->GetClassPrivate()->GetPropertiesSize()
                         < CardEngineHealthStatePointerOffset + sizeof(void*)
                     || !address_is_readable(
@@ -2295,6 +2302,12 @@ namespace QuantumCheckpoint
                     state, PlayerStateMaxHealthOffset);
                 if (native_current != *current || native_maximum != *maximum)
                 {
+                    append_route_c_trace_failure(
+                        "restore.player-health.native-state-mismatch",
+                        "getter=" + std::to_string(*current) + "/"
+                            + std::to_string(*maximum) + " native="
+                            + std::to_string(native_current) + "/"
+                            + std::to_string(native_maximum));
                     throw std::runtime_error{
                         "Player-health native state disagrees with the reflected getters"};
                 }
@@ -4402,7 +4415,7 @@ namespace QuantumCheckpoint
         QuantumCheckpointMod()
         {
             ModName = STR("QuantumCheckpoint");
-            ModVersion = STR("0.11.3-dev");
+            ModVersion = STR("0.12.1-dev");
             ModDescription = STR("Route C checkpoint with optional exact-state supplements");
             ModAuthors = STR("zaofenMachine and contributors");
             ModIntendedSDKVersion = STR("3.0.1");
