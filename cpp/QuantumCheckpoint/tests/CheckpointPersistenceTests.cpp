@@ -71,6 +71,21 @@ namespace
             .player_hand = "((CardInfo=(Tag=\"a\")))",
         };
     }
+
+    auto sample_exact_character_charge(const QuantumCheckpoint::RouteCCheckpoint& route_c)
+        -> QuantumCheckpoint::ExactCharacterChargeCheckpoint
+    {
+        return {
+            .captured_at_utc = route_c.captured_at_utc,
+            .route_c_payload_checksum = route_c.payload_checksum,
+            .game_executable_sha256 = route_c.game_executable_sha256,
+            .game_executable_size = route_c.game_executable_size,
+            .source_level_name = route_c.source_level_name,
+            .wave_index = route_c.wave_index,
+            .charge = 4,
+            .requirement = 6,
+        };
+    }
 }
 
 int main()
@@ -236,6 +251,35 @@ int main()
                 "((CardInfo=(Tag=\"different\")))",
                 error),
             "exact player zones reject a different card multiset");
+
+    auto charge = sample_exact_character_charge(original);
+    const auto charge_json = serialize_exact_character_charge_checkpoint(charge);
+    error.clear();
+    const auto parsed_charge = parse_exact_character_charge_checkpoint(charge_json, error);
+    require(parsed_charge.has_value(), error.c_str());
+    require(parsed_charge->charge == 4 && parsed_charge->requirement == 6,
+            "exact character charge round trip");
+    require(parsed_charge->payload_checksum
+                == exact_character_charge_payload_checksum(*parsed_charge),
+            "exact character-charge checksum round trip");
+
+    auto full_charge = charge;
+    full_charge.charge = full_charge.requirement;
+    error.clear();
+    require(!parse_exact_character_charge_checkpoint(
+                serialize_exact_character_charge_checkpoint(full_charge), error),
+            "full character charge is outside the first exact slice");
+
+    auto corrupt_charge = charge_json;
+    const auto charge_field = corrupt_charge.find("\"charge\": 4");
+    require(charge_field != std::string::npos, "character-charge fixture contains charge");
+    corrupt_charge.replace(
+        charge_field, std::string{"\"charge\": 4"}.size(), "\"charge\": 3");
+    error.clear();
+    require(!parse_exact_character_charge_checkpoint(corrupt_charge, error),
+            "corrupted exact character charge is rejected");
+    require(error.find("checksum") != std::string::npos,
+            "character-charge corruption reports checksum error");
 
     std::cout << "Route C checkpoint persistence tests passed\n";
     return 0;

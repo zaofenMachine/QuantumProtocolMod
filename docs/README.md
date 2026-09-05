@@ -22,5 +22,6 @@
 - [phase-8-exact-state-gap.md](phase-8-exact-state-gap.md)：同波次恢复前后语义差异、离线比较工具，以及首个精确 `spawnList` 补充切片的回滚与实机验证。
 - [phase-9-fixed-player-zones.md](phase-9-fixed-player-zones.md)：`FDecklist.fixedOrder` 反汇编、精确初始牌库/手牌补充层、崩溃与时序修正，以及主菜单最终验收。
 - [phase-10-complex-combat-gap.md](phase-10-complex-combat-gap.md)：复杂战斗基线、攻击状态 Getter、场上/敌人差异，以及 5/8 向下生命恢复的偏移修正与验收。
+- [phase-11-character-charge.md](phase-11-character-charge.md)：未满角色充能的独立精确补充层、公开 API 写回门禁，以及 4/6 实机验收。
 
 维护规则：需求发生变化时先更新 `requirements.md`；技术实验产生新证据时更新 `technical-status.md` 并补充对应阶段报告；正式选定恢复路线后在 `architecture-options.md` 记录决定与理由。

@@ -39,4 +39,12 @@ namespace QuantumCheckpoint
                                              std::string_view player_hand,
                                              std::string& error)
         -> std::optional<std::string>;
+    auto exact_character_charge_payload_checksum(
+        const ExactCharacterChargeCheckpoint& checkpoint) -> std::string;
+    auto serialize_exact_character_charge_checkpoint(ExactCharacterChargeCheckpoint checkpoint)
+        -> std::string;
+    auto parse_exact_character_charge_checkpoint(std::string_view json, std::string& error)
+        -> std::optional<ExactCharacterChargeCheckpoint>;
+    auto validate_exact_character_charge_checkpoint(
+        const ExactCharacterChargeCheckpoint& checkpoint, std::string& error) -> bool;
 } // namespace QuantumCheckpoint

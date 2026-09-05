@@ -99,6 +99,7 @@ namespace QuantumCheckpoint
             RouteCCheckpoint checkpoint{};
             std::optional<ExactSpawnPlanCheckpoint> exact_spawn_plan{};
             std::optional<ExactPlayerZonesCheckpoint> exact_player_zones{};
+            std::optional<ExactCharacterChargeCheckpoint> exact_character_charge{};
             std::string exact_player_startup_decklist{};
             std::vector<std::string> loot_drops{};
             RouteCRestorePhase phase{RouteCRestorePhase::AwaitingWaveIntercept};
@@ -122,6 +123,8 @@ namespace QuantumCheckpoint
             std::string exact_spawn_plan_reason{};
             std::string exact_player_zones_status{"unavailable"};
             std::string exact_player_zones_reason{};
+            std::string exact_character_charge_status{"unavailable"};
+            std::string exact_character_charge_reason{};
             bool active_decklist_restored_after_exact_startup{};
             std::string interception_error{};
             std::string last_diagnostic{};
@@ -1001,6 +1004,14 @@ namespace QuantumCheckpoint
                 / STR("route-c-exact-player-zones.json");
         }
 
+        auto exact_character_charge_checkpoint_path() -> std::filesystem::path
+        {
+            const auto mods_directory = std::filesystem::path{
+                UE4SSProgram::get_program().get_mods_directory()};
+            return mods_directory / STR("QuantumCheckpoint") / STR("Checkpoint")
+                / STR("route-c-exact-character-charge.json");
+        }
+
         auto append_route_c_trace(std::string_view event) noexcept -> void
         {
             try
@@ -1324,6 +1335,84 @@ namespace QuantumCheckpoint
                     + error.what();
                 append_route_c_trace_failure(
                     "restore.exact-player-zones.rejected", reason);
+                return std::nullopt;
+            }
+        }
+
+        auto try_read_exact_character_charge_checkpoint(const RouteCCheckpoint& route_c,
+                                                        std::string& reason)
+            -> std::optional<ExactCharacterChargeCheckpoint>
+        {
+            try
+            {
+                const auto path = exact_character_charge_checkpoint_path();
+                std::error_code file_error{};
+                if (!std::filesystem::exists(path, file_error))
+                {
+                    reason = file_error
+                        ? "exact character-charge path could not be inspected"
+                        : "exact character-charge supplement does not exist";
+                    append_route_c_trace_failure(
+                        "restore.exact-character-charge.unavailable", reason);
+                    return std::nullopt;
+                }
+                const auto size = std::filesystem::file_size(path, file_error);
+                if (file_error || size == 0 || size > RouteCMaximumFileBytes)
+                {
+                    reason = "exact character-charge supplement has an invalid size";
+                    append_route_c_trace_failure(
+                        "restore.exact-character-charge.rejected", reason);
+                    return std::nullopt;
+                }
+                std::ifstream input{path, std::ios::binary};
+                if (!input)
+                {
+                    reason = "exact character-charge supplement could not be opened";
+                    append_route_c_trace_failure(
+                        "restore.exact-character-charge.rejected", reason);
+                    return std::nullopt;
+                }
+                std::string contents(static_cast<std::size_t>(size), '\0');
+                input.read(contents.data(), static_cast<std::streamsize>(contents.size()));
+                if (!input)
+                {
+                    reason = "exact character-charge supplement could not be read completely";
+                    append_route_c_trace_failure(
+                        "restore.exact-character-charge.rejected", reason);
+                    return std::nullopt;
+                }
+
+                std::string parse_error{};
+                auto exact = parse_exact_character_charge_checkpoint(contents, parse_error);
+                if (!exact)
+                {
+                    reason = "exact character-charge supplement was rejected: " + parse_error;
+                    append_route_c_trace_failure(
+                        "restore.exact-character-charge.rejected", reason);
+                    return std::nullopt;
+                }
+                if (exact->route_c_payload_checksum != route_c.payload_checksum
+                    || exact->game_executable_sha256 != route_c.game_executable_sha256
+                    || exact->game_executable_size != route_c.game_executable_size
+                    || exact->source_level_name != route_c.source_level_name
+                    || exact->wave_index != route_c.wave_index)
+                {
+                    reason =
+                        "exact character-charge supplement does not match the Route C checkpoint";
+                    append_route_c_trace_failure(
+                        "restore.exact-character-charge.stale", reason);
+                    return std::nullopt;
+                }
+                reason = "linked exact character-charge supplement loaded";
+                append_route_c_trace("restore.exact-character-charge.loaded");
+                return exact;
+            }
+            catch (const std::exception& error)
+            {
+                reason = std::string{"exact character-charge supplement was ignored: "}
+                    + error.what();
+                append_route_c_trace_failure(
+                    "restore.exact-character-charge.rejected", reason);
                 return std::nullopt;
             }
         }
@@ -1844,6 +1933,49 @@ namespace QuantumCheckpoint
                     "capture.exact-player-zones.skipped", error.what());
             }
 
+            std::optional<ExactCharacterChargeCheckpoint> exact_character_charge{};
+            try
+            {
+                append_route_c_trace("capture.exact-character-charge.prepare.begin");
+                if (!objects.character_card_slot)
+                {
+                    throw std::runtime_error{"live character charge slot was not found"};
+                }
+                const auto charge = parse_int32(required_getter_text(
+                    objects.character_card_slot,
+                    STR("getCurrentCharacterCardCharge")));
+                const auto requirement = parse_int32(required_getter_text(
+                    objects.character_card_slot,
+                    STR("getAmountPerCharacterCard")));
+                if (!charge || !requirement)
+                {
+                    throw std::runtime_error{"character charge getters were not integers"};
+                }
+                ExactCharacterChargeCheckpoint exact{};
+                exact.captured_at_utc = checkpoint.captured_at_utc;
+                exact.route_c_payload_checksum = checkpoint.payload_checksum;
+                exact.game_executable_sha256 = checkpoint.game_executable_sha256;
+                exact.game_executable_size = checkpoint.game_executable_size;
+                exact.source_level_name = checkpoint.source_level_name;
+                exact.wave_index = checkpoint.wave_index;
+                exact.charge = *charge;
+                exact.requirement = *requirement;
+                exact.payload_checksum = exact_character_charge_payload_checksum(exact);
+                std::string exact_validation_error{};
+                if (!validate_exact_character_charge_checkpoint(
+                        exact, exact_validation_error))
+                {
+                    throw std::runtime_error{exact_validation_error};
+                }
+                exact_character_charge = std::move(exact);
+                append_route_c_trace("capture.exact-character-charge.prepare.complete");
+            }
+            catch (const std::exception& error)
+            {
+                append_route_c_trace_failure(
+                    "capture.exact-character-charge.skipped", error.what());
+            }
+
             const auto path = route_c_checkpoint_path();
             append_route_c_trace("capture.write.begin");
             write_file_atomically(path, serialize_route_c_checkpoint(checkpoint));
@@ -1879,6 +2011,23 @@ namespace QuantumCheckpoint
                 {
                     append_route_c_trace_failure(
                         "capture.exact-player-zones.write.failed", error.what());
+                }
+            }
+            if (exact_character_charge)
+            {
+                try
+                {
+                    append_route_c_trace("capture.exact-character-charge.write.begin");
+                    write_file_atomically(
+                        exact_character_charge_checkpoint_path(),
+                        serialize_exact_character_charge_checkpoint(
+                            std::move(*exact_character_charge)));
+                    append_route_c_trace("capture.exact-character-charge.write.complete");
+                }
+                catch (const std::exception& error)
+                {
+                    append_route_c_trace_failure(
+                        "capture.exact-character-charge.write.failed", error.what());
                 }
             }
             return path;
@@ -1957,6 +2106,12 @@ namespace QuantumCheckpoint
                    << "  \"activeDecklistRestoredAfterExactStartup\": "
                    << (restore.active_decklist_restored_after_exact_startup
                            ? "true" : "false") << ",\n"
+                   << "  \"exactCharacterChargeSupplementPresent\": "
+                   << (restore.exact_character_charge ? "true" : "false") << ",\n"
+                   << "  \"exactCharacterChargeStatus\": \""
+                   << json_escape(restore.exact_character_charge_status) << "\",\n"
+                   << "  \"exactCharacterChargeReason\": \""
+                   << json_escape(restore.exact_character_charge_reason) << "\",\n"
                    << "  \"targetHealth\": " << restore.checkpoint.player_health << "\n"
                    << "}\n";
             write_file_atomically(path, output.str());
@@ -2056,6 +2211,9 @@ namespace QuantumCheckpoint
             std::string exact_player_zones_reason{};
             auto exact_player_zones = try_read_exact_player_zones_checkpoint(
                 checkpoint, exact_player_zones_reason);
+            std::string exact_character_charge_reason{};
+            auto exact_character_charge = try_read_exact_character_charge_checkpoint(
+                checkpoint, exact_character_charge_reason);
 
             const auto objects = find_route_c_objects();
             if (!objects.game_instance)
@@ -2196,11 +2354,13 @@ namespace QuantumCheckpoint
             const auto now = std::chrono::steady_clock::now();
             const bool exact_spawn_plan_available = exact_spawn_plan.has_value();
             const bool exact_player_zones_available = exact_player_zones.has_value();
+            const bool exact_character_charge_available = exact_character_charge.has_value();
             g_pending_route_c_capture.reset();
             g_pending_route_c_restore.emplace(PendingRouteCRestore{
                 .checkpoint = std::move(checkpoint),
                 .exact_spawn_plan = std::move(exact_spawn_plan),
                 .exact_player_zones = std::move(exact_player_zones),
+                .exact_character_charge = std::move(exact_character_charge),
                 .exact_player_startup_decklist = startup_decklist,
                 .loot_drops = std::move(*loot_drops),
                 .phase = RouteCRestorePhase::AwaitingWaveIntercept,
@@ -2212,6 +2372,9 @@ namespace QuantumCheckpoint
                 .exact_player_zones_status = exact_player_zones_available
                     ? "pending" : "unavailable",
                 .exact_player_zones_reason = std::move(exact_player_zones_reason),
+                .exact_character_charge_status = exact_character_charge_available
+                    ? "pending" : "unavailable",
+                .exact_character_charge_reason = std::move(exact_character_charge_reason),
             });
 
             try
@@ -2592,6 +2755,91 @@ namespace QuantumCheckpoint
             return true;
         }
 
+        auto update_exact_character_charge(
+            PendingRouteCRestore& restore,
+            const RouteCBattleObjects& objects,
+            const std::optional<std::int32_t>& current_charge,
+            const std::optional<std::int32_t>& requirement) -> void
+        {
+            if (!restore.exact_character_charge
+                || (restore.exact_character_charge_status != "pending"
+                    && restore.exact_character_charge_status != "applied"))
+            {
+                return;
+            }
+            if (!objects.character_card_slot || !current_charge || !requirement)
+            {
+                return;
+            }
+
+            const auto& exact = *restore.exact_character_charge;
+            if (*requirement != exact.requirement)
+            {
+                restore.exact_character_charge_status = "failed-no-write";
+                restore.exact_character_charge_reason =
+                    "live character-charge requirement differs from the supplement";
+                append_route_c_trace_failure(
+                    "restore.exact-character-charge.failed-no-write",
+                    restore.exact_character_charge_reason);
+                return;
+            }
+
+            if (restore.exact_character_charge_status == "applied")
+            {
+                if (*current_charge == exact.charge)
+                {
+                    restore.exact_character_charge_status = "verified";
+                    restore.exact_character_charge_reason =
+                        "public character-charge API reached the saved value";
+                    append_route_c_trace("restore.exact-character-charge.verified");
+                }
+                else
+                {
+                    restore.exact_character_charge_status = "failed-after-write";
+                    restore.exact_character_charge_reason =
+                        "public character-charge API did not reach the saved value";
+                    append_route_c_trace_failure(
+                        "restore.exact-character-charge.failed-after-write",
+                        "target=" + std::to_string(exact.charge) + " actual="
+                            + std::to_string(*current_charge));
+                }
+                return;
+            }
+
+            if (*current_charge > exact.charge)
+            {
+                restore.exact_character_charge_status = "failed-no-write";
+                restore.exact_character_charge_reason =
+                    "live character charge is already above the saved value";
+                append_route_c_trace_failure(
+                    "restore.exact-character-charge.failed-no-write",
+                    restore.exact_character_charge_reason);
+                return;
+            }
+            if (*current_charge == exact.charge)
+            {
+                restore.exact_character_charge_status = "verified";
+                restore.exact_character_charge_reason =
+                    "native startup already matched the saved character charge";
+                append_route_c_trace("restore.exact-character-charge.verified-no-write");
+                return;
+            }
+
+            const auto amount = exact.charge - *current_charge;
+            append_route_c_trace_failure(
+                "restore.exact-character-charge.apply.begin",
+                "current=" + std::to_string(*current_charge) + " target="
+                    + std::to_string(exact.charge) + " amount="
+                    + std::to_string(amount));
+            call_reflected(objects.card_engine,
+                           STR("addCharacterAbilityCharge"),
+                           {{STR("Amount"), std::to_string(amount)}});
+            restore.exact_character_charge_status = "applied";
+            restore.exact_character_charge_reason =
+                "public character-charge API was called; awaiting verification";
+            append_route_c_trace("restore.exact-character-charge.apply.complete");
+        }
+
         auto update_route_c_restore() -> void
         {
             if (!g_pending_route_c_restore)
@@ -2854,6 +3102,24 @@ namespace QuantumCheckpoint
                         restore.exact_spawn_plan_reason);
                 }
                 verify_exact_spawn_plan_or_rollback(restore, objects.spawner);
+                update_exact_character_charge(
+                    restore,
+                    objects,
+                    character_card_charge,
+                    character_card_charge_requirement);
+                if (restore.exact_character_charge_status == "pending")
+                {
+                    if (now - restore.started_at <= std::chrono::seconds{5})
+                    {
+                        return;
+                    }
+                    restore.exact_character_charge_status = "failed-no-write";
+                    restore.exact_character_charge_reason =
+                        "character charge getters were unavailable after five seconds";
+                    append_route_c_trace_failure(
+                        "restore.exact-character-charge.failed-no-write",
+                        restore.exact_character_charge_reason);
+                }
 
                 if (restore.phase == RouteCRestorePhase::AwaitingStableBattle)
                 {
@@ -2967,7 +3233,14 @@ namespace QuantumCheckpoint
                     "passed",
                     restore.exact_spawn_plan_status == "verified"
                             && restore.exact_player_zones_status == "verified"
+                            && restore.exact_character_charge_status == "verified"
+                        ? "ordinary substage semantics, exact future spawn plan, exact initial player zones, and character charge were restored"
+                        : restore.exact_spawn_plan_status == "verified"
+                            && restore.exact_player_zones_status == "verified"
                         ? "ordinary substage semantics, exact future spawn plan, and exact initial player zones were restored"
+                        : restore.exact_spawn_plan_status == "verified"
+                            && restore.exact_character_charge_status == "verified"
+                            ? "ordinary substage semantics, exact future spawn plan, and character charge were restored"
                         : restore.exact_spawn_plan_status == "verified"
                             ? "ordinary substage semantics and the exact future spawn plan were restored"
                             : "ordinary substage, player deck, storage, new loot drops, and health were restored");
@@ -4415,7 +4688,7 @@ namespace QuantumCheckpoint
         QuantumCheckpointMod()
         {
             ModName = STR("QuantumCheckpoint");
-            ModVersion = STR("0.12.1-dev");
+            ModVersion = STR("0.13.0-dev");
             ModDescription = STR("Route C checkpoint with optional exact-state supplements");
             ModAuthors = STR("zaofenMachine and contributors");
             ModIntendedSDKVersion = STR("3.0.1");
