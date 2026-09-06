@@ -864,6 +864,184 @@ namespace QuantumCheckpoint
         return startup;
     }
 
+    auto exact_player_trash_startup_decklist(std::string_view active_decklist,
+                                             std::string_view player_deck,
+                                             std::string_view player_hand,
+                                             std::string_view player_trash,
+                                             std::string& error)
+        -> std::optional<std::string>
+    {
+        error.clear();
+        auto deck = split_route_c_unreal_array(player_deck, error);
+        if (!deck || deck->empty())
+        {
+            error = "exact player-trash deck is invalid: " + error;
+            return std::nullopt;
+        }
+        auto trash = split_route_c_unreal_array(player_trash, error);
+        if (!trash || trash->empty())
+        {
+            error = "exact player trash is empty or invalid: " + error;
+            return std::nullopt;
+        }
+        auto hand = split_route_c_unreal_array(player_hand, error);
+        if (!hand || hand->empty() || deck->size() + hand->size() + trash->size() > 128)
+        {
+            error = "exact player-trash hand is invalid or total cards exceed 128: " + error;
+            return std::nullopt;
+        }
+
+        // Native startup draws from the end of this fixed array. Leave the captured
+        // trash immediately above the captured deck, draw the reversed hand, and move
+        // only those staged trash identities after the battle becomes stable.
+        std::string staged_deck{"("};
+        bool first = true;
+        for (const auto* zone : {&*deck, &*trash})
+        {
+            for (const auto& card : *zone)
+            {
+                if (!first)
+                {
+                    staged_deck += ',';
+                }
+                first = false;
+                staged_deck += card;
+            }
+        }
+        staged_deck += ')';
+        return exact_player_zones_startup_decklist(
+            active_decklist, staged_deck, player_hand, error);
+    }
+
+    auto exact_player_trash_staging_matches(std::string_view expected_deck,
+                                            std::string_view expected_hand,
+                                            std::string_view expected_trash,
+                                            std::string_view live_deck,
+                                            std::string_view live_hand,
+                                            std::string_view live_trash,
+                                            std::string& error) -> bool
+    {
+        error.clear();
+        auto parse = [&](std::string_view value, std::string_view label)
+            -> std::optional<std::vector<std::string>> {
+            std::string array_error{};
+            auto elements = split_route_c_unreal_array(value, array_error);
+            if (!elements)
+            {
+                error = std::string{label} + " is invalid: " + array_error;
+            }
+            return elements;
+        };
+
+        const auto saved_deck = parse(expected_deck, "saved deck");
+        const auto saved_hand = parse(expected_hand, "saved hand");
+        const auto saved_trash = parse(expected_trash, "saved trash");
+        const auto staged_deck = parse(live_deck, "live deck");
+        const auto staged_hand = parse(live_hand, "live hand");
+        const auto staged_trash = parse(live_trash, "live trash");
+        if (!saved_deck || !saved_hand || !saved_trash
+            || !staged_deck || !staged_hand || !staged_trash)
+        {
+            return false;
+        }
+
+        const auto expected_total = saved_deck->size() + saved_hand->size()
+            + saved_trash->size();
+        const auto live_total = staged_deck->size() + staged_hand->size()
+            + staged_trash->size();
+        if (live_total != expected_total)
+        {
+            error = "staged player-card total does not match the checkpoint";
+            return false;
+        }
+        if (!staged_trash->empty())
+        {
+            error = "live trash is not empty before native staging moves";
+            return false;
+        }
+        if (staged_hand->size() < saved_hand->size())
+        {
+            error = "live hand is shorter than the saved hand";
+            return false;
+        }
+        const auto hand_overflow_count = staged_hand->size() - saved_hand->size();
+        if (hand_overflow_count > saved_trash->size())
+        {
+            error = "live hand overflow is larger than the saved trash";
+            return false;
+        }
+        if (!std::equal(saved_hand->begin(),
+                        saved_hand->end(),
+                        staged_hand->begin()
+                            + static_cast<std::ptrdiff_t>(hand_overflow_count)))
+        {
+            error = "live hand does not end with the saved hand";
+            return false;
+        }
+        const auto trash_in_deck_count = saved_trash->size() - hand_overflow_count;
+        if (!std::equal(saved_trash->begin()
+                            + static_cast<std::ptrdiff_t>(trash_in_deck_count),
+                        saved_trash->end(),
+                        staged_hand->begin()))
+        {
+            error = "live hand overflow does not reproduce the saved trash suffix";
+            return false;
+        }
+        if (staged_deck->size() != saved_deck->size() + trash_in_deck_count)
+        {
+            error = "live deck size does not match the staged deck/trash merge";
+            return false;
+        }
+
+        // The game's sorted deck view is a stable merge of the saved deck and the
+        // undrawn trash prefix. Preserve the order of both input sequences, while
+        // accepting either branch when duplicate identities make the merge ambiguous.
+        const auto columns = trash_in_deck_count + 1;
+        std::vector<bool> reachable((saved_deck->size() + 1) * columns);
+        reachable[0] = true;
+        for (std::size_t deck_index{}; deck_index <= saved_deck->size(); ++deck_index)
+        {
+            for (std::size_t trash_index{}; trash_index <= trash_in_deck_count;
+                 ++trash_index)
+            {
+                if (!reachable[deck_index * columns + trash_index])
+                {
+                    continue;
+                }
+                const auto live_index = deck_index + trash_index;
+                if (deck_index < saved_deck->size()
+                    && (*staged_deck)[live_index] == (*saved_deck)[deck_index])
+                {
+                    reachable[(deck_index + 1) * columns + trash_index] = true;
+                }
+                if (trash_index < trash_in_deck_count
+                    && (*staged_deck)[live_index] == (*saved_trash)[trash_index])
+                {
+                    reachable[deck_index * columns + trash_index + 1] = true;
+                }
+            }
+        }
+        if (!reachable[saved_deck->size() * columns + trash_in_deck_count])
+        {
+            error = "live deck is not an order-preserving merge of the saved deck and trash";
+            return false;
+        }
+        return true;
+    }
+
+    auto exact_card_identity_key_from_instance(std::string_view card_instance,
+                                               std::string& error)
+        -> std::optional<std::string>
+    {
+        error.clear();
+        auto card = exact_card_from_instance(card_instance, error);
+        if (!card)
+        {
+            return std::nullopt;
+        }
+        return ordered_card_key(*card);
+    }
+
     auto route_c_payload_checksum(const RouteCCheckpoint& checkpoint) -> std::string
     {
         std::uint64_t hash = 14695981039346656037ULL;
@@ -1356,6 +1534,206 @@ namespace QuantumCheckpoint
 #undef READ_ZONES_STRING
 
         if (!validate_exact_player_zones_checkpoint(checkpoint, error))
+        {
+            return std::nullopt;
+        }
+        return checkpoint;
+    }
+
+    auto exact_player_trash_payload_checksum(const ExactPlayerTrashCheckpoint& checkpoint)
+        -> std::string
+    {
+        std::uint64_t hash = 14695981039346656037ULL;
+        append_hash_number(hash, checkpoint.schema_version);
+        append_hash_bytes(hash, checkpoint.kind);
+        append_hash_bytes(hash, checkpoint.captured_at_utc);
+        append_hash_bytes(hash, checkpoint.route_c_payload_checksum);
+        append_hash_bytes(hash, checkpoint.game_executable_sha256);
+        append_hash_number(hash, checkpoint.game_executable_size);
+        append_hash_bytes(hash, checkpoint.source_level_name);
+        append_hash_number(hash, checkpoint.wave_index);
+        append_hash_bytes(hash, checkpoint.player_deck);
+        append_hash_bytes(hash, checkpoint.player_hand);
+        append_hash_bytes(hash, checkpoint.player_trash);
+
+        std::ostringstream output{};
+        output << std::hex << std::uppercase << std::setw(16) << std::setfill('0') << hash;
+        return output.str();
+    }
+
+    auto serialize_exact_player_trash_checkpoint(ExactPlayerTrashCheckpoint checkpoint)
+        -> std::string
+    {
+        checkpoint.payload_checksum = exact_player_trash_payload_checksum(checkpoint);
+        std::ostringstream output{};
+        output << "{\n"
+               << "  \"schemaVersion\": " << checkpoint.schema_version << ",\n"
+               << "  \"kind\": \"" << json_escape(checkpoint.kind) << "\",\n"
+               << "  \"capturedAtUtc\": \"" << json_escape(checkpoint.captured_at_utc)
+               << "\",\n"
+               << "  \"routeCPayloadChecksum\": \""
+               << json_escape(checkpoint.route_c_payload_checksum) << "\",\n"
+               << "  \"gameExecutableSha256\": \""
+               << json_escape(checkpoint.game_executable_sha256) << "\",\n"
+               << "  \"gameExecutableSize\": " << checkpoint.game_executable_size << ",\n"
+               << "  \"sourceLevelName\": \"" << json_escape(checkpoint.source_level_name)
+               << "\",\n"
+               << "  \"waveIndex\": " << checkpoint.wave_index << ",\n"
+               << "  \"playerDeck\": \"" << json_escape(checkpoint.player_deck) << "\",\n"
+               << "  \"playerHand\": \"" << json_escape(checkpoint.player_hand) << "\",\n"
+               << "  \"playerTrash\": \"" << json_escape(checkpoint.player_trash) << "\",\n"
+               << "  \"payloadChecksum\": \"" << checkpoint.payload_checksum << "\"\n"
+               << "}\n";
+        return output.str();
+    }
+
+    auto validate_exact_player_trash_checkpoint(const ExactPlayerTrashCheckpoint& checkpoint,
+                                                std::string& error) -> bool
+    {
+        if (checkpoint.schema_version != ExactPlayerTrashSchemaVersion)
+        {
+            error = "unsupported exact player-trash schema version";
+            return false;
+        }
+        if (checkpoint.kind != ExactPlayerTrashCheckpointKind)
+        {
+            error = "checkpoint kind is not exact player trash";
+            return false;
+        }
+        if (checkpoint.captured_at_utc.empty()
+            || !is_hex_digest(checkpoint.route_c_payload_checksum, 16))
+        {
+            error = "exact player trash has invalid Route C linkage";
+            return false;
+        }
+        if (!is_sha256(checkpoint.game_executable_sha256)
+            || checkpoint.game_executable_size == 0)
+        {
+            error = "exact player trash has an invalid game executable fingerprint";
+            return false;
+        }
+        if (checkpoint.source_level_name.empty() || checkpoint.source_level_name == "None"
+            || checkpoint.source_level_name.size() > 256 || checkpoint.wave_index < 0
+            || checkpoint.wave_index > 1000)
+        {
+            error = "exact player trash has invalid level or wave data";
+            return false;
+        }
+
+        std::string array_error{};
+        const auto deck = split_route_c_unreal_array(checkpoint.player_deck, array_error);
+        if (!deck || deck->empty())
+        {
+            error = "exact player-trash deck is invalid: " + array_error;
+            return false;
+        }
+        array_error.clear();
+        const auto hand = split_route_c_unreal_array(checkpoint.player_hand, array_error);
+        if (!hand || hand->empty())
+        {
+            error = "exact player-trash hand is invalid: " + array_error;
+            return false;
+        }
+        array_error.clear();
+        const auto trash = split_route_c_unreal_array(checkpoint.player_trash, array_error);
+        if (!trash || trash->empty()
+            || deck->size() + hand->size() + trash->size() > 128)
+        {
+            error = "exact player trash is empty, invalid, or total cards exceed 128: "
+                + array_error;
+            return false;
+        }
+        for (const auto* zone : {&*deck, &*hand, &*trash})
+        {
+            for (const auto& element : *zone)
+            {
+                array_error.clear();
+                if (!exact_card_from_instance(element, array_error))
+                {
+                    error = "exact player-trash zone contains an invalid card: "
+                        + array_error;
+                    return false;
+                }
+            }
+        }
+        std::unordered_map<std::string, bool> hand_identities{};
+        for (const auto& element : *hand)
+        {
+            array_error.clear();
+            const auto card = exact_card_from_instance(element, array_error);
+            if (!card)
+            {
+                error = "exact player-trash hand identity is invalid: " + array_error;
+                return false;
+            }
+            hand_identities.emplace(ordered_card_key(*card), true);
+        }
+        for (const auto& element : *trash)
+        {
+            array_error.clear();
+            const auto card = exact_card_from_instance(element, array_error);
+            if (!card)
+            {
+                error = "exact player-trash trash identity is invalid: " + array_error;
+                return false;
+            }
+            if (hand_identities.contains(ordered_card_key(*card)))
+            {
+                error = "exact player trash shares a card identity with the hand; "
+                    "the guarded mixed-zone staging slice would be ambiguous";
+                return false;
+            }
+        }
+        if (checkpoint.payload_checksum != exact_player_trash_payload_checksum(checkpoint))
+        {
+            error = "exact player-trash payload checksum does not match";
+            return false;
+        }
+        return true;
+    }
+
+    auto parse_exact_player_trash_checkpoint(std::string_view json, std::string& error)
+        -> std::optional<ExactPlayerTrashCheckpoint>
+    {
+        if (json.empty() || json.size() > RouteCMaximumFileBytes)
+        {
+            error = "exact player-trash file is empty or exceeds the 2 MiB limit";
+            return std::nullopt;
+        }
+        auto values = FlatJsonParser{json}.parse(error);
+        if (!values)
+        {
+            return std::nullopt;
+        }
+
+        ExactPlayerTrashCheckpoint checkpoint{};
+#define READ_TRASH_STRING(Field, JsonName) \
+        do { auto value = required_string(*values, JsonName, error); if (!value) return std::nullopt; checkpoint.Field = std::move(*value); } while (false)
+#define READ_TRASH_INTEGER(Field, JsonName, Type) \
+        do { auto value = required_integer<Type>(*values, JsonName, error); if (!value) return std::nullopt; checkpoint.Field = *value; } while (false)
+
+        READ_TRASH_INTEGER(schema_version, "schemaVersion", int);
+        if (checkpoint.schema_version != ExactPlayerTrashSchemaVersion)
+        {
+            error = "unsupported exact player-trash schema version";
+            return std::nullopt;
+        }
+        READ_TRASH_STRING(kind, "kind");
+        READ_TRASH_STRING(captured_at_utc, "capturedAtUtc");
+        READ_TRASH_STRING(route_c_payload_checksum, "routeCPayloadChecksum");
+        READ_TRASH_STRING(game_executable_sha256, "gameExecutableSha256");
+        READ_TRASH_INTEGER(game_executable_size, "gameExecutableSize", std::uint64_t);
+        READ_TRASH_STRING(source_level_name, "sourceLevelName");
+        READ_TRASH_INTEGER(wave_index, "waveIndex", std::int32_t);
+        READ_TRASH_STRING(player_deck, "playerDeck");
+        READ_TRASH_STRING(player_hand, "playerHand");
+        READ_TRASH_STRING(player_trash, "playerTrash");
+        READ_TRASH_STRING(payload_checksum, "payloadChecksum");
+
+#undef READ_TRASH_INTEGER
+#undef READ_TRASH_STRING
+
+        if (!validate_exact_player_trash_checkpoint(checkpoint, error))
         {
             return std::nullopt;
         }

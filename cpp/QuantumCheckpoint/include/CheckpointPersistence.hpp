@@ -39,6 +39,30 @@ namespace QuantumCheckpoint
                                              std::string_view player_hand,
                                              std::string& error)
         -> std::optional<std::string>;
+    auto exact_player_trash_payload_checksum(const ExactPlayerTrashCheckpoint& checkpoint)
+        -> std::string;
+    auto serialize_exact_player_trash_checkpoint(ExactPlayerTrashCheckpoint checkpoint)
+        -> std::string;
+    auto parse_exact_player_trash_checkpoint(std::string_view json, std::string& error)
+        -> std::optional<ExactPlayerTrashCheckpoint>;
+    auto validate_exact_player_trash_checkpoint(const ExactPlayerTrashCheckpoint& checkpoint,
+                                                std::string& error) -> bool;
+    auto exact_player_trash_startup_decklist(std::string_view active_decklist,
+                                             std::string_view player_deck,
+                                             std::string_view player_hand,
+                                             std::string_view player_trash,
+                                             std::string& error)
+        -> std::optional<std::string>;
+    auto exact_player_trash_staging_matches(std::string_view expected_deck,
+                                            std::string_view expected_hand,
+                                            std::string_view expected_trash,
+                                            std::string_view live_deck,
+                                            std::string_view live_hand,
+                                            std::string_view live_trash,
+                                            std::string& error) -> bool;
+    auto exact_card_identity_key_from_instance(std::string_view card_instance,
+                                               std::string& error)
+        -> std::optional<std::string>;
     auto exact_character_charge_payload_checksum(
         const ExactCharacterChargeCheckpoint& checkpoint) -> std::string;
     auto serialize_exact_character_charge_checkpoint(ExactCharacterChargeCheckpoint checkpoint)

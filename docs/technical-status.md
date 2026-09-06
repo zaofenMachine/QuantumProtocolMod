@@ -1,13 +1,13 @@
 # 技术状态与已知事实
 
-最后更新：2026-09-05。
+最后更新：2026-09-06。
 
 ## 环境
 
 - 游戏：Quantum Protocol，Windows / Unreal Engine 4。
 - 已测试安装目录：`F:\SteamLibrary\steamapps\common\Quantum Protocol`。
 - 注入/反射工具：UE4SS 3.0.1 zDEV。
-- 当前实现：C++ v0.10.1 已恢复精确 `spawnList`，v0.11.3 已恢复纯净小关开头的牌库/手牌，v0.12.1 已修复向下生命恢复，v0.13.0 已通过公开 API 恢复低于满充阈值的角色充能。主菜单和战斗内恢复报告均为 `passed`。
+- 当前实现：C++ v0.10.1 已恢复精确 `spawnList`，v0.11.3 已恢复纯净小关开头的牌库/手牌，v0.12.1 已修复向下生命恢复，v0.13.0 已通过公开 API 恢复低于满充阈值的角色充能，v0.14.0 已通过原生位置迁移恢复受限玩家墓地。主菜单和战斗内恢复报告均为 `passed`。
 - 正式跨进程恢复倾向 UE4SS C++ Mod。只读导出器 v0.1–v0.5 已使用 RE-UE4SS v3.0.1、UEPseudo、MSVC 14.38 和固定 Rust nightly 完成构建、部署与真实战斗验证，均未导致游戏崩溃。v0.5 复杂样本包含 141 个相关对象和 17 张活动卡。
 - Windows 11 SDK `10.0.28000.0` 已被 CMake 正确选中并以 Windows `10.0.19045` 为目标完成构建，不需要额外安装 Windows 10 SDK。
 - 已在战斗场景成功生成 CXX SDK：662 个头文件，关键 Quantum 类、结构和函数签名均已取得。详细证据见 [sdk-analysis.md](sdk-analysis.md)。
@@ -35,6 +35,7 @@
 - `loadDeck` 反汇编确认 `FDecklist.fixedOrder=True` 会跳过原生洗牌动作。v0.11.3 将保存牌库与反向手牌展开成临时固定 Decklist，原生加载完成后恢复普通活动牌组；最终牌库、手牌及单卡状态均匹配。v0.11.0 的 UObject `GetWorld()` 筛选顺序崩溃、v0.11.1 的过早验证假阴性、v0.11.2 的恢复后旧 DeckRun 导出卡住均已闭合，详见 [phase-9-fixed-player-zones.md](phase-9-fixed-player-zones.md)。
 - v0.12.0 复杂样本加入 `isTurnActive`，覆盖玩家场上 3 张、墓地 3、缓存 2、5/8 生命、特殊资源 4/6、四个敌人及伤势/回合/效果。首轮向下生命恢复因把 `state+0x24` 的回合倒计时误作最大生命而安全拒绝；v0.12.1 按 `getMaxHealth` 反汇编改为 `state+0x20`，5/8 Getter 与 UI 均通过。详见 [phase-10-complex-combat-gap.md](phase-10-complex-combat-gap.md)。
 - v0.13.0 将未满角色充能存入与 Route C 负载绑定的独立 schema 1 补充文件。恢复只允许公开 `addCharacterAbilityCharge` 的正向差值，需求值不一致或实时值已高于目标时拒绝写入；`4/6` 样本恢复后的 UI、Getter 和语义比较均一致，`characterResourceEqual=True`。满充能因可能创建能力卡而继续排除。详见 [phase-11-character-charge.md](phase-11-character-charge.md)。
+- v0.14.0 确认 `AInGameCard + 0x228` 的共享原生状态可由完整 `getCardLocation` 包装器安全读取，并通过原生 `Action_MoveCard` 入队函数与 `DEFAULT` 类型在 `HAND/DECK/TRASH` 间迁移。引用保活修复后的往返探针保持卡牌身份、顺序和全部语义状态；正式恢复使用独立 schema 1 墓地补充、固定顺序启动、混合牌库/手牌暂存识别、逐卡原位置回滚和三区严格 Getter 复核。最终主菜单恢复为 `passed / exactPlayerTrashStatus=verified`，用户确认 UI 墓地顺序正确。详见 [phase-12-player-trash.md](phase-12-player-trash.md)。
 
 - C++ 模组可由 UE4SS 3.0.1 正常加载；首份 `Ctrl+F11` 报告成功写入 `Mods/QuantumCheckpoint/Reports`。游戏自身也会把 `F11` 解释为窗口模式切换，因此后续版本改用 `Ctrl+F1`。
 - 第一版 C++ 报告成功读取实时生命 `9/9`、战斗状态 `OPEN`、无限模式 Spawner 的波次索引与倒计时等字段。
@@ -156,9 +157,10 @@ CXX SDK 进一步确认：已公开的卡牌状态修改函数主要是 `Action_
 
 ## 下一步需要获得的证据
 
-1. 选择玩家场上/墓地作为下一个最小切片；在任何写入前先证明权威所有权、位置迁移、动作队列时序和失败回滚，不能调用 `Action_*_Visuals` 冒充状态修改。
-2. 单独确认恢复后保留的 `lastLevelChangeType=FAST` 是否会影响后续玩法；若只是已消费的加载方式标记，则从精确玩法签名中降为诊断差异。
-3. 扩大固定顺序牌区回归：含升级卡、不同起手数量和更多普通牌组；有场上/墓地卡时必须继续跳过精确牌区补充。
-4. 作为发布前回归矩阵补测非满生命的向上/向下恢复、更多普通 Spawner，以及标题入口；完全重启后主菜单直接恢复已通过一个代表性样本。
+1. 先恢复当前墓地样本成对归零的 `CardEngine` 战斗回合与 `SpawnController.currentWaveAlertCounter`；两者是最终对照仅剩的玩法标量差异，必须共同验证后续回合推进。
+2. 随后进入玩家场上切片；除原生位置外，还必须恢复精确槽位、当前生命、已攻击状态、回合计数和失败回滚，不能调用 `Action_*_Visuals` 冒充权威写入。
+3. 单独确认恢复后保留的 `lastLevelChangeType=FAST` 是否会影响后续玩法；若只是已消费的加载方式标记，则从精确玩法签名中降为诊断差异。
+4. 扩大固定顺序/墓地回归：含升级卡、不同起手数量和更多普通牌组；超出已验证门禁时必须继续安全跳过精确补充。
+5. 作为发布前回归矩阵补测非满生命的向上/向下恢复、更多普通 Spawner，以及标题入口；完全重启后主菜单直接恢复已通过代表性样本。
 
 具体构建要求见 [cpp-development.md](cpp-development.md)。

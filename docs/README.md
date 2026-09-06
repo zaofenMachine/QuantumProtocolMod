@@ -23,5 +23,6 @@
 - [phase-9-fixed-player-zones.md](phase-9-fixed-player-zones.md)：`FDecklist.fixedOrder` 反汇编、精确初始牌库/手牌补充层、崩溃与时序修正，以及主菜单最终验收。
 - [phase-10-complex-combat-gap.md](phase-10-complex-combat-gap.md)：复杂战斗基线、攻击状态 Getter、场上/敌人差异，以及 5/8 向下生命恢复的偏移修正与验收。
 - [phase-11-character-charge.md](phase-11-character-charge.md)：未满角色充能的独立精确补充层、公开 API 写回门禁，以及 4/6 实机验收。
+- [phase-12-player-trash.md](phase-12-player-trash.md)：原生卡牌位置迁移、共享引用崩溃修正、受限玩家墓地补充，以及混合牌库/手牌暂存的实机闭环。
 
 维护规则：需求发生变化时先更新 `requirements.md`；技术实验产生新证据时更新 `technical-status.md` 并补充对应阶段报告；正式选定恢复路线后在 `architecture-options.md` 记录决定与理由。

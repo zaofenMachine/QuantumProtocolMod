@@ -17,6 +17,9 @@ namespace QuantumCheckpoint
     inline constexpr int ExactPlayerZonesSchemaVersion = 1;
     inline constexpr std::string_view ExactPlayerZonesCheckpointKind =
         "route-c-exact-player-zones";
+    inline constexpr int ExactPlayerTrashSchemaVersion = 1;
+    inline constexpr std::string_view ExactPlayerTrashCheckpointKind =
+        "route-c-exact-player-trash";
     inline constexpr int ExactCharacterChargeSchemaVersion = 1;
     inline constexpr std::string_view ExactCharacterChargeCheckpointKind =
         "route-c-exact-character-charge";
@@ -100,6 +103,25 @@ namespace QuantumCheckpoint
         std::int32_t wave_index{};
         std::string player_deck{};
         std::string player_hand{};
+        std::string payload_checksum{};
+    };
+
+    // This remains separate from ExactPlayerZonesCheckpoint so the proven clean
+    // Deck/Hand startup path stays compatible. It is emitted only when the player
+    // trash is non-empty and no player FIELD/PENDING card requires reconstruction.
+    struct ExactPlayerTrashCheckpoint
+    {
+        int schema_version{ExactPlayerTrashSchemaVersion};
+        std::string kind{ExactPlayerTrashCheckpointKind};
+        std::string captured_at_utc{};
+        std::string route_c_payload_checksum{};
+        std::string game_executable_sha256{};
+        std::uint64_t game_executable_size{};
+        std::string source_level_name{};
+        std::int32_t wave_index{};
+        std::string player_deck{};
+        std::string player_hand{};
+        std::string player_trash{};
         std::string payload_checksum{};
     };
 

@@ -72,6 +72,22 @@ namespace
         };
     }
 
+    auto sample_exact_player_trash(const QuantumCheckpoint::RouteCCheckpoint& route_c)
+        -> QuantumCheckpoint::ExactPlayerTrashCheckpoint
+    {
+        return {
+            .captured_at_utc = route_c.captured_at_utc,
+            .route_c_payload_checksum = route_c.payload_checksum,
+            .game_executable_sha256 = route_c.game_executable_sha256,
+            .game_executable_size = route_c.game_executable_size,
+            .source_level_name = route_c.source_level_name,
+            .wave_index = route_c.wave_index,
+            .player_deck = "((CardInfo=(Tag=\"a\")))",
+            .player_hand = "((CardInfo=(Tag=\"b\"),upgradeLevel=1))",
+            .player_trash = "((CardInfo=(Tag=\"a\")))",
+        };
+    }
+
     auto sample_exact_character_charge(const QuantumCheckpoint::RouteCCheckpoint& route_c)
         -> QuantumCheckpoint::ExactCharacterChargeCheckpoint
     {
@@ -251,6 +267,97 @@ int main()
                 "((CardInfo=(Tag=\"different\")))",
                 error),
             "exact player zones reject a different card multiset");
+
+    auto trash_route = original;
+    trash_route.active_decklist =
+        "(deckTag=\"trash-test\",cardList=((cardName=\"a\",count=2),"
+        "(cardName=\"b\",count=1,upgradeLevel=1)),fixedOrder=False)";
+    trash_route.payload_checksum = route_c_payload_checksum(trash_route);
+    auto trash = sample_exact_player_trash(trash_route);
+    const auto trash_json = serialize_exact_player_trash_checkpoint(trash);
+    error.clear();
+    const auto parsed_trash = parse_exact_player_trash_checkpoint(trash_json, error);
+    require(parsed_trash.has_value(), error.c_str());
+    require(parsed_trash->player_trash == trash.player_trash,
+            "exact player trash round trip");
+    require(parsed_trash->payload_checksum
+                == exact_player_trash_payload_checksum(*parsed_trash),
+            "exact player-trash checksum round trip");
+
+    error.clear();
+    const auto trash_startup = exact_player_trash_startup_decklist(
+        trash_route.active_decklist,
+        trash.player_deck,
+        trash.player_hand,
+        trash.player_trash,
+        error);
+    require(trash_startup.has_value(), error.c_str());
+    require(*trash_startup
+                == "(deckTag=\"trash-test\",cardList=((cardName=\"a\",count=1),"
+                   "(cardName=\"a\",count=1),(cardName=\"b\",count=1,upgradeLevel=1)),"
+                   "fixedOrder=True)",
+            "player trash is staged above the exact deck and below the reversed hand");
+
+    error.clear();
+    require(exact_player_trash_staging_matches(
+                "((CardInfo=(Tag=\"a\")),(CardInfo=(Tag=\"e\")))",
+                "((CardInfo=(Tag=\"b\")),(CardInfo=(Tag=\"f\")))",
+                "((CardInfo=(Tag=\"c\")),(CardInfo=(Tag=\"d\")),"
+                "(CardInfo=(Tag=\"g\")))",
+                "((CardInfo=(Tag=\"a\")),(CardInfo=(Tag=\"c\")),"
+                "(CardInfo=(Tag=\"d\")),(CardInfo=(Tag=\"e\")))",
+                "((CardInfo=(Tag=\"g\")),(CardInfo=(Tag=\"b\")),"
+                "(CardInfo=(Tag=\"f\")))",
+                "()",
+                error),
+            error.c_str());
+    require(!exact_player_trash_staging_matches(
+                "((CardInfo=(Tag=\"a\")),(CardInfo=(Tag=\"e\")))",
+                "((CardInfo=(Tag=\"b\")),(CardInfo=(Tag=\"f\")))",
+                "((CardInfo=(Tag=\"c\")),(CardInfo=(Tag=\"d\")),"
+                "(CardInfo=(Tag=\"g\")))",
+                "((CardInfo=(Tag=\"a\")),(CardInfo=(Tag=\"d\")),"
+                "(CardInfo=(Tag=\"c\")),(CardInfo=(Tag=\"e\")))",
+                "((CardInfo=(Tag=\"g\")),(CardInfo=(Tag=\"b\")),"
+                "(CardInfo=(Tag=\"f\")))",
+                "()",
+                error),
+            "mixed deck/hand staging rejects a reordered deck/trash merge");
+
+    error.clear();
+    require(exact_card_identity_key_from_instance(
+                "(CardInfo=(Tag=\"b\"),upgradeLevel=1)", error)
+                == std::optional<std::string>{"b@1"},
+            "runtime card instance exposes a stable tag and upgrade identity key");
+
+    auto empty_trash = trash;
+    empty_trash.player_trash = "()";
+    error.clear();
+    require(!parse_exact_player_trash_checkpoint(
+                serialize_exact_player_trash_checkpoint(empty_trash), error),
+            "empty trash is outside the independent player-trash slice");
+
+    auto overlapping_hand_trash = trash;
+    overlapping_hand_trash.player_trash =
+        "((CardInfo=(Tag=\"b\"),upgradeLevel=1))";
+    error.clear();
+    require(!parse_exact_player_trash_checkpoint(
+                serialize_exact_player_trash_checkpoint(overlapping_hand_trash), error),
+            "a shared hand/trash identity is outside the guarded mixed-zone slice");
+    require(error.find("ambiguous") != std::string::npos,
+            "shared hand/trash identity reports the staging ambiguity");
+
+    auto corrupt_trash = trash_json;
+    const auto trash_card = corrupt_trash.find("\"playerTrash\"");
+    require(trash_card != std::string::npos, "player-trash fixture contains its zone");
+    const auto trash_tag = corrupt_trash.find("Tag=\\\"a\\\"", trash_card);
+    require(trash_tag != std::string::npos, "player-trash fixture contains its card tag");
+    corrupt_trash[trash_tag + 6] = 'z';
+    error.clear();
+    require(!parse_exact_player_trash_checkpoint(corrupt_trash, error),
+            "corrupted exact player trash is rejected");
+    require(error.find("checksum") != std::string::npos,
+            "player-trash corruption reports checksum error");
 
     auto charge = sample_exact_character_charge(original);
     const auto charge_json = serialize_exact_character_charge_checkpoint(charge);
