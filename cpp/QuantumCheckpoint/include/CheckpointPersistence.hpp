@@ -71,4 +71,12 @@ namespace QuantumCheckpoint
         -> std::optional<ExactCharacterChargeCheckpoint>;
     auto validate_exact_character_charge_checkpoint(
         const ExactCharacterChargeCheckpoint& checkpoint, std::string& error) -> bool;
+    auto exact_turn_progress_payload_checksum(const ExactTurnProgressCheckpoint& checkpoint)
+        -> std::string;
+    auto serialize_exact_turn_progress_checkpoint(ExactTurnProgressCheckpoint checkpoint)
+        -> std::string;
+    auto parse_exact_turn_progress_checkpoint(std::string_view json, std::string& error)
+        -> std::optional<ExactTurnProgressCheckpoint>;
+    auto validate_exact_turn_progress_checkpoint(
+        const ExactTurnProgressCheckpoint& checkpoint, std::string& error) -> bool;
 } // namespace QuantumCheckpoint

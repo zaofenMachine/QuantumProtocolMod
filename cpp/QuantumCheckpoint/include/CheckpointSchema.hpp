@@ -23,6 +23,9 @@ namespace QuantumCheckpoint
     inline constexpr int ExactCharacterChargeSchemaVersion = 1;
     inline constexpr std::string_view ExactCharacterChargeCheckpointKind =
         "route-c-exact-character-charge";
+    inline constexpr int ExactTurnProgressSchemaVersion = 1;
+    inline constexpr std::string_view ExactTurnProgressCheckpointKind =
+        "route-c-exact-turn-progress";
     inline constexpr std::string_view RouteCSupportedMode = "DUNGEON";
     inline constexpr std::size_t RouteCMaximumFileBytes = 2U * 1024U * 1024U;
 
@@ -137,6 +140,22 @@ namespace QuantumCheckpoint
         std::int32_t wave_index{};
         std::int32_t charge{};
         std::int32_t requirement{};
+        std::string payload_checksum{};
+    };
+
+    struct ExactTurnProgressCheckpoint
+    {
+        int schema_version{ExactTurnProgressSchemaVersion};
+        std::string kind{ExactTurnProgressCheckpointKind};
+        std::string captured_at_utc{};
+        std::string route_c_payload_checksum{};
+        std::string game_executable_sha256{};
+        std::uint64_t game_executable_size{};
+        std::string source_level_name{};
+        std::int32_t wave_index{};
+        std::int32_t card_engine_turn_count{};
+        std::int32_t player_draw_delay{};
+        std::int32_t wave_alert_counter{};
         std::string payload_checksum{};
     };
 } // namespace QuantumCheckpoint

@@ -17,6 +17,7 @@
 #include <fstream>
 #include <iomanip>
 #include <initializer_list>
+#include <limits>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -56,6 +57,8 @@ namespace QuantumCheckpoint
         std::atomic_bool g_export_requested{false};
         std::atomic_bool g_health_write_probe_requested{false};
         std::atomic_bool g_turn_write_probe_requested{false};
+        std::atomic_bool g_battle_turn_write_probe_requested{false};
+        std::atomic_bool g_draw_delay_write_probe_requested{false};
         std::atomic_bool g_move_card_probe_requested{false};
         std::atomic_bool g_route_c_save_requested{false};
         std::atomic_bool g_route_c_load_requested{false};
@@ -109,6 +112,7 @@ namespace QuantumCheckpoint
             std::optional<ExactPlayerZonesCheckpoint> exact_player_zones{};
             std::optional<ExactPlayerTrashCheckpoint> exact_player_trash{};
             std::optional<ExactCharacterChargeCheckpoint> exact_character_charge{};
+            std::optional<ExactTurnProgressCheckpoint> exact_turn_progress{};
             std::string exact_player_startup_decklist{};
             std::vector<std::string> loot_drops{};
             RouteCRestorePhase phase{RouteCRestorePhase::AwaitingWaveIntercept};
@@ -123,6 +127,17 @@ namespace QuantumCheckpoint
             std::optional<std::int32_t> character_card_charge{};
             std::optional<std::int32_t> character_card_charge_requirement{};
             std::optional<std::string> character_ability_ok{};
+            const void* exact_turn_progress_engine_state{};
+            const void* exact_turn_progress_deck_state{};
+            const void* exact_turn_progress_deck_state_controller{};
+            std::optional<std::int32_t> exact_turn_progress_original_turn{};
+            std::optional<std::int32_t> exact_turn_progress_original_draw_base{};
+            std::optional<std::int32_t> exact_turn_progress_original_draw_adjustment{};
+            std::optional<std::int32_t> exact_turn_progress_applied_draw_adjustment{};
+            std::optional<std::int32_t> exact_turn_progress_original_wave_alert{};
+            std::optional<std::int32_t> exact_turn_progress_observed_turn{};
+            std::optional<std::int32_t> exact_turn_progress_observed_draw_delay{};
+            std::optional<std::int32_t> exact_turn_progress_observed_wave_alert{};
             std::optional<std::chrono::steady_clock::time_point> empty_player_state_since{};
             std::optional<std::chrono::steady_clock::time_point>
                 exact_player_zone_mismatch_since{};
@@ -139,6 +154,8 @@ namespace QuantumCheckpoint
             std::string exact_player_trash_reason{};
             std::string exact_character_charge_status{"unavailable"};
             std::string exact_character_charge_reason{};
+            std::string exact_turn_progress_status{"unavailable"};
+            std::string exact_turn_progress_reason{};
             bool active_decklist_restored_after_exact_startup{};
             std::string interception_error{};
             std::string last_diagnostic{};
@@ -281,6 +298,19 @@ namespace QuantumCheckpoint
             STR("getCardInstanceListSorted"),
         };
 
+        constexpr std::array<StringViewType, 3> ControllerDeckGetters{
+            STR("getCardInstanceListSorted"),
+            STR("getTurnDrawDelay"),
+            STR("getNumCards"),
+        };
+
+        constexpr std::array<StringViewType, 4> ControllerDeckDiagnosticFunctions{
+            STR("OnTurnSkipped"),
+            STR("OnTurnDraw"),
+            STR("OnDraw"),
+            STR("OnCanClickToDrawJustActivated"),
+        };
+
         constexpr std::array<StringViewType, 4> CharacterCardSlotGetters{
             STR("getCardInstanceListSorted"),
             STR("getCurrentCharacterCardCharge"),
@@ -304,7 +334,7 @@ namespace QuantumCheckpoint
             STR("getCurrentHealth"),
         };
 
-        constexpr std::array<StringViewType, 7> CardEngineDiagnosticFunctions{
+        constexpr std::array<StringViewType, 9> CardEngineDiagnosticFunctions{
             STR("playCardInstantly"),
             STR("removeCardsFromGame"),
             STR("resetPlayerBoard"),
@@ -312,6 +342,8 @@ namespace QuantumCheckpoint
             STR("clearAllActionQueue"),
             STR("drawCard"),
             STR("loadDeck"),
+            STR("addSpawnTurnCountdownTime"),
+            STR("onManualActionQueued"),
         };
 
         constexpr std::array<StringViewType, 6> InGameCardDiagnosticFunctions{
@@ -339,9 +371,10 @@ namespace QuantumCheckpoint
             STR("getCurrentCounters"),
         };
 
-        // Native diagnostics for Quantum-Win64-Shipping.exe SHA-256
+        // Fingerprint-gated native layouts for Quantum-Win64-Shipping.exe SHA-256
         // 0DCF220317FA31667C14DD7FB41A6757B94FF7CDE2262E5A87337D00CCB017A6.
-        // These are read-only corroboration fields, not a supported checkpoint format.
+        // Every read/write path additionally validates its relevant function signatures,
+        // object ownership, address protection, and public Getter agreement.
         constexpr std::size_t InGameCardStatePointerOffset = 0x228;
         constexpr std::size_t CardStateSharedObjectOffset = 0x08;
         constexpr std::size_t CardStateSharedControllerOffset = 0x10;
@@ -358,6 +391,11 @@ namespace QuantumCheckpoint
         constexpr std::uintptr_t CardLocationGetterThunkRva = 0x102D090;
         constexpr std::uintptr_t CardEngineCurrentHealthGetterThunkRva = 0x1019930;
         constexpr std::uintptr_t CardEngineMaxHealthGetterThunkRva = 0x1019CD0;
+        constexpr std::uintptr_t CardEngineTurnGetterThunkRva = 0x101A0B0;
+        constexpr std::uintptr_t ControllerDeckTurnDrawDelayGetterThunkRva = 0x1027DC0;
+        constexpr std::uintptr_t NativeCardEngineTurnGetterRva = 0xE32360;
+        constexpr std::uintptr_t NativeControllerDeckTurnDrawDelayResolverRva = 0xF9F300;
+        constexpr std::uintptr_t NativeDeckTurnDrawDelayGetterRva = 0xE323D0;
         constexpr std::uintptr_t NativeCurrentTurnGetterRva = 0xE323C0;
         constexpr std::uintptr_t SetCurrentHealthRva = 0xE522E0;
         constexpr std::uintptr_t NativeGetCardLocationRva = 0xE27CC0;
@@ -365,10 +403,18 @@ namespace QuantumCheckpoint
         constexpr std::uintptr_t MoveCardConstructorRva = 0xDFAF30;
         constexpr std::uintptr_t MoveCardExecuteRva = 0xE426C0;
         constexpr std::size_t CardEngineHealthStatePointerOffset = 0x268;
+        constexpr std::size_t CardEngineNativeTurnOffset = 0x18;
+        constexpr std::size_t ControllerDeckCardEnginePointerOffset = 0x220;
+        constexpr std::size_t CardEngineDeckStatePointerOffset = 0x48;
+        constexpr std::size_t CardEngineDeckStateControllerOffset = 0x50;
+        constexpr std::size_t DeckStateTurnDrawDelayBaseOffset = 0x68;
+        constexpr std::size_t DeckStateTurnDrawDelayAdjustmentOffset = 0x6C;
         constexpr std::size_t PlayerStateCurrentHealthOffset = 0x1C;
         constexpr std::size_t PlayerStateMaxHealthOffset = 0x20;
         constexpr auto TimedHealthProbeHold = std::chrono::milliseconds{1000};
         constexpr auto TimedTurnProbeHold = std::chrono::milliseconds{1000};
+        constexpr auto TimedBattleTurnProbeHold = std::chrono::milliseconds{1000};
+        constexpr auto TimedDrawDelayProbeHold = std::chrono::milliseconds{1000};
         constexpr auto TimedMoveCardProbeHold = std::chrono::milliseconds{1200};
         constexpr auto MoveCardProbeTimeout = std::chrono::seconds{6};
         constexpr std::array<std::uint8_t, 7> SetCurrentHealthSignature{
@@ -378,6 +424,18 @@ namespace QuantumCheckpoint
             0x8B, 0x81, 0x98, 0x01, 0x00, 0x00,
             0x03, 0x81, 0x94, 0x01, 0x00, 0x00,
             0xC3,
+        };
+        constexpr std::array<std::uint8_t, 15> NativeCardEngineTurnGetterSignature{
+            0x48, 0x89, 0x5C, 0x24, 0x08, 0x57, 0x48, 0x83,
+            0xEC, 0x30, 0x48, 0x8D, 0x54, 0x24, 0x20,
+        };
+        constexpr std::array<std::uint8_t, 14>
+            NativeControllerDeckTurnDrawDelayResolverSignature{
+                0x48, 0x83, 0xEC, 0x48, 0x4C, 0x8B, 0x81,
+                0x20, 0x02, 0x00, 0x00, 0x4D, 0x85, 0xC0,
+            };
+        constexpr std::array<std::uint8_t, 7> NativeDeckTurnDrawDelayGetterSignature{
+            0x8B, 0x41, 0x6C, 0x03, 0x41, 0x68, 0xC3,
         };
         constexpr std::array<std::uint8_t, 11> QueueMoveCardSignature{
             0x48, 0x8B, 0xC4, 0x53, 0x48, 0x81,
@@ -507,6 +565,88 @@ namespace QuantumCheckpoint
         };
 
         std::optional<PendingTurnWriteProbe> g_pending_turn_write_probe{};
+
+        struct BattleTurnWriteProbeResult
+        {
+            std::string status{"not-run"};
+            std::string reason{};
+            std::string card_engine_full_name{};
+            std::string spawner_full_name{};
+            std::uintptr_t engine_state_address{};
+            std::int32_t before_native_turn{};
+            std::int32_t before_getter_turn{};
+            std::int32_t before_wave_alert{};
+            std::int32_t test_turn{};
+            std::int32_t test_wave_alert{};
+            std::int32_t during_native_turn{};
+            std::int32_t during_getter_turn{};
+            std::int32_t during_wave_alert{};
+            std::int64_t requested_hold_milliseconds{};
+            std::int64_t actual_hold_milliseconds{};
+            bool restore_identity_validated{};
+            std::int32_t before_restore_native_turn{};
+            std::int32_t before_restore_wave_alert{};
+            std::int32_t restored_native_turn{};
+            std::int32_t restored_getter_turn{};
+            std::int32_t restored_wave_alert{};
+        };
+
+        struct PendingBattleTurnWriteProbe
+        {
+            BattleTurnWriteProbeResult result{};
+            UObject* card_engine{};
+            UObject* spawner{};
+            const void* engine_state{};
+            std::chrono::steady_clock::time_point started_at{};
+            std::chrono::steady_clock::time_point restore_after{};
+        };
+
+        std::optional<PendingBattleTurnWriteProbe> g_pending_battle_turn_write_probe{};
+
+        struct DrawDelayWriteProbeResult
+        {
+            std::string status{"not-run"};
+            std::string reason{};
+            std::string controller_deck_full_name{};
+            std::string card_engine_full_name{};
+            std::uintptr_t engine_state_address{};
+            std::uintptr_t deck_state_address{};
+            std::uintptr_t deck_state_controller_address{};
+            std::int32_t before_base{};
+            std::int32_t before_adjustment{};
+            std::int64_t before_computed{};
+            std::int32_t before_getter{};
+            std::int32_t test_adjustment{};
+            std::int64_t test_computed{};
+            std::int32_t during_base{};
+            std::int32_t during_adjustment{};
+            std::int64_t during_computed{};
+            std::int32_t during_getter{};
+            std::int64_t requested_hold_milliseconds{};
+            std::int64_t actual_hold_milliseconds{};
+            bool restore_identity_validated{};
+            std::int32_t before_restore_base{};
+            std::int32_t before_restore_adjustment{};
+            std::int64_t before_restore_computed{};
+            std::int32_t restored_base{};
+            std::int32_t restored_adjustment{};
+            std::int64_t restored_computed{};
+            std::int32_t restored_getter{};
+        };
+
+        struct PendingDrawDelayWriteProbe
+        {
+            DrawDelayWriteProbeResult result{};
+            UObject* controller_deck{};
+            UObject* card_engine{};
+            const void* engine_state{};
+            const void* deck_state{};
+            const void* deck_state_controller{};
+            std::chrono::steady_clock::time_point started_at{};
+            std::chrono::steady_clock::time_point restore_after{};
+        };
+
+        std::optional<PendingDrawDelayWriteProbe> g_pending_draw_delay_write_probe{};
 
         struct NativeSharedPointerPair
         {
@@ -1173,6 +1313,14 @@ namespace QuantumCheckpoint
                 / STR("route-c-exact-character-charge.json");
         }
 
+        auto exact_turn_progress_checkpoint_path() -> std::filesystem::path
+        {
+            const auto mods_directory = std::filesystem::path{
+                UE4SSProgram::get_program().get_mods_directory()};
+            return mods_directory / STR("QuantumCheckpoint") / STR("Checkpoint")
+                / STR("route-c-exact-turn-progress.json");
+        }
+
         auto append_route_c_trace(std::string_view event) noexcept -> void
         {
             try
@@ -1655,6 +1803,84 @@ namespace QuantumCheckpoint
             }
         }
 
+        auto try_read_exact_turn_progress_checkpoint(const RouteCCheckpoint& route_c,
+                                                     std::string& reason)
+            -> std::optional<ExactTurnProgressCheckpoint>
+        {
+            try
+            {
+                const auto path = exact_turn_progress_checkpoint_path();
+                std::error_code file_error{};
+                if (!std::filesystem::exists(path, file_error))
+                {
+                    reason = file_error
+                        ? "exact turn-progress path could not be inspected"
+                        : "exact turn-progress supplement does not exist";
+                    append_route_c_trace_failure(
+                        "restore.exact-turn-progress.unavailable", reason);
+                    return std::nullopt;
+                }
+                const auto size = std::filesystem::file_size(path, file_error);
+                if (file_error || size == 0 || size > RouteCMaximumFileBytes)
+                {
+                    reason = "exact turn-progress supplement has an invalid size";
+                    append_route_c_trace_failure(
+                        "restore.exact-turn-progress.rejected", reason);
+                    return std::nullopt;
+                }
+                std::ifstream input{path, std::ios::binary};
+                if (!input)
+                {
+                    reason = "exact turn-progress supplement could not be opened";
+                    append_route_c_trace_failure(
+                        "restore.exact-turn-progress.rejected", reason);
+                    return std::nullopt;
+                }
+                std::string contents(static_cast<std::size_t>(size), '\0');
+                input.read(contents.data(), static_cast<std::streamsize>(contents.size()));
+                if (!input)
+                {
+                    reason = "exact turn-progress supplement could not be read completely";
+                    append_route_c_trace_failure(
+                        "restore.exact-turn-progress.rejected", reason);
+                    return std::nullopt;
+                }
+
+                std::string parse_error{};
+                auto exact = parse_exact_turn_progress_checkpoint(contents, parse_error);
+                if (!exact)
+                {
+                    reason = "exact turn-progress supplement was rejected: " + parse_error;
+                    append_route_c_trace_failure(
+                        "restore.exact-turn-progress.rejected", reason);
+                    return std::nullopt;
+                }
+                if (exact->route_c_payload_checksum != route_c.payload_checksum
+                    || exact->game_executable_sha256 != route_c.game_executable_sha256
+                    || exact->game_executable_size != route_c.game_executable_size
+                    || exact->source_level_name != route_c.source_level_name
+                    || exact->wave_index != route_c.wave_index)
+                {
+                    reason =
+                        "exact turn-progress supplement does not match the Route C checkpoint";
+                    append_route_c_trace_failure(
+                        "restore.exact-turn-progress.stale", reason);
+                    return std::nullopt;
+                }
+                reason = "linked exact turn-progress supplement loaded";
+                append_route_c_trace("restore.exact-turn-progress.loaded");
+                return exact;
+            }
+            catch (const std::exception& error)
+            {
+                reason = std::string{"exact turn-progress supplement was ignored: "}
+                    + error.what();
+                append_route_c_trace_failure(
+                    "restore.exact-turn-progress.rejected", reason);
+                return std::nullopt;
+            }
+        }
+
         auto parse_int32(std::string_view value) -> std::optional<std::int32_t>
         {
             std::int32_t parsed{};
@@ -1850,6 +2076,233 @@ namespace QuantumCheckpoint
                 sizeof(ValueType));
         }
 
+        struct NativeBattleTurnSnapshot
+        {
+            const void* engine_state{};
+            std::int32_t native_turn{};
+            std::int32_t getter_turn{};
+            std::int32_t wave_alert_counter{};
+        };
+
+        auto read_validated_battle_turn(UObject* card_engine, UObject* spawner)
+            -> NativeBattleTurnSnapshot
+        {
+            const auto module = GetModuleHandleW(L"Quantum-Win64-Shipping.exe");
+            if (!module || !card_engine || !spawner
+                || !fingerprint_matches_supported_game(executable_fingerprint()))
+            {
+                throw std::runtime_error{
+                    "validated game executable or battle objects were not found"};
+            }
+            const auto module_base = reinterpret_cast<std::uintptr_t>(module);
+            auto* turn_getter = card_engine->GetFunctionByNameInChain(STR("getTurnCount"));
+            if (!turn_getter
+                || reinterpret_cast<std::uintptr_t>(turn_getter->GetFuncPtr())
+                    != module_base + CardEngineTurnGetterThunkRva
+                || !std::equal(
+                    NativeCardEngineTurnGetterSignature.begin(),
+                    NativeCardEngineTurnGetterSignature.end(),
+                    reinterpret_cast<const std::uint8_t*>(
+                        module_base + NativeCardEngineTurnGetterRva))
+                || card_engine->GetClassPrivate()->GetPropertiesSize()
+                    < CardEngineHealthStatePointerOffset + sizeof(void*)
+                || !address_is_readable(
+                    static_cast<const std::byte*>(static_cast<const void*>(card_engine))
+                        + CardEngineHealthStatePointerOffset,
+                    sizeof(void*)))
+            {
+                throw std::runtime_error{
+                    "CardEngine turn getter or native state layout did not pass the executable gate"};
+            }
+
+            const auto* state = read_native_value<const void*>(
+                card_engine, CardEngineHealthStatePointerOffset);
+            if (!state
+                || !address_is_writable(
+                    static_cast<const std::byte*>(state) + CardEngineNativeTurnOffset,
+                    sizeof(std::int32_t)))
+            {
+                throw std::runtime_error{
+                    "CardEngine native turn field is null or not safely writable"};
+            }
+            const auto native_turn = read_native_value<std::int32_t>(
+                state, CardEngineNativeTurnOffset);
+            const auto getter = export_zero_argument_getter(
+                card_engine, STR("getTurnCount"));
+            const auto getter_turn = getter ? parse_int32(getter->value) : std::nullopt;
+            const auto wave_alert_text = export_property_text(
+                spawner, STR("currentWaveAlertCounter"));
+            const auto wave_alert = wave_alert_text
+                ? parse_int32(*wave_alert_text) : std::nullopt;
+            if (!getter_turn || !wave_alert)
+            {
+                throw std::runtime_error{
+                    "battle turn or wave-alert getter did not return an integer"};
+            }
+            if (native_turn != *getter_turn)
+            {
+                throw std::runtime_error{
+                    "CardEngine native turn disagrees with the reflected getter"};
+            }
+            return {
+                .engine_state = state,
+                .native_turn = native_turn,
+                .getter_turn = *getter_turn,
+                .wave_alert_counter = *wave_alert,
+            };
+        }
+
+        struct NativeDrawDelaySnapshot
+        {
+            const void* engine_state{};
+            const void* deck_state{};
+            const void* deck_state_controller{};
+            std::int32_t base{};
+            std::int32_t adjustment{};
+            std::int64_t computed{};
+            std::int32_t getter{};
+        };
+
+        auto read_validated_draw_delay(UObject* controller_deck, UObject* card_engine)
+            -> NativeDrawDelaySnapshot
+        {
+            const auto module = GetModuleHandleW(L"Quantum-Win64-Shipping.exe");
+            if (!module || !controller_deck || !card_engine
+                || controller_deck->GetWorld() != card_engine->GetWorld()
+                || !fingerprint_matches_supported_game(executable_fingerprint()))
+            {
+                throw std::runtime_error{
+                    "validated game executable or player deck objects were not found"};
+            }
+
+            const auto module_base = reinterpret_cast<std::uintptr_t>(module);
+            auto* draw_delay_getter = controller_deck->GetFunctionByNameInChain(
+                STR("getTurnDrawDelay"));
+            auto* deck_class = controller_deck->GetClassPrivate();
+            auto* engine_class = card_engine->GetClassPrivate();
+            if (!draw_delay_getter
+                || reinterpret_cast<std::uintptr_t>(draw_delay_getter->GetFuncPtr())
+                    != module_base + ControllerDeckTurnDrawDelayGetterThunkRva
+                || !address_is_readable(
+                    reinterpret_cast<const void*>(
+                        module_base + NativeControllerDeckTurnDrawDelayResolverRva),
+                    NativeControllerDeckTurnDrawDelayResolverSignature.size())
+                || !std::equal(
+                    NativeControllerDeckTurnDrawDelayResolverSignature.begin(),
+                    NativeControllerDeckTurnDrawDelayResolverSignature.end(),
+                    reinterpret_cast<const std::uint8_t*>(
+                        module_base + NativeControllerDeckTurnDrawDelayResolverRva))
+                || !address_is_readable(
+                    reinterpret_cast<const void*>(
+                        module_base + NativeDeckTurnDrawDelayGetterRva),
+                    NativeDeckTurnDrawDelayGetterSignature.size())
+                || !std::equal(
+                    NativeDeckTurnDrawDelayGetterSignature.begin(),
+                    NativeDeckTurnDrawDelayGetterSignature.end(),
+                    reinterpret_cast<const std::uint8_t*>(
+                        module_base + NativeDeckTurnDrawDelayGetterRva))
+                || !deck_class || !engine_class
+                || deck_class->GetPropertiesSize()
+                    < ControllerDeckCardEnginePointerOffset + sizeof(void*)
+                || engine_class->GetPropertiesSize()
+                    < CardEngineHealthStatePointerOffset + sizeof(void*)
+                || !address_is_readable(
+                    static_cast<const std::byte*>(
+                        static_cast<const void*>(controller_deck))
+                        + ControllerDeckCardEnginePointerOffset,
+                    sizeof(void*))
+                || !address_is_readable(
+                    static_cast<const std::byte*>(static_cast<const void*>(card_engine))
+                        + CardEngineHealthStatePointerOffset,
+                    sizeof(void*)))
+            {
+                throw std::runtime_error{
+                    "player draw-delay getter or native object layout did not pass the executable gate"};
+            }
+
+            auto* reflected_engine = reflected_object_property(
+                controller_deck, STR("mCardEngine"));
+            const auto* raw_engine = read_native_value<const void*>(
+                controller_deck, ControllerDeckCardEnginePointerOffset);
+            if (reflected_engine != card_engine
+                || raw_engine != static_cast<const void*>(card_engine))
+            {
+                throw std::runtime_error{
+                    "ControllerDeck is not anchored to the active CardEngine"};
+            }
+
+            const auto* engine_state = read_native_value<const void*>(
+                card_engine, CardEngineHealthStatePointerOffset);
+            if (!engine_state
+                || !address_is_readable(
+                    static_cast<const std::byte*>(engine_state)
+                        + CardEngineDeckStatePointerOffset,
+                    sizeof(void*))
+                || !address_is_readable(
+                    static_cast<const std::byte*>(engine_state)
+                        + CardEngineDeckStateControllerOffset,
+                    sizeof(void*)))
+            {
+                throw std::runtime_error{
+                    "CardEngine deck-state shared pointer is null or unreadable"};
+            }
+
+            const auto* deck_state = read_native_value<const void*>(
+                engine_state, CardEngineDeckStatePointerOffset);
+            const auto* deck_state_controller = read_native_value<const void*>(
+                engine_state, CardEngineDeckStateControllerOffset);
+            if (!deck_state || !deck_state_controller
+                || !address_is_writable(
+                    static_cast<const std::byte*>(deck_state)
+                        + DeckStateTurnDrawDelayBaseOffset,
+                    sizeof(std::int32_t))
+                || !address_is_writable(
+                    static_cast<const std::byte*>(deck_state)
+                        + DeckStateTurnDrawDelayAdjustmentOffset,
+                    sizeof(std::int32_t))
+                || !address_is_readable(
+                    static_cast<const std::byte*>(deck_state_controller) + sizeof(void*),
+                    sizeof(std::int32_t)))
+            {
+                throw std::runtime_error{
+                    "player deck state or its shared ownership did not pass validation"};
+            }
+
+            const auto reference_count = read_native_value<std::int32_t>(
+                deck_state_controller, sizeof(void*));
+            const auto base = read_native_value<std::int32_t>(
+                deck_state, DeckStateTurnDrawDelayBaseOffset);
+            const auto adjustment = read_native_value<std::int32_t>(
+                deck_state, DeckStateTurnDrawDelayAdjustmentOffset);
+            const auto computed = static_cast<std::int64_t>(base) + adjustment;
+            const auto getter_snapshot = export_zero_argument_getter(
+                controller_deck, STR("getTurnDrawDelay"));
+            const auto getter = getter_snapshot
+                ? parse_int32(getter_snapshot->value) : std::nullopt;
+            const auto reference_count_after = read_native_value<std::int32_t>(
+                deck_state_controller, sizeof(void*));
+            if (!getter || *getter != computed
+                || reference_count <= 0 || reference_count > 1'000'000
+                || reference_count_after != reference_count
+                || base < -100'000 || base > 100'000
+                || adjustment < -100'000 || adjustment > 100'000
+                || computed < 0 || computed > 1'000'000)
+            {
+                throw std::runtime_error{
+                    "player draw-delay values did not pass getter, range, and ownership guards"};
+            }
+
+            return {
+                .engine_state = engine_state,
+                .deck_state = deck_state,
+                .deck_state_controller = deck_state_controller,
+                .base = base,
+                .adjustment = adjustment,
+                .computed = computed,
+                .getter = *getter,
+            };
+        }
+
         auto append_private_card_state_diagnostics(ObjectSnapshot& snapshot, UObject* object) -> void
         {
             const auto& fingerprint = executable_fingerprint();
@@ -1970,7 +2423,9 @@ namespace QuantumCheckpoint
         {
             append_route_c_trace("capture.begin");
             if (g_pending_route_c_restore || g_pending_health_write_probe
-                || g_pending_turn_write_probe || g_pending_move_card_probe)
+                || g_pending_turn_write_probe || g_pending_battle_turn_write_probe
+                || g_pending_draw_delay_write_probe
+                || g_pending_move_card_probe)
             {
                 throw std::runtime_error{"A restore or native write probe is already active"};
             }
@@ -2285,6 +2740,55 @@ namespace QuantumCheckpoint
                     "capture.exact-character-charge.skipped", error.what());
             }
 
+            std::optional<ExactTurnProgressCheckpoint> exact_turn_progress{};
+            try
+            {
+                append_route_c_trace("capture.exact-turn-progress.prepare.begin");
+                const auto turn = read_validated_battle_turn(
+                    objects.card_engine, objects.spawner);
+                const auto zones = find_route_c_player_zone_objects(
+                    static_cast<const void*>(objects.card_engine->GetWorld()));
+                if (!zones.deck)
+                {
+                    throw std::runtime_error{"live player deck controller was not found"};
+                }
+                const auto draw = read_validated_draw_delay(
+                    zones.deck, objects.card_engine);
+                if (draw.engine_state != turn.engine_state)
+                {
+                    throw std::runtime_error{
+                        "turn and player-draw state did not share one CardEngine"};
+                }
+                ExactTurnProgressCheckpoint exact{};
+                exact.captured_at_utc = checkpoint.captured_at_utc;
+                exact.route_c_payload_checksum = checkpoint.payload_checksum;
+                exact.game_executable_sha256 = checkpoint.game_executable_sha256;
+                exact.game_executable_size = checkpoint.game_executable_size;
+                exact.source_level_name = checkpoint.source_level_name;
+                exact.wave_index = checkpoint.wave_index;
+                exact.card_engine_turn_count = turn.native_turn;
+                exact.player_draw_delay = draw.getter;
+                exact.wave_alert_counter = turn.wave_alert_counter;
+                exact.payload_checksum = exact_turn_progress_payload_checksum(exact);
+                std::string exact_validation_error{};
+                if (!validate_exact_turn_progress_checkpoint(
+                        exact, exact_validation_error))
+                {
+                    throw std::runtime_error{exact_validation_error};
+                }
+                exact_turn_progress = std::move(exact);
+                append_route_c_trace_failure(
+                    "capture.exact-turn-progress.prepare.complete",
+                    "engineTurn=" + std::to_string(turn.native_turn)
+                        + " drawDelay=" + std::to_string(draw.getter) + " alert="
+                        + std::to_string(turn.wave_alert_counter));
+            }
+            catch (const std::exception& error)
+            {
+                append_route_c_trace_failure(
+                    "capture.exact-turn-progress.skipped", error.what());
+            }
+
             const auto path = route_c_checkpoint_path();
             append_route_c_trace("capture.write.begin");
             write_file_atomically(path, serialize_route_c_checkpoint(checkpoint));
@@ -2354,6 +2858,23 @@ namespace QuantumCheckpoint
                 {
                     append_route_c_trace_failure(
                         "capture.exact-character-charge.write.failed", error.what());
+                }
+            }
+            if (exact_turn_progress)
+            {
+                try
+                {
+                    append_route_c_trace("capture.exact-turn-progress.write.begin");
+                    write_file_atomically(
+                        exact_turn_progress_checkpoint_path(),
+                        serialize_exact_turn_progress_checkpoint(
+                            std::move(*exact_turn_progress)));
+                    append_route_c_trace("capture.exact-turn-progress.write.complete");
+                }
+                catch (const std::exception& error)
+                {
+                    append_route_c_trace_failure(
+                        "capture.exact-turn-progress.write.failed", error.what());
                 }
             }
             return path;
@@ -2444,8 +2965,68 @@ namespace QuantumCheckpoint
                    << json_escape(restore.exact_character_charge_status) << "\",\n"
                    << "  \"exactCharacterChargeReason\": \""
                    << json_escape(restore.exact_character_charge_reason) << "\",\n"
-                   << "  \"targetHealth\": " << restore.checkpoint.player_health << "\n"
-                   << "}\n";
+                   << "  \"exactTurnProgressSupplementPresent\": "
+                   << (restore.exact_turn_progress ? "true" : "false") << ",\n"
+                   << "  \"exactTurnProgressStatus\": \""
+                   << json_escape(restore.exact_turn_progress_status) << "\",\n"
+                   << "  \"exactTurnProgressReason\": \""
+                   << json_escape(restore.exact_turn_progress_reason) << "\",\n"
+                   << "  \"targetCardEngineTurnCount\": ";
+            if (restore.exact_turn_progress)
+            {
+                output << restore.exact_turn_progress->card_engine_turn_count;
+            }
+            else
+            {
+                output << "null";
+            }
+            output << ",\n  \"targetPlayerDrawDelay\": ";
+            if (restore.exact_turn_progress)
+            {
+                output << restore.exact_turn_progress->player_draw_delay;
+            }
+            else
+            {
+                output << "null";
+            }
+            output << ",\n  \"targetWaveAlertCounter\": ";
+            if (restore.exact_turn_progress)
+            {
+                output << restore.exact_turn_progress->wave_alert_counter;
+            }
+            else
+            {
+                output << "null";
+            }
+            output << ",\n  \"observedCardEngineTurnCount\": ";
+            if (restore.exact_turn_progress_observed_turn)
+            {
+                output << *restore.exact_turn_progress_observed_turn;
+            }
+            else
+            {
+                output << "null";
+            }
+            output << ",\n  \"observedPlayerDrawDelay\": ";
+            if (restore.exact_turn_progress_observed_draw_delay)
+            {
+                output << *restore.exact_turn_progress_observed_draw_delay;
+            }
+            else
+            {
+                output << "null";
+            }
+            output << ",\n  \"observedWaveAlertCounter\": ";
+            if (restore.exact_turn_progress_observed_wave_alert)
+            {
+                output << *restore.exact_turn_progress_observed_wave_alert;
+            }
+            else
+            {
+                output << "null";
+            }
+            output << ",\n  \"targetHealth\": " << restore.checkpoint.player_health
+                   << "\n}\n";
             write_file_atomically(path, output.str());
             return path;
         }
@@ -2523,7 +3104,9 @@ namespace QuantumCheckpoint
         {
             append_route_c_trace("restore.begin");
             if (g_pending_route_c_restore || g_pending_health_write_probe
-                || g_pending_turn_write_probe || g_pending_move_card_probe)
+                || g_pending_turn_write_probe || g_pending_battle_turn_write_probe
+                || g_pending_draw_delay_write_probe
+                || g_pending_move_card_probe)
             {
                 throw std::runtime_error{"A restore or native write probe is already active"};
             }
@@ -2556,6 +3139,9 @@ namespace QuantumCheckpoint
             std::string exact_character_charge_reason{};
             auto exact_character_charge = try_read_exact_character_charge_checkpoint(
                 checkpoint, exact_character_charge_reason);
+            std::string exact_turn_progress_reason{};
+            auto exact_turn_progress = try_read_exact_turn_progress_checkpoint(
+                checkpoint, exact_turn_progress_reason);
 
             const auto objects = find_route_c_objects();
             if (!objects.game_instance)
@@ -2724,6 +3310,7 @@ namespace QuantumCheckpoint
             const bool exact_player_zones_available = exact_player_zones.has_value();
             const bool exact_player_trash_available = exact_player_trash.has_value();
             const bool exact_character_charge_available = exact_character_charge.has_value();
+            const bool exact_turn_progress_available = exact_turn_progress.has_value();
             g_pending_route_c_capture.reset();
             g_pending_route_c_restore.emplace(PendingRouteCRestore{
                 .checkpoint = std::move(checkpoint),
@@ -2731,6 +3318,7 @@ namespace QuantumCheckpoint
                 .exact_player_zones = std::move(exact_player_zones),
                 .exact_player_trash = std::move(exact_player_trash),
                 .exact_character_charge = std::move(exact_character_charge),
+                .exact_turn_progress = std::move(exact_turn_progress),
                 .exact_player_startup_decklist = startup_decklist,
                 .loot_drops = std::move(*loot_drops),
                 .phase = RouteCRestorePhase::AwaitingWaveIntercept,
@@ -2748,6 +3336,9 @@ namespace QuantumCheckpoint
                 .exact_character_charge_status = exact_character_charge_available
                     ? "pending" : "unavailable",
                 .exact_character_charge_reason = std::move(exact_character_charge_reason),
+                .exact_turn_progress_status = exact_turn_progress_available
+                    ? "pending" : "unavailable",
+                .exact_turn_progress_reason = std::move(exact_turn_progress_reason),
             });
 
             try
@@ -3509,6 +4100,292 @@ namespace QuantumCheckpoint
             append_route_c_trace("restore.exact-character-charge.apply.complete");
         }
 
+        auto update_exact_turn_progress(PendingRouteCRestore& restore,
+                                        const RouteCBattleObjects& objects) -> void
+        {
+            if (!restore.exact_turn_progress
+                || (restore.exact_turn_progress_status != "pending"
+                    && restore.exact_turn_progress_status != "applied"))
+            {
+                return;
+            }
+
+            NativeBattleTurnSnapshot turn{};
+            NativeDrawDelaySnapshot draw{};
+            UObject* controller_deck{};
+            try
+            {
+                const auto zones = find_route_c_player_zone_objects(
+                    objects.card_engine
+                        ? static_cast<const void*>(objects.card_engine->GetWorld())
+                        : nullptr);
+                controller_deck = zones.deck;
+                turn = read_validated_battle_turn(
+                    objects.card_engine, objects.spawner);
+                draw = read_validated_draw_delay(controller_deck, objects.card_engine);
+                if (draw.engine_state != turn.engine_state)
+                {
+                    throw std::runtime_error{
+                        "turn and player-draw state did not share one CardEngine"};
+                }
+            }
+            catch (const std::exception& error)
+            {
+                restore.exact_turn_progress_status =
+                    restore.exact_turn_progress_status == "applied"
+                    ? "failed-after-write"
+                    : "failed-no-write";
+                restore.exact_turn_progress_reason = error.what();
+                append_route_c_trace_failure(
+                    "restore.exact-turn-progress."
+                        + restore.exact_turn_progress_status,
+                    restore.exact_turn_progress_reason);
+                return;
+            }
+
+            restore.exact_turn_progress_observed_turn = turn.native_turn;
+            restore.exact_turn_progress_observed_draw_delay = draw.getter;
+            restore.exact_turn_progress_observed_wave_alert = turn.wave_alert_counter;
+            const auto& exact = *restore.exact_turn_progress;
+
+            const auto rollback_if_unchanged = [&]() -> bool {
+                if (!restore.exact_turn_progress_original_turn
+                    || !restore.exact_turn_progress_original_draw_base
+                    || !restore.exact_turn_progress_original_draw_adjustment
+                    || !restore.exact_turn_progress_applied_draw_adjustment
+                    || !restore.exact_turn_progress_original_wave_alert)
+                {
+                    return false;
+                }
+                try
+                {
+                    const auto current_turn = read_validated_battle_turn(
+                        objects.card_engine, objects.spawner);
+                    const auto zones = find_route_c_player_zone_objects(
+                        static_cast<const void*>(objects.card_engine->GetWorld()));
+                    const auto current_draw = read_validated_draw_delay(
+                        zones.deck, objects.card_engine);
+                    const auto original_turn =
+                        *restore.exact_turn_progress_original_turn;
+                    const auto original_base =
+                        *restore.exact_turn_progress_original_draw_base;
+                    const auto original_adjustment =
+                        *restore.exact_turn_progress_original_draw_adjustment;
+                    const auto applied_adjustment =
+                        *restore.exact_turn_progress_applied_draw_adjustment;
+                    const auto original_alert =
+                        *restore.exact_turn_progress_original_wave_alert;
+                    if (current_turn.engine_state
+                            != restore.exact_turn_progress_engine_state
+                        || current_draw.engine_state
+                            != restore.exact_turn_progress_engine_state
+                        || current_draw.deck_state
+                            != restore.exact_turn_progress_deck_state
+                        || current_draw.deck_state_controller
+                            != restore.exact_turn_progress_deck_state_controller
+                        || current_draw.base != original_base
+                        || (current_turn.native_turn
+                                != exact.card_engine_turn_count
+                            && current_turn.native_turn != original_turn)
+                        || (current_draw.adjustment != applied_adjustment
+                            && current_draw.adjustment != original_adjustment)
+                        || (current_turn.wave_alert_counter
+                                != exact.wave_alert_counter
+                            && current_turn.wave_alert_counter != original_alert))
+                    {
+                        return false;
+                    }
+
+                    write_native_value(
+                        current_turn.engine_state,
+                        CardEngineNativeTurnOffset,
+                        original_turn);
+                    write_native_value(
+                        current_draw.deck_state,
+                        DeckStateTurnDrawDelayAdjustmentOffset,
+                        original_adjustment);
+                    import_property_text(
+                        objects.spawner,
+                        STR("currentWaveAlertCounter"),
+                        std::to_string(original_alert));
+                    const auto rolled_back_turn = read_validated_battle_turn(
+                        objects.card_engine, objects.spawner);
+                    const auto rolled_back_draw = read_validated_draw_delay(
+                        zones.deck, objects.card_engine);
+                    restore.exact_turn_progress_observed_turn =
+                        rolled_back_turn.native_turn;
+                    restore.exact_turn_progress_observed_draw_delay =
+                        rolled_back_draw.getter;
+                    restore.exact_turn_progress_observed_wave_alert =
+                        rolled_back_turn.wave_alert_counter;
+                    return rolled_back_turn.engine_state
+                            == restore.exact_turn_progress_engine_state
+                        && rolled_back_draw.deck_state
+                            == restore.exact_turn_progress_deck_state
+                        && rolled_back_draw.base == original_base
+                        && rolled_back_draw.adjustment == original_adjustment
+                        && rolled_back_turn.native_turn == original_turn
+                        && rolled_back_turn.wave_alert_counter == original_alert;
+                }
+                catch (...)
+                {
+                    return false;
+                }
+            };
+
+            if (restore.exact_turn_progress_status == "applied")
+            {
+                if (turn.engine_state == restore.exact_turn_progress_engine_state
+                    && draw.deck_state == restore.exact_turn_progress_deck_state
+                    && draw.deck_state_controller
+                        == restore.exact_turn_progress_deck_state_controller
+                    && restore.exact_turn_progress_original_draw_base
+                    && restore.exact_turn_progress_applied_draw_adjustment
+                    && draw.base == *restore.exact_turn_progress_original_draw_base
+                    && draw.adjustment
+                        == *restore.exact_turn_progress_applied_draw_adjustment
+                    && turn.native_turn == exact.card_engine_turn_count
+                    && draw.getter == exact.player_draw_delay
+                    && turn.wave_alert_counter == exact.wave_alert_counter)
+                {
+                    restore.exact_turn_progress_status = "verified";
+                    restore.exact_turn_progress_reason =
+                        "CardEngine turn, player draw delay, and wave-alert counter retained the saved values across frames";
+                    append_route_c_trace("restore.exact-turn-progress.verified");
+                    return;
+                }
+
+                const bool rolled_back = rollback_if_unchanged();
+                restore.exact_turn_progress_status = rolled_back
+                    ? "failed-rolled-back" : "failed-after-write";
+                restore.exact_turn_progress_reason = rolled_back
+                    ? "turn-progress write did not persist and was rolled back"
+                    : "turn-progress state changed concurrently; no rollback was attempted";
+                append_route_c_trace_failure(
+                    "restore.exact-turn-progress."
+                        + restore.exact_turn_progress_status,
+                    restore.exact_turn_progress_reason);
+                return;
+            }
+
+            if (turn.native_turn == exact.card_engine_turn_count
+                && draw.getter == exact.player_draw_delay
+                && turn.wave_alert_counter == exact.wave_alert_counter)
+            {
+                restore.exact_turn_progress_status = "verified";
+                restore.exact_turn_progress_reason =
+                    "native startup already matched all saved turn-progress values";
+                append_route_c_trace(
+                    "restore.exact-turn-progress.verified-no-write");
+                return;
+            }
+            if (turn.native_turn != 0 || turn.wave_alert_counter != 0)
+            {
+                restore.exact_turn_progress_status = "failed-no-write";
+                restore.exact_turn_progress_reason =
+                    "CardEngine turn or wave-alert counter advanced before guarded restoration";
+                append_route_c_trace_failure(
+                    "restore.exact-turn-progress.failed-no-write",
+                    "engineTurn=" + std::to_string(turn.native_turn)
+                        + " drawDelay=" + std::to_string(draw.getter) + " alert="
+                        + std::to_string(turn.wave_alert_counter));
+                return;
+            }
+
+            const auto draw_delta = static_cast<std::int64_t>(
+                exact.player_draw_delay) - draw.computed;
+            const auto target_adjustment = static_cast<std::int64_t>(draw.adjustment)
+                + draw_delta;
+            if (target_adjustment < std::numeric_limits<std::int32_t>::min()
+                || target_adjustment > std::numeric_limits<std::int32_t>::max()
+                || target_adjustment < -100'000 || target_adjustment > 100'000)
+            {
+                restore.exact_turn_progress_status = "failed-no-write";
+                restore.exact_turn_progress_reason =
+                    "saved player draw delay required an unsafe native adjustment";
+                append_route_c_trace_failure(
+                    "restore.exact-turn-progress.failed-no-write",
+                    restore.exact_turn_progress_reason);
+                return;
+            }
+
+            restore.exact_turn_progress_engine_state = turn.engine_state;
+            restore.exact_turn_progress_deck_state = draw.deck_state;
+            restore.exact_turn_progress_deck_state_controller =
+                draw.deck_state_controller;
+            restore.exact_turn_progress_original_turn = turn.native_turn;
+            restore.exact_turn_progress_original_draw_base = draw.base;
+            restore.exact_turn_progress_original_draw_adjustment = draw.adjustment;
+            restore.exact_turn_progress_applied_draw_adjustment =
+                static_cast<std::int32_t>(target_adjustment);
+            restore.exact_turn_progress_original_wave_alert =
+                turn.wave_alert_counter;
+            try
+            {
+                append_route_c_trace_failure(
+                    "restore.exact-turn-progress.apply.begin",
+                    "engineTurn=0->"
+                        + std::to_string(exact.card_engine_turn_count)
+                        + " drawDelay=" + std::to_string(draw.getter) + "->"
+                        + std::to_string(exact.player_draw_delay) + " alert=0->"
+                        + std::to_string(exact.wave_alert_counter));
+                write_native_value(
+                    turn.engine_state,
+                    CardEngineNativeTurnOffset,
+                    exact.card_engine_turn_count);
+                write_native_value(
+                    draw.deck_state,
+                    DeckStateTurnDrawDelayAdjustmentOffset,
+                    static_cast<std::int32_t>(target_adjustment));
+                import_property_text(
+                    objects.spawner,
+                    STR("currentWaveAlertCounter"),
+                    std::to_string(exact.wave_alert_counter));
+                const auto written_turn = read_validated_battle_turn(
+                    objects.card_engine, objects.spawner);
+                const auto written_draw = read_validated_draw_delay(
+                    controller_deck, objects.card_engine);
+                restore.exact_turn_progress_observed_turn = written_turn.native_turn;
+                restore.exact_turn_progress_observed_draw_delay = written_draw.getter;
+                restore.exact_turn_progress_observed_wave_alert =
+                    written_turn.wave_alert_counter;
+                if (written_turn.engine_state
+                        != restore.exact_turn_progress_engine_state
+                    || written_draw.engine_state
+                        != restore.exact_turn_progress_engine_state
+                    || written_draw.deck_state
+                        != restore.exact_turn_progress_deck_state
+                    || written_draw.deck_state_controller
+                        != restore.exact_turn_progress_deck_state_controller
+                    || written_draw.base != draw.base
+                    || written_draw.adjustment != target_adjustment
+                    || written_turn.native_turn != exact.card_engine_turn_count
+                    || written_draw.getter != exact.player_draw_delay
+                    || written_turn.wave_alert_counter != exact.wave_alert_counter)
+                {
+                    throw std::runtime_error{
+                        "turn-progress write did not verify immediately"};
+                }
+                restore.exact_turn_progress_status = "applied";
+                restore.exact_turn_progress_reason =
+                    "all turn-progress values were written; awaiting cross-frame verification";
+                append_route_c_trace("restore.exact-turn-progress.apply.complete");
+            }
+            catch (const std::exception& error)
+            {
+                const bool rolled_back = rollback_if_unchanged();
+                restore.exact_turn_progress_status = rolled_back
+                    ? "failed-rolled-back" : "failed-after-write";
+                restore.exact_turn_progress_reason = std::string{error.what()}
+                    + (rolled_back ? "; original values restored"
+                                   : "; rollback could not be proven safe");
+                append_route_c_trace_failure(
+                    "restore.exact-turn-progress."
+                        + restore.exact_turn_progress_status,
+                    restore.exact_turn_progress_reason);
+            }
+        }
+
         auto update_route_c_restore() -> void
         {
             if (!g_pending_route_c_restore)
@@ -3780,6 +4657,7 @@ namespace QuantumCheckpoint
                     objects,
                     character_card_charge,
                     character_card_charge_requirement);
+                update_exact_turn_progress(restore, objects);
                 if (restore.exact_character_charge_status == "pending")
                 {
                     if (now - restore.started_at <= std::chrono::seconds{5})
@@ -3904,7 +4782,12 @@ namespace QuantumCheckpoint
 
                 finish_route_c_restore(
                     "passed",
-                    restore.exact_player_trash_status == "verified"
+                    restore.exact_turn_progress_status == "verified"
+                        && restore.exact_player_trash_status == "verified"
+                        ? "ordinary substage semantics, exact player deck, hand, trash, CardEngine turn, player draw delay, and wave-alert counter were restored"
+                    : restore.exact_turn_progress_status == "verified"
+                        ? "ordinary substage semantics, CardEngine turn, player draw delay, and wave-alert counter were restored"
+                    : restore.exact_player_trash_status == "verified"
                         ? "ordinary substage semantics and exact player deck, hand, and trash were restored"
                         : restore.exact_spawn_plan_status == "verified"
                             && restore.exact_player_zones_status == "verified"
@@ -4450,6 +5333,12 @@ namespace QuantumCheckpoint
                 {
                     append_getters(snapshot, object, CharacterCardSlotGetters);
                 }
+                else if (role == "BP_ControllerDeck_C")
+                {
+                    append_getters(snapshot, object, ControllerDeckGetters);
+                    append_function_pointers(
+                        snapshot, object, ControllerDeckDiagnosticFunctions);
+                }
                 else if (role.starts_with("BP_Controller") && role != "BP_ControllerBoard_C"
                          && role != "BP_FieldSlot_C")
                 {
@@ -4645,7 +5534,9 @@ namespace QuantumCheckpoint
             result.requested_hold_milliseconds = TimedHealthProbeHold.count();
             try
             {
-                if (g_pending_health_write_probe || g_pending_turn_write_probe)
+                if (g_pending_health_write_probe || g_pending_turn_write_probe
+                    || g_pending_battle_turn_write_probe
+                    || g_pending_draw_delay_write_probe)
                 {
                     Output::send<LogLevel::Warning>(
                         STR("[QuantumCheckpoint] A timed native write probe is already active; health request ignored.\n"));
@@ -5016,7 +5907,9 @@ namespace QuantumCheckpoint
             result.requested_hold_milliseconds = TimedTurnProbeHold.count();
             try
             {
-                if (g_pending_health_write_probe || g_pending_turn_write_probe)
+                if (g_pending_health_write_probe || g_pending_turn_write_probe
+                    || g_pending_battle_turn_write_probe
+                    || g_pending_draw_delay_write_probe)
                 {
                     Output::send<LogLevel::Warning>(
                         STR("[QuantumCheckpoint] A timed native write probe is already active; turn request ignored.\n"));
@@ -5362,6 +6255,706 @@ namespace QuantumCheckpoint
             }
         }
 
+        auto write_battle_turn_probe_report(const BattleTurnWriteProbeResult& result)
+            -> std::filesystem::path
+        {
+            const auto mods_directory = std::filesystem::path{
+                UE4SSProgram::get_program().get_mods_directory()};
+            const auto path = mods_directory / STR("QuantumCheckpoint") / STR("Reports") /
+                (STR("battle-turn-write-probe-") + to_wstring(filename_timestamp())
+                 + STR(".json"));
+            std::ostringstream output{};
+            output << "{\n"
+                   << "  \"schemaVersion\": 1,\n"
+                   << "  \"kind\": \"guarded-battle-turn-write-probe\",\n"
+                   << "  \"capturedAtUtc\": \"" << json_escape(utc_timestamp()) << "\",\n"
+                   << "  \"status\": \"" << json_escape(result.status) << "\",\n"
+                   << "  \"reason\": \"" << json_escape(result.reason) << "\",\n"
+                   << "  \"cardEngineFullName\": \""
+                   << json_escape(result.card_engine_full_name) << "\",\n"
+                   << "  \"spawnerFullName\": \""
+                   << json_escape(result.spawner_full_name) << "\",\n"
+                   << "  \"engineStateAddress\": \""
+                   << format_address(result.engine_state_address) << "\",\n"
+                   << "  \"nativeTurnOffset\": \"0x18\",\n"
+                   << "  \"beforeNativeTurn\": " << result.before_native_turn << ",\n"
+                   << "  \"beforeGetterTurn\": " << result.before_getter_turn << ",\n"
+                   << "  \"beforeWaveAlert\": " << result.before_wave_alert << ",\n"
+                   << "  \"testTurn\": " << result.test_turn << ",\n"
+                   << "  \"testWaveAlert\": " << result.test_wave_alert << ",\n"
+                   << "  \"duringNativeTurn\": " << result.during_native_turn << ",\n"
+                   << "  \"duringGetterTurn\": " << result.during_getter_turn << ",\n"
+                   << "  \"duringWaveAlert\": " << result.during_wave_alert << ",\n"
+                   << "  \"requestedHoldMilliseconds\": "
+                   << result.requested_hold_milliseconds << ",\n"
+                   << "  \"actualHoldMilliseconds\": "
+                   << result.actual_hold_milliseconds << ",\n"
+                   << "  \"restoreIdentityValidated\": "
+                   << (result.restore_identity_validated ? "true" : "false") << ",\n"
+                   << "  \"beforeRestoreNativeTurn\": "
+                   << result.before_restore_native_turn << ",\n"
+                   << "  \"beforeRestoreWaveAlert\": "
+                   << result.before_restore_wave_alert << ",\n"
+                   << "  \"restoredNativeTurn\": "
+                   << result.restored_native_turn << ",\n"
+                   << "  \"restoredGetterTurn\": "
+                   << result.restored_getter_turn << ",\n"
+                   << "  \"restoredWaveAlert\": "
+                   << result.restored_wave_alert << "\n"
+                   << "}\n";
+            write_file_atomically(path, output.str());
+            return path;
+        }
+
+        auto run_battle_turn_write_probe() -> void
+        {
+            BattleTurnWriteProbeResult result{};
+            result.requested_hold_milliseconds = TimedBattleTurnProbeHold.count();
+            UObject* target_engine{};
+            UObject* target_spawner{};
+            const void* target_state{};
+            bool turn_written{};
+            bool alert_written{};
+            try
+            {
+                if (g_pending_health_write_probe || g_pending_turn_write_probe
+                    || g_pending_battle_turn_write_probe
+                    || g_pending_draw_delay_write_probe || g_pending_move_card_probe
+                    || g_pending_route_c_restore || g_pending_route_c_capture)
+                {
+                    result.status = "refused";
+                    throw std::runtime_error{"another checkpoint or write transaction is active"};
+                }
+                const auto objects = find_route_c_objects();
+                if (!objects.card_engine || !objects.spawner || !objects.bottom_bar)
+                {
+                    result.status = "refused";
+                    throw std::runtime_error{"a complete active battle was not found"};
+                }
+                target_engine = objects.card_engine;
+                target_spawner = objects.spawner;
+                result.card_engine_full_name = to_string(target_engine->GetFullName());
+                result.spawner_full_name = to_string(target_spawner->GetFullName());
+                if (required_text(
+                        export_property_text(target_engine, STR("currentGameState")),
+                        "CardEngine.currentGameState") != "OPEN"
+                    || required_text(
+                           export_property_text(
+                               target_engine, STR("mActiveCardSelectionPrompt")),
+                           "CardEngine.mActiveCardSelectionPrompt") != "None"
+                    || required_text(
+                           export_property_text(
+                               target_engine, STR("mActiveCardPlacementPrompt")),
+                           "CardEngine.mActiveCardPlacementPrompt") != "None")
+                {
+                    result.status = "refused";
+                    throw std::runtime_error{"the battle is not in a stable prompt-free OPEN state"};
+                }
+
+                const auto module = GetModuleHandleW(L"Quantum-Win64-Shipping.exe");
+                if (!module || !fingerprint_matches_supported_game(executable_fingerprint()))
+                {
+                    result.status = "refused";
+                    throw std::runtime_error{"the game executable is not the validated build"};
+                }
+                const auto module_base = reinterpret_cast<std::uintptr_t>(module);
+                auto* turn_getter = target_engine->GetFunctionByNameInChain(
+                    STR("getTurnCount"));
+                if (!turn_getter
+                    || reinterpret_cast<std::uintptr_t>(turn_getter->GetFuncPtr())
+                        != module_base + CardEngineTurnGetterThunkRva
+                    || !std::equal(
+                        NativeCardEngineTurnGetterSignature.begin(),
+                        NativeCardEngineTurnGetterSignature.end(),
+                        reinterpret_cast<const std::uint8_t*>(
+                            module_base + NativeCardEngineTurnGetterRva)))
+                {
+                    result.status = "refused";
+                    throw std::runtime_error{"CardEngine turn getter signatures did not match"};
+                }
+                if (!address_is_readable(
+                        static_cast<const std::byte*>(static_cast<const void*>(target_engine))
+                            + CardEngineHealthStatePointerOffset,
+                        sizeof(void*)))
+                {
+                    result.status = "refused";
+                    throw std::runtime_error{"CardEngine native state pointer is unreadable"};
+                }
+                target_state = read_native_value<const void*>(
+                    target_engine, CardEngineHealthStatePointerOffset);
+                if (!target_state
+                    || !address_is_writable(
+                        static_cast<const std::byte*>(target_state)
+                            + CardEngineNativeTurnOffset,
+                        sizeof(std::int32_t)))
+                {
+                    result.status = "refused";
+                    throw std::runtime_error{"CardEngine native turn field is not writable"};
+                }
+                result.engine_state_address = reinterpret_cast<std::uintptr_t>(target_state);
+                result.before_native_turn = read_native_value<std::int32_t>(
+                    target_state, CardEngineNativeTurnOffset);
+                const auto getter_before = export_zero_argument_getter(
+                    target_engine, STR("getTurnCount"));
+                const auto getter_before_value = getter_before
+                    ? parse_int32(getter_before->value)
+                    : std::nullopt;
+                const auto alert_before = parse_int32(required_text(
+                    export_property_text(target_spawner, STR("currentWaveAlertCounter")),
+                    "SpawnController.currentWaveAlertCounter"));
+                const auto alert_amount = parse_int32(required_text(
+                    export_property_text(target_spawner, STR("amountPerWaveAlertLevel")),
+                    "SpawnController.amountPerWaveAlertLevel"));
+                const auto alert_stacks = parse_int32(required_text(
+                    export_property_text(target_spawner, STR("maxWaveAlertStacks")),
+                    "SpawnController.maxWaveAlertStacks"));
+                if (!getter_before_value || !alert_before || !alert_amount || !alert_stacks
+                    || *getter_before_value != result.before_native_turn
+                    || result.before_native_turn < 0 || result.before_native_turn >= 1000
+                    || *alert_before < 0 || *alert_amount <= 0 || *alert_stacks <= 0
+                    || *alert_amount > 1000 || *alert_stacks > 1000
+                    || static_cast<std::int64_t>(*alert_before) + 1
+                        >= static_cast<std::int64_t>(*alert_amount) * *alert_stacks)
+                {
+                    result.status = "refused";
+                    throw std::runtime_error{
+                        "live turn/alert values did not pass getter and threshold guards"};
+                }
+                result.before_getter_turn = *getter_before_value;
+                result.before_wave_alert = *alert_before;
+                result.test_turn = result.before_native_turn + 1;
+                result.test_wave_alert = result.before_wave_alert + 1;
+
+                write_native_value(
+                    target_state, CardEngineNativeTurnOffset, result.test_turn);
+                turn_written = true;
+                import_property_text(
+                    target_spawner,
+                    STR("currentWaveAlertCounter"),
+                    std::to_string(result.test_wave_alert));
+                alert_written = true;
+                result.during_native_turn = read_native_value<std::int32_t>(
+                    target_state, CardEngineNativeTurnOffset);
+                const auto getter_during = export_zero_argument_getter(
+                    target_engine, STR("getTurnCount"));
+                const auto getter_during_value = getter_during
+                    ? parse_int32(getter_during->value)
+                    : std::nullopt;
+                const auto alert_during = parse_int32(required_text(
+                    export_property_text(target_spawner, STR("currentWaveAlertCounter")),
+                    "written SpawnController.currentWaveAlertCounter"));
+                result.during_getter_turn = getter_during_value.value_or(-1);
+                result.during_wave_alert = alert_during.value_or(-1);
+                if (result.during_native_turn != result.test_turn
+                    || getter_during_value != result.test_turn
+                    || alert_during != result.test_wave_alert)
+                {
+                    throw std::runtime_error{"temporary battle turn/alert write did not verify"};
+                }
+
+                const auto started_at = std::chrono::steady_clock::now();
+                g_pending_battle_turn_write_probe.emplace(PendingBattleTurnWriteProbe{
+                    .result = result,
+                    .card_engine = target_engine,
+                    .spawner = target_spawner,
+                    .engine_state = target_state,
+                    .started_at = started_at,
+                    .restore_after = started_at + TimedBattleTurnProbeHold,
+                });
+                append_route_c_trace_failure(
+                    "battle-turn-probe.holding",
+                    "turn=" + std::to_string(result.before_native_turn) + "->"
+                        + std::to_string(result.test_turn) + " alert="
+                        + std::to_string(result.before_wave_alert) + "->"
+                        + std::to_string(result.test_wave_alert));
+                Output::send<LogLevel::Verbose>(
+                    STR("[QuantumCheckpoint] Battle turn probe holding +1 turn/+1 alert for {} ms; do not interact.\n"),
+                    TimedBattleTurnProbeHold.count());
+                return;
+            }
+            catch (const std::exception& error)
+            {
+                if (alert_written && target_spawner)
+                {
+                    try
+                    {
+                        import_property_text(
+                            target_spawner,
+                            STR("currentWaveAlertCounter"),
+                            std::to_string(result.before_wave_alert));
+                    }
+                    catch (...)
+                    {
+                    }
+                }
+                if (turn_written && target_state
+                    && address_is_writable(
+                        static_cast<const std::byte*>(target_state)
+                            + CardEngineNativeTurnOffset,
+                        sizeof(std::int32_t))
+                    && read_native_value<std::int32_t>(
+                           target_state, CardEngineNativeTurnOffset) == result.test_turn)
+                {
+                    write_native_value(
+                        target_state, CardEngineNativeTurnOffset, result.before_native_turn);
+                }
+                if (result.status != "refused")
+                {
+                    result.status = "failed";
+                }
+                result.reason = error.what();
+                const auto path = write_battle_turn_probe_report(result);
+                Output::send<LogLevel::Warning>(
+                    STR("[QuantumCheckpoint] Battle turn probe {}: {}; report: {}\n"),
+                    to_wstring(result.status), to_wstring(result.reason), path.wstring());
+            }
+        }
+
+        auto finish_battle_turn_write_probe_if_due() -> void
+        {
+            if (!g_pending_battle_turn_write_probe
+                || std::chrono::steady_clock::now()
+                    < g_pending_battle_turn_write_probe->restore_after)
+            {
+                return;
+            }
+            auto pending = *g_pending_battle_turn_write_probe;
+            g_pending_battle_turn_write_probe.reset();
+            auto& result = pending.result;
+            result.actual_hold_milliseconds =
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - pending.started_at).count();
+            try
+            {
+                const auto live = find_route_c_objects();
+                result.restore_identity_validated = live.card_engine == pending.card_engine
+                    && live.spawner == pending.spawner
+                    && address_is_readable(
+                        static_cast<const std::byte*>(
+                            static_cast<const void*>(pending.card_engine))
+                            + CardEngineHealthStatePointerOffset,
+                        sizeof(void*))
+                    && read_native_value<const void*>(
+                           pending.card_engine, CardEngineHealthStatePointerOffset)
+                        == pending.engine_state
+                    && address_is_writable(
+                        static_cast<const std::byte*>(pending.engine_state)
+                            + CardEngineNativeTurnOffset,
+                        sizeof(std::int32_t));
+                if (!result.restore_identity_validated)
+                {
+                    throw std::runtime_error{
+                        "battle objects changed identity during the timed hold"};
+                }
+                result.before_restore_native_turn = read_native_value<std::int32_t>(
+                    pending.engine_state, CardEngineNativeTurnOffset);
+                result.before_restore_wave_alert = parse_int32(required_text(
+                    export_property_text(
+                        pending.spawner, STR("currentWaveAlertCounter")),
+                    "held SpawnController.currentWaveAlertCounter")).value_or(-1);
+                if (result.before_restore_native_turn != result.test_turn
+                    || result.before_restore_wave_alert != result.test_wave_alert)
+                {
+                    throw std::runtime_error{
+                        "battle turn/alert changed independently during the timed hold"};
+                }
+
+                write_native_value(
+                    pending.engine_state,
+                    CardEngineNativeTurnOffset,
+                    result.before_native_turn);
+                import_property_text(
+                    pending.spawner,
+                    STR("currentWaveAlertCounter"),
+                    std::to_string(result.before_wave_alert));
+                result.restored_native_turn = read_native_value<std::int32_t>(
+                    pending.engine_state, CardEngineNativeTurnOffset);
+                const auto getter_restored = export_zero_argument_getter(
+                    pending.card_engine, STR("getTurnCount"));
+                result.restored_getter_turn = getter_restored
+                    ? parse_int32(getter_restored->value).value_or(-1)
+                    : -1;
+                result.restored_wave_alert = parse_int32(required_text(
+                    export_property_text(
+                        pending.spawner, STR("currentWaveAlertCounter")),
+                    "restored SpawnController.currentWaveAlertCounter")).value_or(-1);
+                const bool passed = result.restored_native_turn == result.before_native_turn
+                    && result.restored_getter_turn == result.before_getter_turn
+                    && result.restored_wave_alert == result.before_wave_alert;
+                result.status = passed ? "passed" : "failed";
+                result.reason = passed
+                    ? "paired battle turn and wave-alert writes survived the hold and were restored"
+                    : "paired battle turn and wave-alert restoration did not verify";
+            }
+            catch (const std::exception& error)
+            {
+                result.status = "failed";
+                result.reason = error.what();
+                if (pending.engine_state
+                    && address_is_writable(
+                        static_cast<const std::byte*>(pending.engine_state)
+                            + CardEngineNativeTurnOffset,
+                        sizeof(std::int32_t))
+                    && read_native_value<std::int32_t>(
+                           pending.engine_state, CardEngineNativeTurnOffset)
+                        == result.test_turn)
+                {
+                    write_native_value(
+                        pending.engine_state,
+                        CardEngineNativeTurnOffset,
+                        result.before_native_turn);
+                    result.restored_native_turn = result.before_native_turn;
+                }
+                if (pending.spawner)
+                {
+                    try
+                    {
+                        const auto live_alert = parse_int32(required_text(
+                            export_property_text(
+                                pending.spawner, STR("currentWaveAlertCounter")),
+                            "failed probe SpawnController.currentWaveAlertCounter"));
+                        if (live_alert == result.test_wave_alert)
+                        {
+                            import_property_text(
+                                pending.spawner,
+                                STR("currentWaveAlertCounter"),
+                                std::to_string(result.before_wave_alert));
+                            result.restored_wave_alert = result.before_wave_alert;
+                        }
+                    }
+                    catch (...)
+                    {
+                    }
+                }
+            }
+            const auto path = write_battle_turn_probe_report(result);
+            append_route_c_trace_failure(
+                "battle-turn-probe.complete", result.status + ": " + result.reason);
+            Output::send<LogLevel::Verbose>(
+                STR("[QuantumCheckpoint] Battle turn probe {}: {}; report: {}\n"),
+                to_wstring(result.status), to_wstring(result.reason), path.wstring());
+        }
+
+        auto write_draw_delay_probe_report(const DrawDelayWriteProbeResult& result)
+            -> std::filesystem::path
+        {
+            const auto mods_directory = std::filesystem::path{
+                UE4SSProgram::get_program().get_mods_directory()};
+            const auto path = mods_directory / STR("QuantumCheckpoint") / STR("Reports") /
+                (STR("draw-delay-write-probe-") + to_wstring(filename_timestamp())
+                 + STR(".json"));
+            std::ostringstream output{};
+            output << "{\n"
+                   << "  \"schemaVersion\": 1,\n"
+                   << "  \"kind\": \"guarded-player-draw-delay-write-probe\",\n"
+                   << "  \"capturedAtUtc\": \"" << json_escape(utc_timestamp()) << "\",\n"
+                   << "  \"status\": \"" << json_escape(result.status) << "\",\n"
+                   << "  \"reason\": \"" << json_escape(result.reason) << "\",\n"
+                   << "  \"controllerDeckFullName\": \""
+                   << json_escape(result.controller_deck_full_name) << "\",\n"
+                   << "  \"cardEngineFullName\": \""
+                   << json_escape(result.card_engine_full_name) << "\",\n"
+                   << "  \"engineStateAddress\": \""
+                   << format_address(result.engine_state_address) << "\",\n"
+                   << "  \"deckStateAddress\": \""
+                   << format_address(result.deck_state_address) << "\",\n"
+                   << "  \"deckStateControllerAddress\": \""
+                   << format_address(result.deck_state_controller_address) << "\",\n"
+                   << "  \"baseOffset\": \"0x68\",\n"
+                   << "  \"adjustmentOffset\": \"0x6C\",\n"
+                   << "  \"beforeBase\": " << result.before_base << ",\n"
+                   << "  \"beforeAdjustment\": " << result.before_adjustment << ",\n"
+                   << "  \"beforeComputed\": " << result.before_computed << ",\n"
+                   << "  \"beforeGetter\": " << result.before_getter << ",\n"
+                   << "  \"testAdjustment\": " << result.test_adjustment << ",\n"
+                   << "  \"testComputed\": " << result.test_computed << ",\n"
+                   << "  \"duringBase\": " << result.during_base << ",\n"
+                   << "  \"duringAdjustment\": " << result.during_adjustment << ",\n"
+                   << "  \"duringComputed\": " << result.during_computed << ",\n"
+                   << "  \"duringGetter\": " << result.during_getter << ",\n"
+                   << "  \"requestedHoldMilliseconds\": "
+                   << result.requested_hold_milliseconds << ",\n"
+                   << "  \"actualHoldMilliseconds\": "
+                   << result.actual_hold_milliseconds << ",\n"
+                   << "  \"restoreIdentityValidated\": "
+                   << (result.restore_identity_validated ? "true" : "false") << ",\n"
+                   << "  \"beforeRestoreBase\": "
+                   << result.before_restore_base << ",\n"
+                   << "  \"beforeRestoreAdjustment\": "
+                   << result.before_restore_adjustment << ",\n"
+                   << "  \"beforeRestoreComputed\": "
+                   << result.before_restore_computed << ",\n"
+                   << "  \"restoredBase\": " << result.restored_base << ",\n"
+                   << "  \"restoredAdjustment\": "
+                   << result.restored_adjustment << ",\n"
+                   << "  \"restoredComputed\": "
+                   << result.restored_computed << ",\n"
+                   << "  \"restoredGetter\": " << result.restored_getter << "\n"
+                   << "}\n";
+            write_file_atomically(path, output.str());
+            return path;
+        }
+
+        auto run_draw_delay_write_probe() -> void
+        {
+            DrawDelayWriteProbeResult result{};
+            result.requested_hold_milliseconds = TimedDrawDelayProbeHold.count();
+            UObject* target_deck{};
+            UObject* target_engine{};
+            const void* target_deck_state{};
+            bool adjustment_written{};
+            try
+            {
+                if (g_pending_health_write_probe || g_pending_turn_write_probe
+                    || g_pending_battle_turn_write_probe
+                    || g_pending_draw_delay_write_probe || g_pending_move_card_probe
+                    || g_pending_route_c_restore || g_pending_route_c_capture)
+                {
+                    result.status = "refused";
+                    throw std::runtime_error{"another checkpoint or write transaction is active"};
+                }
+
+                const auto objects = find_route_c_objects();
+                const auto zones = find_route_c_player_zone_objects(
+                    objects.card_engine
+                        ? static_cast<const void*>(objects.card_engine->GetWorld())
+                        : nullptr);
+                if (!objects.card_engine || !objects.spawner || !objects.bottom_bar
+                    || !zones.deck)
+                {
+                    result.status = "refused";
+                    throw std::runtime_error{"a complete active battle and player deck were not found"};
+                }
+                target_deck = zones.deck;
+                target_engine = objects.card_engine;
+                result.controller_deck_full_name = to_string(target_deck->GetFullName());
+                result.card_engine_full_name = to_string(target_engine->GetFullName());
+                if (required_text(
+                        export_property_text(target_engine, STR("currentGameState")),
+                        "CardEngine.currentGameState") != "OPEN"
+                    || required_text(
+                           export_property_text(
+                               target_engine, STR("mActiveCardSelectionPrompt")),
+                           "CardEngine.mActiveCardSelectionPrompt") != "None"
+                    || required_text(
+                           export_property_text(
+                               target_engine, STR("mActiveCardPlacementPrompt")),
+                           "CardEngine.mActiveCardPlacementPrompt") != "None")
+                {
+                    result.status = "refused";
+                    throw std::runtime_error{"the battle is not in a stable prompt-free OPEN state"};
+                }
+
+                const auto before = read_validated_draw_delay(target_deck, target_engine);
+                target_deck_state = before.deck_state;
+                result.engine_state_address = reinterpret_cast<std::uintptr_t>(
+                    before.engine_state);
+                result.deck_state_address = reinterpret_cast<std::uintptr_t>(
+                    before.deck_state);
+                result.deck_state_controller_address = reinterpret_cast<std::uintptr_t>(
+                    before.deck_state_controller);
+                result.before_base = before.base;
+                result.before_adjustment = before.adjustment;
+                result.before_computed = before.computed;
+                result.before_getter = before.getter;
+                if (before.computed <= 0
+                    || before.adjustment == std::numeric_limits<std::int32_t>::min())
+                {
+                    result.status = "refused";
+                    throw std::runtime_error{
+                        "the current player draw delay cannot be decremented safely"};
+                }
+                result.test_adjustment = before.adjustment - 1;
+                result.test_computed = before.computed - 1;
+
+                write_native_value(
+                    before.deck_state,
+                    DeckStateTurnDrawDelayAdjustmentOffset,
+                    result.test_adjustment);
+                adjustment_written = true;
+                const auto during = read_validated_draw_delay(target_deck, target_engine);
+                result.during_base = during.base;
+                result.during_adjustment = during.adjustment;
+                result.during_computed = during.computed;
+                result.during_getter = during.getter;
+                if (during.engine_state != before.engine_state
+                    || during.deck_state != before.deck_state
+                    || during.deck_state_controller != before.deck_state_controller
+                    || during.base != before.base
+                    || during.adjustment != result.test_adjustment
+                    || during.computed != result.test_computed
+                    || during.getter != result.test_computed)
+                {
+                    throw std::runtime_error{
+                        "temporary player draw-delay adjustment did not verify"};
+                }
+
+                const auto started_at = std::chrono::steady_clock::now();
+                g_pending_draw_delay_write_probe.emplace(PendingDrawDelayWriteProbe{
+                    .result = result,
+                    .controller_deck = target_deck,
+                    .card_engine = target_engine,
+                    .engine_state = before.engine_state,
+                    .deck_state = before.deck_state,
+                    .deck_state_controller = before.deck_state_controller,
+                    .started_at = started_at,
+                    .restore_after = started_at + TimedDrawDelayProbeHold,
+                });
+                append_route_c_trace_failure(
+                    "draw-delay-probe.holding",
+                    "delay=" + std::to_string(result.before_computed) + "->"
+                        + std::to_string(result.test_computed));
+                Output::send<LogLevel::Verbose>(
+                    STR("[QuantumCheckpoint] Player draw-delay probe holding {} -> {} for {} ms; do not interact.\n"),
+                    result.before_computed,
+                    result.test_computed,
+                    TimedDrawDelayProbeHold.count());
+                return;
+            }
+            catch (const std::exception& error)
+            {
+                if (adjustment_written && target_deck_state
+                    && address_is_writable(
+                        static_cast<const std::byte*>(target_deck_state)
+                            + DeckStateTurnDrawDelayAdjustmentOffset,
+                        sizeof(std::int32_t))
+                    && read_native_value<std::int32_t>(
+                           target_deck_state,
+                           DeckStateTurnDrawDelayAdjustmentOffset)
+                        == result.test_adjustment)
+                {
+                    write_native_value(
+                        target_deck_state,
+                        DeckStateTurnDrawDelayAdjustmentOffset,
+                        result.before_adjustment);
+                }
+                if (result.status != "refused")
+                {
+                    result.status = "failed";
+                }
+                result.reason = error.what();
+                const auto path = write_draw_delay_probe_report(result);
+                append_route_c_trace_failure(
+                    "draw-delay-probe.complete", result.status + ": " + result.reason);
+                Output::send<LogLevel::Warning>(
+                    STR("[QuantumCheckpoint] Player draw-delay probe {}: {}; report: {}\n"),
+                    to_wstring(result.status), to_wstring(result.reason), path.wstring());
+            }
+        }
+
+        auto finish_draw_delay_write_probe_if_due() -> void
+        {
+            if (!g_pending_draw_delay_write_probe
+                || std::chrono::steady_clock::now()
+                    < g_pending_draw_delay_write_probe->restore_after)
+            {
+                return;
+            }
+
+            auto pending = *g_pending_draw_delay_write_probe;
+            g_pending_draw_delay_write_probe.reset();
+            auto& result = pending.result;
+            result.actual_hold_milliseconds =
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - pending.started_at).count();
+            try
+            {
+                const auto objects = find_route_c_objects();
+                const auto zones = find_route_c_player_zone_objects(
+                    objects.card_engine
+                        ? static_cast<const void*>(objects.card_engine->GetWorld())
+                        : nullptr);
+                const auto held = read_validated_draw_delay(zones.deck, objects.card_engine);
+                result.restore_identity_validated = zones.deck == pending.controller_deck
+                    && objects.card_engine == pending.card_engine
+                    && held.engine_state == pending.engine_state
+                    && held.deck_state == pending.deck_state
+                    && held.deck_state_controller == pending.deck_state_controller;
+                if (!result.restore_identity_validated)
+                {
+                    throw std::runtime_error{
+                        "player deck objects changed identity during the timed hold"};
+                }
+
+                result.before_restore_base = held.base;
+                result.before_restore_adjustment = held.adjustment;
+                result.before_restore_computed = held.computed;
+                if (held.base != result.before_base
+                    || held.adjustment != result.test_adjustment
+                    || held.computed != result.test_computed
+                    || held.getter != result.test_computed)
+                {
+                    throw std::runtime_error{
+                        "player draw-delay state changed independently during the timed hold"};
+                }
+
+                write_native_value(
+                    held.deck_state,
+                    DeckStateTurnDrawDelayAdjustmentOffset,
+                    result.before_adjustment);
+                const auto restored = read_validated_draw_delay(
+                    pending.controller_deck, pending.card_engine);
+                result.restored_base = restored.base;
+                result.restored_adjustment = restored.adjustment;
+                result.restored_computed = restored.computed;
+                result.restored_getter = restored.getter;
+                const bool passed = restored.engine_state == pending.engine_state
+                    && restored.deck_state == pending.deck_state
+                    && restored.deck_state_controller == pending.deck_state_controller
+                    && restored.base == result.before_base
+                    && restored.adjustment == result.before_adjustment
+                    && restored.computed == result.before_computed
+                    && restored.getter == result.before_getter;
+                result.status = passed ? "passed" : "failed";
+                result.reason = passed
+                    ? "temporary player draw-delay adjustment survived the hold and was restored"
+                    : "player draw-delay restoration did not verify";
+            }
+            catch (const std::exception& error)
+            {
+                result.status = "failed";
+                result.reason = error.what();
+                try
+                {
+                    const auto objects = find_route_c_objects();
+                    const auto zones = find_route_c_player_zone_objects(
+                        objects.card_engine
+                            ? static_cast<const void*>(objects.card_engine->GetWorld())
+                            : nullptr);
+                    const auto live = read_validated_draw_delay(
+                        zones.deck, objects.card_engine);
+                    if (zones.deck == pending.controller_deck
+                        && objects.card_engine == pending.card_engine
+                        && live.engine_state == pending.engine_state
+                        && live.deck_state == pending.deck_state
+                        && live.deck_state_controller == pending.deck_state_controller
+                        && live.adjustment == result.test_adjustment)
+                    {
+                        write_native_value(
+                            live.deck_state,
+                            DeckStateTurnDrawDelayAdjustmentOffset,
+                            result.before_adjustment);
+                        const auto rolled_back = read_validated_draw_delay(
+                            zones.deck, objects.card_engine);
+                        result.restored_base = rolled_back.base;
+                        result.restored_adjustment = rolled_back.adjustment;
+                        result.restored_computed = rolled_back.computed;
+                        result.restored_getter = rolled_back.getter;
+                    }
+                }
+                catch (...)
+                {
+                }
+            }
+
+            const auto path = write_draw_delay_probe_report(result);
+            append_route_c_trace_failure(
+                "draw-delay-probe.complete", result.status + ": " + result.reason);
+            Output::send<LogLevel::Verbose>(
+                STR("[QuantumCheckpoint] Player draw-delay probe {}: {}; report: {}\n"),
+                to_wstring(result.status), to_wstring(result.reason), path.wstring());
+        }
+
         auto write_move_card_probe_report(const MoveCardProbeResult& result)
             -> std::filesystem::path
         {
@@ -5704,7 +7297,9 @@ namespace QuantumCheckpoint
             try
             {
                 if (g_pending_move_card_probe || g_pending_health_write_probe
-                    || g_pending_turn_write_probe || g_pending_route_c_restore
+                    || g_pending_turn_write_probe || g_pending_battle_turn_write_probe
+                    || g_pending_draw_delay_write_probe
+                    || g_pending_route_c_restore
                     || g_pending_route_c_capture)
                 {
                     result.status = "refused";
@@ -5929,7 +7524,7 @@ namespace QuantumCheckpoint
         QuantumCheckpointMod()
         {
             ModName = STR("QuantumCheckpoint");
-            ModVersion = STR("0.14.0-dev");
+            ModVersion = STR("0.15.0-dev");
             ModDescription = STR("Route C checkpoint with optional exact-state supplements");
             ModAuthors = STR("zaofenMachine and contributors");
             ModIntendedSDKVersion = STR("3.0.1");
@@ -5976,6 +7571,15 @@ namespace QuantumCheckpoint
                 Input::Key::F9,
                 {Input::ModifierKey::CONTROL, Input::ModifierKey::SHIFT},
                 []() { g_turn_write_probe_requested.store(true, std::memory_order_release); });
+
+            UE4SSProgram::get_program().register_keydown_event(
+                Input::Key::F7,
+                {Input::ModifierKey::CONTROL, Input::ModifierKey::SHIFT},
+                []() {
+                    append_route_c_trace("hotkey.draw-delay-probe.received");
+                    g_draw_delay_write_probe_requested.store(
+                        true, std::memory_order_release);
+                });
 
             UE4SSProgram::get_program().register_keydown_event(
                 Input::Key::F8,
@@ -6075,6 +7679,8 @@ namespace QuantumCheckpoint
                 update_route_c_wave_poll();
                 finish_health_write_probe_if_due();
                 finish_turn_write_probe_if_due();
+                finish_battle_turn_write_probe_if_due();
+                finish_draw_delay_write_probe_if_due();
                 update_move_card_probe();
 
                 if (g_route_c_save_requested.exchange(false, std::memory_order_acq_rel))
@@ -6154,6 +7760,36 @@ namespace QuantumCheckpoint
                     {
                         Output::send<LogLevel::Warning>(
                             STR("[QuantumCheckpoint] Unreal is not initialized; turn write probe ignored.\n"));
+                    }
+                }
+
+                if (g_battle_turn_write_probe_requested.exchange(
+                        false, std::memory_order_acq_rel))
+                {
+                    append_route_c_trace("battle-turn-probe.dispatch");
+                    if (g_unreal_ready.load(std::memory_order_acquire))
+                    {
+                        run_battle_turn_write_probe();
+                    }
+                    else
+                    {
+                        Output::send<LogLevel::Warning>(
+                            STR("[QuantumCheckpoint] Unreal is not initialized; battle turn probe ignored.\n"));
+                    }
+                }
+
+                if (g_draw_delay_write_probe_requested.exchange(
+                        false, std::memory_order_acq_rel))
+                {
+                    append_route_c_trace("draw-delay-probe.dispatch");
+                    if (g_unreal_ready.load(std::memory_order_acquire))
+                    {
+                        run_draw_delay_write_probe();
+                    }
+                    else
+                    {
+                        Output::send<LogLevel::Warning>(
+                            STR("[QuantumCheckpoint] Unreal is not initialized; player draw-delay probe ignored.\n"));
                     }
                 }
 

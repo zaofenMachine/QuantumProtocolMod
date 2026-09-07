@@ -1874,4 +1874,148 @@ namespace QuantumCheckpoint
         }
         return checkpoint;
     }
+
+    auto exact_turn_progress_payload_checksum(const ExactTurnProgressCheckpoint& checkpoint)
+        -> std::string
+    {
+        std::uint64_t hash = 14695981039346656037ULL;
+        append_hash_number(hash, checkpoint.schema_version);
+        append_hash_bytes(hash, checkpoint.kind);
+        append_hash_bytes(hash, checkpoint.captured_at_utc);
+        append_hash_bytes(hash, checkpoint.route_c_payload_checksum);
+        append_hash_bytes(hash, checkpoint.game_executable_sha256);
+        append_hash_number(hash, checkpoint.game_executable_size);
+        append_hash_bytes(hash, checkpoint.source_level_name);
+        append_hash_number(hash, checkpoint.wave_index);
+        append_hash_number(hash, checkpoint.card_engine_turn_count);
+        append_hash_number(hash, checkpoint.player_draw_delay);
+        append_hash_number(hash, checkpoint.wave_alert_counter);
+
+        std::ostringstream output{};
+        output << std::hex << std::uppercase << std::setw(16) << std::setfill('0') << hash;
+        return output.str();
+    }
+
+    auto serialize_exact_turn_progress_checkpoint(ExactTurnProgressCheckpoint checkpoint)
+        -> std::string
+    {
+        checkpoint.payload_checksum = exact_turn_progress_payload_checksum(checkpoint);
+        std::ostringstream output{};
+        output << "{\n"
+               << "  \"schemaVersion\": " << checkpoint.schema_version << ",\n"
+               << "  \"kind\": \"" << json_escape(checkpoint.kind) << "\",\n"
+               << "  \"capturedAtUtc\": \"" << json_escape(checkpoint.captured_at_utc)
+               << "\",\n"
+               << "  \"routeCPayloadChecksum\": \""
+               << json_escape(checkpoint.route_c_payload_checksum) << "\",\n"
+               << "  \"gameExecutableSha256\": \""
+               << json_escape(checkpoint.game_executable_sha256) << "\",\n"
+               << "  \"gameExecutableSize\": " << checkpoint.game_executable_size << ",\n"
+               << "  \"sourceLevelName\": \"" << json_escape(checkpoint.source_level_name)
+               << "\",\n"
+               << "  \"waveIndex\": " << checkpoint.wave_index << ",\n"
+               << "  \"cardEngineTurnCount\": "
+               << checkpoint.card_engine_turn_count << ",\n"
+               << "  \"playerDrawDelay\": " << checkpoint.player_draw_delay << ",\n"
+               << "  \"waveAlertCounter\": " << checkpoint.wave_alert_counter << ",\n"
+               << "  \"payloadChecksum\": \"" << checkpoint.payload_checksum << "\"\n"
+               << "}\n";
+        return output.str();
+    }
+
+    auto validate_exact_turn_progress_checkpoint(
+        const ExactTurnProgressCheckpoint& checkpoint, std::string& error) -> bool
+    {
+        if (checkpoint.schema_version != ExactTurnProgressSchemaVersion)
+        {
+            error = "unsupported exact turn-progress schema version";
+            return false;
+        }
+        if (checkpoint.kind != ExactTurnProgressCheckpointKind)
+        {
+            error = "checkpoint kind is not exact turn progress";
+            return false;
+        }
+        if (checkpoint.captured_at_utc.empty()
+            || !is_hex_digest(checkpoint.route_c_payload_checksum, 16)
+            || !is_sha256(checkpoint.game_executable_sha256)
+            || checkpoint.game_executable_size == 0)
+        {
+            error = "exact turn progress has invalid linkage or executable data";
+            return false;
+        }
+        if (checkpoint.source_level_name.empty() || checkpoint.source_level_name == "None"
+            || checkpoint.source_level_name.size() > 256 || checkpoint.wave_index < 0
+            || checkpoint.wave_index > 1000)
+        {
+            error = "exact turn progress has invalid level or wave data";
+            return false;
+        }
+        if (checkpoint.card_engine_turn_count < 0
+            || checkpoint.card_engine_turn_count > 1'000'000
+            || checkpoint.player_draw_delay < 0
+            || checkpoint.player_draw_delay > 1'000'000
+            || checkpoint.wave_alert_counter < 0
+            || checkpoint.wave_alert_counter > 1'000'000)
+        {
+            error = "exact turn-progress value is outside the supported range";
+            return false;
+        }
+        if (checkpoint.payload_checksum != exact_turn_progress_payload_checksum(checkpoint))
+        {
+            error = "exact turn-progress payload checksum does not match";
+            return false;
+        }
+        return true;
+    }
+
+    auto parse_exact_turn_progress_checkpoint(std::string_view json, std::string& error)
+        -> std::optional<ExactTurnProgressCheckpoint>
+    {
+        if (json.empty() || json.size() > RouteCMaximumFileBytes)
+        {
+            error = "exact turn-progress file is empty or exceeds the 2 MiB limit";
+            return std::nullopt;
+        }
+        auto values = FlatJsonParser{json}.parse(error);
+        if (!values)
+        {
+            return std::nullopt;
+        }
+
+        ExactTurnProgressCheckpoint checkpoint{};
+#define READ_TURN_PROGRESS_STRING(Field, JsonName) \
+        do { auto value = required_string(*values, JsonName, error); if (!value) return std::nullopt; checkpoint.Field = std::move(*value); } while (false)
+#define READ_TURN_PROGRESS_INTEGER(Field, JsonName, Type) \
+        do { auto value = required_integer<Type>(*values, JsonName, error); if (!value) return std::nullopt; checkpoint.Field = *value; } while (false)
+
+        READ_TURN_PROGRESS_INTEGER(schema_version, "schemaVersion", int);
+        if (checkpoint.schema_version != ExactTurnProgressSchemaVersion)
+        {
+            error = "unsupported exact turn-progress schema version";
+            return std::nullopt;
+        }
+        READ_TURN_PROGRESS_STRING(kind, "kind");
+        READ_TURN_PROGRESS_STRING(captured_at_utc, "capturedAtUtc");
+        READ_TURN_PROGRESS_STRING(route_c_payload_checksum, "routeCPayloadChecksum");
+        READ_TURN_PROGRESS_STRING(game_executable_sha256, "gameExecutableSha256");
+        READ_TURN_PROGRESS_INTEGER(game_executable_size, "gameExecutableSize", std::uint64_t);
+        READ_TURN_PROGRESS_STRING(source_level_name, "sourceLevelName");
+        READ_TURN_PROGRESS_INTEGER(wave_index, "waveIndex", std::int32_t);
+        READ_TURN_PROGRESS_INTEGER(
+            card_engine_turn_count, "cardEngineTurnCount", std::int32_t);
+        READ_TURN_PROGRESS_INTEGER(player_draw_delay, "playerDrawDelay", std::int32_t);
+        READ_TURN_PROGRESS_INTEGER(
+            wave_alert_counter, "waveAlertCounter", std::int32_t);
+        READ_TURN_PROGRESS_STRING(payload_checksum, "payloadChecksum");
+
+#undef READ_TURN_PROGRESS_INTEGER
+#undef READ_TURN_PROGRESS_STRING
+
+        if (!validate_exact_turn_progress_checkpoint(checkpoint, error))
+        {
+            return std::nullopt;
+        }
+        return checkpoint;
+    }
 } // namespace QuantumCheckpoint

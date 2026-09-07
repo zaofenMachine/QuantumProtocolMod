@@ -102,6 +102,22 @@ namespace
             .requirement = 6,
         };
     }
+
+    auto sample_exact_turn_progress(const QuantumCheckpoint::RouteCCheckpoint& route_c)
+        -> QuantumCheckpoint::ExactTurnProgressCheckpoint
+    {
+        return {
+            .captured_at_utc = route_c.captured_at_utc,
+            .route_c_payload_checksum = route_c.payload_checksum,
+            .game_executable_sha256 = route_c.game_executable_sha256,
+            .game_executable_size = route_c.game_executable_size,
+            .source_level_name = route_c.source_level_name,
+            .wave_index = route_c.wave_index,
+            .card_engine_turn_count = 5,
+            .player_draw_delay = 4,
+            .wave_alert_counter = 5,
+        };
+    }
 }
 
 int main()
@@ -387,6 +403,55 @@ int main()
             "corrupted exact character charge is rejected");
     require(error.find("checksum") != std::string::npos,
             "character-charge corruption reports checksum error");
+
+    auto turn_progress = sample_exact_turn_progress(original);
+    const auto turn_progress_json = serialize_exact_turn_progress_checkpoint(turn_progress);
+    error.clear();
+    const auto parsed_turn_progress =
+        parse_exact_turn_progress_checkpoint(turn_progress_json, error);
+    require(parsed_turn_progress.has_value(), error.c_str());
+    require(parsed_turn_progress->card_engine_turn_count == 5
+                && parsed_turn_progress->player_draw_delay == 4
+                && parsed_turn_progress->wave_alert_counter == 5,
+            "exact turn progress round trip");
+    require(parsed_turn_progress->payload_checksum
+                == exact_turn_progress_payload_checksum(*parsed_turn_progress),
+            "exact turn-progress checksum round trip");
+
+    auto corrupt_turn_progress = turn_progress_json;
+    const auto draw_delay_field = corrupt_turn_progress.find("\"playerDrawDelay\": 4");
+    require(draw_delay_field != std::string::npos,
+            "turn-progress fixture contains player draw delay");
+    corrupt_turn_progress.replace(
+        draw_delay_field,
+        std::string{"\"playerDrawDelay\": 4"}.size(),
+        "\"playerDrawDelay\": 3");
+    error.clear();
+    require(!parse_exact_turn_progress_checkpoint(corrupt_turn_progress, error),
+            "corrupted exact turn progress is rejected");
+    require(error.find("checksum") != std::string::npos,
+            "turn-progress corruption reports checksum error");
+
+    auto negative_turn_progress = turn_progress;
+    negative_turn_progress.card_engine_turn_count = -1;
+    error.clear();
+    require(!parse_exact_turn_progress_checkpoint(
+                serialize_exact_turn_progress_checkpoint(negative_turn_progress), error),
+            "negative CardEngine turn is rejected");
+
+    auto excessive_draw_delay = turn_progress;
+    excessive_draw_delay.player_draw_delay = 1'000'001;
+    error.clear();
+    require(!parse_exact_turn_progress_checkpoint(
+                serialize_exact_turn_progress_checkpoint(excessive_draw_delay), error),
+            "excessive player draw delay is rejected");
+
+    auto excessive_wave_alert = turn_progress;
+    excessive_wave_alert.wave_alert_counter = 1'000'001;
+    error.clear();
+    require(!parse_exact_turn_progress_checkpoint(
+                serialize_exact_turn_progress_checkpoint(excessive_wave_alert), error),
+            "excessive wave-alert counter is rejected");
 
     std::cout << "Route C checkpoint persistence tests passed\n";
     return 0;
