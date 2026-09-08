@@ -402,6 +402,17 @@ namespace QuantumCheckpoint
         constexpr std::uintptr_t QueueMoveCardRva = 0xE35A10;
         constexpr std::uintptr_t MoveCardConstructorRva = 0xDFAF30;
         constexpr std::uintptr_t MoveCardExecuteRva = 0xE426C0;
+        constexpr std::uintptr_t QueueMoveCardOnFieldRva = 0xE35CF0;
+        constexpr std::uintptr_t MoveCardOnFieldConstructorRva = 0xDFB160;
+        constexpr std::uintptr_t MoveCardOnFieldExecuteRva = 0xE43160;
+        constexpr std::uintptr_t QueuePlayCardToFieldRva = 0xE37F10;
+        constexpr std::uintptr_t PlayCardToFieldConstructorRva = 0xDFBA80;
+        constexpr std::uintptr_t PlayCardToFieldExecuteRva = 0xE441D0;
+        constexpr std::uintptr_t DispatchCardPlayEffectsRva = 0xE383C0;
+        constexpr std::uintptr_t NativeGetCardPlacementRva = 0xE21B30;
+        constexpr std::size_t NativeCardEffectListPointerOffset = 0x1B8;
+        constexpr std::size_t NativeCardEffectListCountOffset = 0x1C0;
+        constexpr std::size_t NativeCardEffectListCapacityOffset = 0x1C4;
         constexpr std::size_t CardEngineHealthStatePointerOffset = 0x268;
         constexpr std::size_t CardEngineNativeTurnOffset = 0x18;
         constexpr std::size_t ControllerDeckCardEnginePointerOffset = 0x220;
@@ -453,6 +464,38 @@ namespace QuantumCheckpoint
             0x48, 0x83, 0xEC, 0x38, 0x48, 0x8B, 0x51, 0x10,
             0x33, 0xC0, 0x48, 0x85, 0xD2, 0x74, 0x19, 0x44,
             0x8B, 0x42, 0x08, 0x45, 0x85, 0xC0, 0x74, 0x0D,
+        };
+        constexpr std::array<std::uint8_t, 16> QueueMoveCardOnFieldSignature{
+            0x48, 0x8B, 0xC4, 0x53, 0x48, 0x81, 0xEC, 0x80,
+            0x00, 0x00, 0x00, 0x48, 0x89, 0x68, 0x08, 0x49,
+        };
+        constexpr std::array<std::uint8_t, 16> MoveCardOnFieldConstructorSignature{
+            0x48, 0x89, 0x5C, 0x24, 0x10, 0x48, 0x89, 0x6C,
+            0x24, 0x18, 0x48, 0x89, 0x74, 0x24, 0x20, 0x57,
+        };
+        constexpr std::array<std::uint8_t, 16> MoveCardOnFieldExecuteSignature{
+            0x48, 0x8B, 0xC4, 0x55, 0x53, 0x48, 0x8D, 0x68,
+            0xA1, 0x48, 0x81, 0xEC, 0xA8, 0x00, 0x00, 0x00,
+        };
+        constexpr std::array<std::uint8_t, 16> QueuePlayCardToFieldSignature{
+            0x48, 0x8B, 0xC4, 0x53, 0x48, 0x81, 0xEC, 0x90,
+            0x00, 0x00, 0x00, 0x48, 0x89, 0x68, 0x08, 0x49,
+        };
+        constexpr std::array<std::uint8_t, 16> PlayCardToFieldConstructorSignature{
+            0x4C, 0x8B, 0xDC, 0x4D, 0x89, 0x4B, 0x20, 0x53,
+            0x57, 0x48, 0x83, 0xEC, 0x68, 0x48, 0x8B, 0x02,
+        };
+        constexpr std::array<std::uint8_t, 16> PlayCardToFieldExecuteSignature{
+            0x4C, 0x8B, 0xDC, 0x55, 0x57, 0x49, 0x8D, 0xAB,
+            0xD8, 0xFE, 0xFF, 0xFF, 0x48, 0x81, 0xEC, 0x18,
+        };
+        constexpr std::array<std::uint8_t, 16> DispatchCardPlayEffectsSignature{
+            0x48, 0x8B, 0xC4, 0x53, 0x48, 0x81, 0xEC, 0x50,
+            0x01, 0x00, 0x00, 0x48, 0x89, 0x68, 0x10, 0x48,
+        };
+        constexpr std::array<std::uint8_t, 16> NativeGetCardPlacementSignature{
+            0x48, 0x89, 0x5C, 0x24, 0x10, 0x48, 0x89, 0x74,
+            0x24, 0x18, 0x57, 0x48, 0x83, 0xEC, 0x50, 0x49,
         };
 
         struct HealthWriteProbeResult
@@ -664,11 +707,54 @@ namespace QuantumCheckpoint
         using NativeGetCardLocationFunction = std::uint8_t(__fastcall*)(
             const void* card_state);
 
+        struct NativeCardPlacement
+        {
+            std::uint8_t type{};
+            std::array<std::uint8_t, 3> type_padding{};
+            std::int32_t index{-1};
+            std::uint8_t row{3};
+            std::uint8_t side{2};
+            std::array<std::uint8_t, 2> tail_padding{};
+        };
+
+        static_assert(sizeof(NativeCardPlacement) == 12);
+
+        using QueueMoveCardOnFieldFunction = void(__fastcall*)(
+            const void* engine_state,
+            const NativeSharedPointerPair* parent_action,
+            const NativeSharedPointerPair* card,
+            const NativeCardPlacement* placement,
+            std::uint8_t queue_mode,
+            std::uint8_t resolve_occupied_slot,
+            std::uint8_t find_fallback_slot);
+        using QueuePlayCardToFieldFunction = void(__fastcall*)(
+            const void* engine_state,
+            const NativeSharedPointerPair* parent_action,
+            const NativeSharedPointerPair* card,
+            const NativeCardPlacement* placement,
+            std::uint8_t queue_flag,
+            std::uint8_t find_fallback_slot,
+            std::uint8_t queue_mode,
+            std::uint8_t special_validation,
+            std::uint8_t resolve_occupied_slot);
+        using NativeGetCardPlacementFunction = NativeCardPlacement*(__fastcall*)(
+            const void* engine_state,
+            NativeCardPlacement* result,
+            NativeSharedPointerPair* card_by_value);
+
         struct NativeMoveCardApi
         {
             const void* engine_state{};
             QueueMoveCardFunction queue_move_card{};
             NativeGetCardLocationFunction get_card_location{};
+        };
+
+        struct NativeMoveCardOnFieldApi
+        {
+            NativeMoveCardApi location{};
+            QueueMoveCardOnFieldFunction queue_move_card_on_field{};
+            QueuePlayCardToFieldFunction queue_play_card_to_field{};
+            NativeGetCardPlacementFunction get_card_placement{};
         };
 
         struct NativeCardReference
@@ -689,11 +775,16 @@ namespace QuantumCheckpoint
         auto queue_native_move_card_action(const NativeMoveCardApi& api,
                                            const NativeCardReference& card,
                                            std::uint8_t destination) -> void;
+        auto validated_native_move_card_on_field_api(UObject* card_engine)
+            -> NativeMoveCardOnFieldApi;
+        auto native_card_placement(const NativeMoveCardOnFieldApi& api,
+                                   const NativeCardReference& card)
+            -> std::optional<NativeCardPlacement>;
 
         enum class MoveCardProbePhase
         {
-            AwaitingTrash,
-            HoldingInTrash,
+            AwaitingTarget,
+            HoldingAtTarget,
             AwaitingRestore,
         };
 
@@ -705,14 +796,24 @@ namespace QuantumCheckpoint
             std::string card_tag{};
             std::string card_id{};
             std::string before_location{};
-            std::string trash_location{};
+            std::string staged_location{};
+            std::string initial_field_placement{};
+            std::string before_placement{};
+            std::string target_placement{};
+            std::string during_placement{};
+            std::string restored_placement{};
             std::string restored_location{};
             std::uintptr_t state_address{};
             std::uintptr_t engine_state_address{};
             std::int64_t requested_hold_milliseconds{};
             std::int64_t actual_hold_milliseconds{};
             bool identity_validated_before_restore{};
-            bool used_default_move_type{};
+            std::int32_t suppressed_effect_count{};
+            bool effect_list_restored{};
+            bool selected_plain_fruit{};
+            bool used_zero_queue_mode{};
+            bool used_resolve_occupied_slot{};
+            bool used_find_fallback_slot{};
         };
 
         struct PendingMoveCardProbe
@@ -723,10 +824,20 @@ namespace QuantumCheckpoint
             const void* card_state{};
             const void* engine_state{};
             QueueMoveCardFunction queue_move_card{};
+            QueueMoveCardOnFieldFunction queue_move_card_on_field{};
+            QueuePlayCardToFieldFunction queue_play_card_to_field{};
             NativeGetCardLocationFunction get_card_location{};
-            MoveCardProbePhase phase{MoveCardProbePhase::AwaitingTrash};
+            NativeGetCardPlacementFunction get_card_placement{};
+            const void* native_card_object{};
+            const void* effect_list_pointer{};
+            std::int32_t effect_list_count{};
+            std::int32_t effect_list_capacity{};
+            bool effects_suppressed{};
+            NativeCardPlacement target{};
+            MoveCardProbePhase phase{MoveCardProbePhase::AwaitingTarget};
             std::chrono::steady_clock::time_point started_at{};
             std::chrono::steady_clock::time_point phase_started_at{};
+            std::string failure_before_rollback{};
         };
 
         std::optional<PendingMoveCardProbe> g_pending_move_card_probe{};
@@ -6964,12 +7075,12 @@ namespace QuantumCheckpoint
                 / STR("Reports");
             std::filesystem::create_directories(report_directory);
             const auto path = report_directory
-                / (STR("move-card-probe-") + to_wstring(filename_timestamp()) + STR(".json"));
+                / (STR("field-move-probe-") + to_wstring(filename_timestamp()) + STR(".json"));
 
             std::ostringstream output{};
             output << "{\n"
                    << "  \"schemaVersion\": 1,\n"
-                   << "  \"kind\": \"guarded-native-move-card-probe\",\n"
+                   << "  \"kind\": \"guarded-native-field-move-probe\",\n"
                    << "  \"capturedAtUtc\": \"" << json_escape(utc_timestamp()) << "\",\n"
                    << "  \"status\": \"" << json_escape(result.status) << "\",\n"
                    << "  \"reason\": \"" << json_escape(result.reason) << "\",\n"
@@ -6979,8 +7090,18 @@ namespace QuantumCheckpoint
                    << "  \"cardId\": \"" << json_escape(result.card_id) << "\",\n"
                    << "  \"beforeLocation\": \""
                    << json_escape(result.before_location) << "\",\n"
-                   << "  \"trashLocation\": \""
-                   << json_escape(result.trash_location) << "\",\n"
+                   << "  \"stagedLocation\": \""
+                   << json_escape(result.staged_location) << "\",\n"
+                   << "  \"initialFieldPlacement\": \""
+                   << json_escape(result.initial_field_placement) << "\",\n"
+                   << "  \"beforePlacement\": \""
+                   << json_escape(result.before_placement) << "\",\n"
+                   << "  \"targetPlacement\": \""
+                   << json_escape(result.target_placement) << "\",\n"
+                   << "  \"duringPlacement\": \""
+                   << json_escape(result.during_placement) << "\",\n"
+                   << "  \"restoredPlacement\": \""
+                   << json_escape(result.restored_placement) << "\",\n"
                    << "  \"restoredLocation\": \""
                    << json_escape(result.restored_location) << "\",\n"
                    << "  \"stateAddress\": \"" << format_address(result.state_address)
@@ -6988,8 +7109,10 @@ namespace QuantumCheckpoint
                    << "  \"engineStateAddress\": \""
                    << format_address(result.engine_state_address) << "\",\n"
                    << "  \"queueMoveCardRva\": \"0xE35A10\",\n"
-                   << "  \"destination\": \"TRASH then HAND\",\n"
-                   << "  \"moveType\": \"DEFAULT\",\n"
+                   << "  \"queueMoveCardOnFieldRva\": \"0xE35CF0\",\n"
+                   << "  \"queuePlayCardToFieldRva\": \"0xE37F10\",\n"
+                   << "  \"dispatchCardPlayEffectsRva\": \"0xE383C0\",\n"
+                   << "  \"nativeGetCardPlacementRva\": \"0xE21B30\",\n"
                    << "  \"requestedHoldMilliseconds\": "
                    << result.requested_hold_milliseconds << ",\n"
                    << "  \"actualHoldMilliseconds\": "
@@ -6997,8 +7120,18 @@ namespace QuantumCheckpoint
                    << "  \"identityValidatedBeforeRestore\": "
                    << (result.identity_validated_before_restore ? "true" : "false")
                    << ",\n"
-                   << "  \"usedDefaultMoveType\": "
-                   << (result.used_default_move_type ? "true" : "false") << "\n"
+                   << "  \"suppressedEffectCount\": "
+                   << result.suppressed_effect_count << ",\n"
+                   << "  \"effectListRestored\": "
+                   << (result.effect_list_restored ? "true" : "false") << ",\n"
+                   << "  \"selectedPlainFruit\": "
+                   << (result.selected_plain_fruit ? "true" : "false") << ",\n"
+                   << "  \"usedZeroQueueMode\": "
+                   << (result.used_zero_queue_mode ? "true" : "false") << ",\n"
+                   << "  \"usedResolveOccupiedSlot\": "
+                   << (result.used_resolve_occupied_slot ? "true" : "false") << ",\n"
+                   << "  \"usedFindFallbackSlot\": "
+                   << (result.used_find_fallback_slot ? "true" : "false") << "\n"
                    << "}\n";
             write_file_atomically(path, output.str());
             return path;
@@ -7054,6 +7187,144 @@ namespace QuantumCheckpoint
                 .get_card_location = reinterpret_cast<NativeGetCardLocationFunction>(
                     module_base + NativeGetCardLocationRva),
             };
+        }
+
+        auto validated_native_move_card_on_field_api(UObject* card_engine)
+            -> NativeMoveCardOnFieldApi
+        {
+            auto location = validated_native_move_card_api(card_engine);
+            const auto module = GetModuleHandleW(L"Quantum-Win64-Shipping.exe");
+            const auto module_base = reinterpret_cast<std::uintptr_t>(module);
+            if (!module
+                || !std::equal(
+                    QueueMoveCardOnFieldSignature.begin(),
+                    QueueMoveCardOnFieldSignature.end(),
+                    reinterpret_cast<const std::uint8_t*>(
+                        module_base + QueueMoveCardOnFieldRva))
+                || !std::equal(
+                    MoveCardOnFieldConstructorSignature.begin(),
+                    MoveCardOnFieldConstructorSignature.end(),
+                    reinterpret_cast<const std::uint8_t*>(
+                        module_base + MoveCardOnFieldConstructorRva))
+                || !std::equal(
+                    MoveCardOnFieldExecuteSignature.begin(),
+                    MoveCardOnFieldExecuteSignature.end(),
+                    reinterpret_cast<const std::uint8_t*>(
+                        module_base + MoveCardOnFieldExecuteRva))
+                || !std::equal(
+                    QueuePlayCardToFieldSignature.begin(),
+                    QueuePlayCardToFieldSignature.end(),
+                    reinterpret_cast<const std::uint8_t*>(
+                        module_base + QueuePlayCardToFieldRva))
+                || !std::equal(
+                    PlayCardToFieldConstructorSignature.begin(),
+                    PlayCardToFieldConstructorSignature.end(),
+                    reinterpret_cast<const std::uint8_t*>(
+                        module_base + PlayCardToFieldConstructorRva))
+                || !std::equal(
+                    PlayCardToFieldExecuteSignature.begin(),
+                    PlayCardToFieldExecuteSignature.end(),
+                    reinterpret_cast<const std::uint8_t*>(
+                        module_base + PlayCardToFieldExecuteRva))
+                || !std::equal(
+                    DispatchCardPlayEffectsSignature.begin(),
+                    DispatchCardPlayEffectsSignature.end(),
+                    reinterpret_cast<const std::uint8_t*>(
+                        module_base + DispatchCardPlayEffectsRva))
+                || !std::equal(
+                    NativeGetCardPlacementSignature.begin(),
+                    NativeGetCardPlacementSignature.end(),
+                    reinterpret_cast<const std::uint8_t*>(
+                        module_base + NativeGetCardPlacementRva)))
+            {
+                throw std::runtime_error{
+                    "native move-card-on-field signatures did not match"};
+            }
+            return {
+                .location = location,
+                .queue_move_card_on_field =
+                    reinterpret_cast<QueueMoveCardOnFieldFunction>(
+                        module_base + QueueMoveCardOnFieldRva),
+                .queue_play_card_to_field =
+                    reinterpret_cast<QueuePlayCardToFieldFunction>(
+                        module_base + QueuePlayCardToFieldRva),
+                .get_card_placement = reinterpret_cast<NativeGetCardPlacementFunction>(
+                    module_base + NativeGetCardPlacementRva),
+            };
+        }
+
+        auto native_card_placement(const NativeMoveCardOnFieldApi& api,
+                                   const NativeCardReference& card)
+            -> std::optional<NativeCardPlacement>
+        {
+            if (!card.card || !card.state || !api.location.engine_state
+                || !api.get_card_placement
+                || !address_is_readable(
+                    static_cast<const std::byte*>(card.state)
+                        + CardStateSharedObjectOffset,
+                    sizeof(void*))
+                || !address_is_readable(
+                    static_cast<const std::byte*>(card.state)
+                        + CardStateSharedControllerOffset,
+                    sizeof(void*))
+                || !address_is_readable(
+                    static_cast<const std::byte*>(card.state)
+                        + CardStateEngineStateOffset,
+                    sizeof(void*))
+                || read_native_value<const void*>(
+                       card.state, CardStateEngineStateOffset)
+                    != api.location.engine_state)
+            {
+                return std::nullopt;
+            }
+
+            const auto* shared_object = read_native_value<const void*>(
+                card.state, CardStateSharedObjectOffset);
+            const auto* shared_controller = read_native_value<const void*>(
+                card.state, CardStateSharedControllerOffset);
+            if (!shared_object || !shared_controller
+                || !address_is_readable(
+                    static_cast<const std::byte*>(shared_object) + 0x18, 16)
+                || !address_is_writable(
+                    static_cast<const std::byte*>(shared_controller) + sizeof(void*),
+                    sizeof(std::int32_t)))
+            {
+                return std::nullopt;
+            }
+
+            const auto before_count = read_native_value<std::int32_t>(
+                shared_controller, sizeof(void*));
+            if (before_count <= 0 || before_count >= 1'000'000)
+            {
+                return std::nullopt;
+            }
+
+            // E21B30 accepts the card shared pointer by value and releases that
+            // temporary before returning. Balance the borrowed reference exactly as
+            // every native caller does before invoking it.
+            write_native_value(
+                shared_controller, sizeof(void*), before_count + 1);
+            NativeSharedPointerPair by_value{shared_object, shared_controller};
+            NativeCardPlacement placement{};
+            const auto* returned = api.get_card_placement(
+                api.location.engine_state, &placement, &by_value);
+            const auto after_count = read_native_value<std::int32_t>(
+                shared_controller, sizeof(void*));
+            if (after_count == before_count + 1)
+            {
+                // A mismatched ABI must not leak the temporary reference.
+                write_native_value(shared_controller, sizeof(void*), before_count);
+                append_route_c_trace(
+                    "field-move-probe.native-placement.reference-not-consumed");
+                return std::nullopt;
+            }
+            if (returned != &placement || after_count != before_count)
+            {
+                append_route_c_trace(
+                    "field-move-probe.native-placement.refcount-mismatch");
+                return std::nullopt;
+            }
+            return placement;
         }
 
         auto native_card_location(
@@ -7192,26 +7463,29 @@ namespace QuantumCheckpoint
                 api.engine_state, &empty, &target, &empty, destination, 0);
         }
 
-        auto move_card_probe_location(const PendingMoveCardProbe& pending)
-            -> std::optional<std::string>
+        auto is_valid_card_placement(const NativeCardPlacement& placement) -> bool
         {
-            const auto location = native_card_location(
-                pending.engine_state,
-                pending.card_state,
-                pending.get_card_location);
-            if (!location)
+            return placement.type == 1 && placement.index >= 0 && placement.index <= 4
+                && placement.row <= 2 && placement.side <= 1;
+        }
+
+        auto card_placements_equal(const NativeCardPlacement& left,
+                                   const NativeCardPlacement& right) -> bool
+        {
+            return left.type == right.type && left.index == right.index
+                && left.row == right.row && left.side == right.side;
+        }
+
+        auto card_placement_text(const NativeCardPlacement& placement) -> std::string
+        {
+            if (!is_valid_card_placement(placement))
             {
-                return std::nullopt;
+                return "INVALID";
             }
-            if (*location == 0)
-            {
-                return "HAND";
-            }
-            if (*location == 2)
-            {
-                return "TRASH";
-            }
-            return "OTHER";
+            const auto side = placement.side == 0 ? "PLAYER" : "ENEMY";
+            const auto row = placement.row == 0 ? "FRONT"
+                : placement.row == 1 ? "BACK" : "CORE";
+            return std::string{side} + ':' + row + ':' + std::to_string(placement.index);
         }
 
         auto move_card_probe_identity_is_valid(const PendingMoveCardProbe& pending) -> bool
@@ -7251,10 +7525,81 @@ namespace QuantumCheckpoint
                        pending.card, InGameCardStatePointerOffset) == pending.card_state
                 && read_native_value<const void*>(
                        pending.card_engine, CardEngineHealthStatePointerOffset)
-                    == pending.engine_state;
+                    == pending.engine_state
+                && pending.card->GetWorld() == pending.card_engine->GetWorld();
         }
 
-        auto queue_move_card_probe_action(
+        auto pending_move_card_on_field_api(const PendingMoveCardProbe& pending)
+            -> NativeMoveCardOnFieldApi
+        {
+            return {
+                .location = NativeMoveCardApi{
+                    .engine_state = pending.engine_state,
+                    .queue_move_card = pending.queue_move_card,
+                    .get_card_location = pending.get_card_location,
+                },
+                .queue_move_card_on_field = pending.queue_move_card_on_field,
+                .queue_play_card_to_field = pending.queue_play_card_to_field,
+                .get_card_placement = pending.get_card_placement,
+            };
+        }
+
+        auto move_card_probe_placement(const PendingMoveCardProbe& pending)
+            -> std::optional<NativeCardPlacement>
+        {
+            const auto location = native_card_location(
+                pending.engine_state, pending.card_state, pending.get_card_location);
+            if (!location || *location != 3)
+            {
+                return std::nullopt;
+            }
+            return native_card_placement(
+                pending_move_card_on_field_api(pending),
+                NativeCardReference{.card = pending.card, .state = pending.card_state});
+        }
+
+        auto queue_move_card_probe_action(const PendingMoveCardProbe& pending,
+                                          const NativeCardPlacement& destination) -> void
+        {
+            if (!move_card_probe_identity_is_valid(pending)
+                || !is_valid_card_placement(destination)
+                || !pending.queue_move_card_on_field)
+            {
+                throw std::runtime_error{"move-card target identity is no longer valid"};
+            }
+            const auto location = native_card_location(
+                pending.engine_state, pending.card_state, pending.get_card_location);
+            if (!location || *location != 3)
+            {
+                throw std::runtime_error{"move-card target is no longer on the field"};
+            }
+            const auto* shared_object = read_native_value<const void*>(
+                pending.card_state, CardStateSharedObjectOffset);
+            const auto* shared_controller = read_native_value<const void*>(
+                pending.card_state, CardStateSharedControllerOffset);
+            if (!shared_object || !shared_controller
+                || !address_is_readable(
+                    static_cast<const std::byte*>(shared_controller) + sizeof(void*),
+                    sizeof(std::int32_t))
+                || read_native_value<std::int32_t>(
+                       shared_controller, sizeof(void*)) <= 0)
+            {
+                throw std::runtime_error{
+                    "move-card-on-field shared ownership did not pass validation"};
+            }
+            const NativeSharedPointerPair empty{};
+            const NativeSharedPointerPair target{shared_object, shared_controller};
+            pending.queue_move_card_on_field(
+                pending.engine_state,
+                &empty,
+                &target,
+                &destination,
+                0,
+                0,
+                0);
+        }
+
+        auto queue_move_card_probe_location_action(
             const PendingMoveCardProbe& pending, std::uint8_t destination) -> void
         {
             if (!move_card_probe_identity_is_valid(pending))
@@ -7271,29 +7616,192 @@ namespace QuantumCheckpoint
                 destination);
         }
 
+        auto restore_move_card_probe_effect_list(PendingMoveCardProbe& pending)
+            -> bool
+        {
+            if (!pending.effects_suppressed)
+            {
+                pending.result.effect_list_restored = true;
+                return true;
+            }
+            if (!pending.native_card_object
+                || !address_is_readable(
+                    static_cast<const std::byte*>(pending.native_card_object)
+                        + NativeCardEffectListPointerOffset,
+                    sizeof(void*) + sizeof(std::int32_t) * 2)
+                || !address_is_writable(
+                    static_cast<const std::byte*>(pending.native_card_object)
+                        + NativeCardEffectListCountOffset,
+                    sizeof(std::int32_t)))
+            {
+                return false;
+            }
+            const auto* current_pointer = read_native_value<const void*>(
+                pending.native_card_object, NativeCardEffectListPointerOffset);
+            const auto current_count = read_native_value<std::int32_t>(
+                pending.native_card_object, NativeCardEffectListCountOffset);
+            const auto current_capacity = read_native_value<std::int32_t>(
+                pending.native_card_object, NativeCardEffectListCapacityOffset);
+            if (current_pointer != pending.effect_list_pointer || current_count != 0
+                || current_capacity != pending.effect_list_capacity
+                || current_capacity < pending.effect_list_count)
+            {
+                return false;
+            }
+            write_native_value(
+                pending.native_card_object,
+                NativeCardEffectListCountOffset,
+                pending.effect_list_count);
+            const auto restored_count = read_native_value<std::int32_t>(
+                pending.native_card_object, NativeCardEffectListCountOffset);
+            const auto* restored_pointer = read_native_value<const void*>(
+                pending.native_card_object, NativeCardEffectListPointerOffset);
+            const auto restored_capacity = read_native_value<std::int32_t>(
+                pending.native_card_object, NativeCardEffectListCapacityOffset);
+            if (restored_count != pending.effect_list_count
+                || restored_pointer != pending.effect_list_pointer
+                || restored_capacity != pending.effect_list_capacity)
+            {
+                return false;
+            }
+            pending.effects_suppressed = false;
+            pending.result.effect_list_restored = true;
+            append_route_c_trace("field-move-probe.effects.restored");
+            return true;
+        }
+
+        auto suppress_move_card_probe_effect_list(PendingMoveCardProbe& pending)
+            -> void
+        {
+            if (!pending.native_card_object || pending.effect_list_count < 0
+                || pending.effect_list_capacity < pending.effect_list_count
+                || pending.effect_list_capacity > 256
+                || !address_is_writable(
+                    static_cast<const std::byte*>(pending.native_card_object)
+                        + NativeCardEffectListCountOffset,
+                    sizeof(std::int32_t)))
+            {
+                throw std::runtime_error{
+                    "card play-effect list did not pass guarded write validation"};
+            }
+            const std::int32_t suppressed_count{};
+            write_native_value(
+                pending.native_card_object,
+                NativeCardEffectListCountOffset,
+                suppressed_count);
+            pending.effects_suppressed = true;
+            if (read_native_value<std::int32_t>(
+                    pending.native_card_object, NativeCardEffectListCountOffset) != 0)
+            {
+                throw std::runtime_error{"card play-effect list suppression failed"};
+            }
+            append_route_c_trace("field-move-probe.effects.suppressed");
+        }
+
+        auto queue_move_card_probe_play_action(PendingMoveCardProbe& pending) -> void
+        {
+            if (!move_card_probe_identity_is_valid(pending)
+                || !is_valid_card_placement(pending.target)
+                || !pending.queue_play_card_to_field)
+            {
+                throw std::runtime_error{"play-card target identity is no longer valid"};
+            }
+            const auto location = native_card_location(
+                pending.engine_state, pending.card_state, pending.get_card_location);
+            if (!location || *location != 0)
+            {
+                throw std::runtime_error{"play-card target is no longer in HAND"};
+            }
+            const auto* shared_object = read_native_value<const void*>(
+                pending.card_state, CardStateSharedObjectOffset);
+            const auto* shared_controller = read_native_value<const void*>(
+                pending.card_state, CardStateSharedControllerOffset);
+            if (shared_object != pending.native_card_object || !shared_controller
+                || !address_is_readable(
+                    static_cast<const std::byte*>(shared_controller) + sizeof(void*),
+                    sizeof(std::int32_t))
+                || read_native_value<std::int32_t>(
+                       shared_controller, sizeof(void*)) <= 0)
+            {
+                throw std::runtime_error{
+                    "play-card shared ownership did not pass validation"};
+            }
+            suppress_move_card_probe_effect_list(pending);
+            const NativeSharedPointerPair empty{};
+            const NativeSharedPointerPair target{shared_object, shared_controller};
+            pending.queue_play_card_to_field(
+                pending.engine_state,
+                &empty,
+                &target,
+                &pending.target,
+                0,
+                0,
+                0,
+                0,
+                0);
+        }
+
         auto complete_move_card_probe(std::string status, std::string reason) -> void
         {
             if (!g_pending_move_card_probe)
             {
                 return;
             }
-            auto result = g_pending_move_card_probe->result;
+            auto& pending = *g_pending_move_card_probe;
+            if (!restore_move_card_probe_effect_list(pending))
+            {
+                status = "failed";
+                reason += "; card play-effect list could not be restored safely";
+            }
+            auto result = pending.result;
             result.status = std::move(status);
             result.reason = std::move(reason);
             g_pending_move_card_probe.reset();
             const auto path = write_move_card_probe_report(result);
             Output::send<LogLevel::Verbose>(
-                STR("[QuantumCheckpoint] Move-card probe {}: {}; report: {}\n"),
+                STR("[QuantumCheckpoint] Field-move probe {}: {}; report: {}\n"),
                 to_wstring(result.status),
                 to_wstring(result.reason),
                 path.wstring());
+        }
+
+        auto begin_move_card_probe_rollback(std::string reason) -> void
+        {
+            if (!g_pending_move_card_probe)
+            {
+                return;
+            }
+            auto& pending = *g_pending_move_card_probe;
+            const auto location = native_card_location(
+                pending.engine_state, pending.card_state, pending.get_card_location);
+            if (location && *location == 0)
+            {
+                pending.result.restored_location = "HAND";
+                complete_move_card_probe(
+                    "failed", std::move(reason) + "; source hand remained intact");
+                return;
+            }
+            if (!location)
+            {
+                complete_move_card_probe(
+                    "failed", std::move(reason) + "; automatic rollback was unavailable");
+                return;
+            }
+            pending.failure_before_rollback = std::move(reason);
+            append_route_c_trace("field-move-probe.rollback.begin");
+            queue_move_card_probe_location_action(pending, 0);
+            append_route_c_trace("field-move-probe.rollback.queued");
+            pending.phase = MoveCardProbePhase::AwaitingRestore;
+            pending.phase_started_at = std::chrono::steady_clock::now();
         }
 
         auto run_move_card_probe() -> void
         {
             MoveCardProbeResult result{};
             result.requested_hold_milliseconds = TimedMoveCardProbeHold.count();
-            result.used_default_move_type = true;
+            result.used_zero_queue_mode = true;
+            result.used_resolve_occupied_slot = false;
+            result.used_find_fallback_slot = false;
             try
             {
                 if (g_pending_move_card_probe || g_pending_health_write_probe
@@ -7316,8 +7824,9 @@ namespace QuantumCheckpoint
                 {
                     throw std::runtime_error{"a complete active battle was not found"};
                 }
-                const auto api = validated_native_move_card_api(objects.card_engine);
-                append_route_c_trace("move-card-probe.signatures.verified");
+                const auto api = validated_native_move_card_on_field_api(
+                    objects.card_engine);
+                append_route_c_trace("field-move-probe.signatures.verified");
                 if (required_text(
                         export_property_text(objects.card_engine, STR("currentGameState")),
                         "CardEngine.currentGameState") != "OPEN")
@@ -7336,91 +7845,215 @@ namespace QuantumCheckpoint
                 {
                     throw std::runtime_error{"a card prompt is active"};
                 }
-                const auto* engine_state = api.engine_state;
-
-                UObject* target{};
-                const void* target_state{};
-                std::string target_full_name{};
-                UObjectGlobals::ForEachUObject([&](UObject* object,
-                                                    [[maybe_unused]] int32_t object_index,
-                                                    [[maybe_unused]] int32_t chunk_index) {
-                    if (!object || target)
-                    {
-                        return LoopAction::Continue;
-                    }
-                    const auto full_name = to_string(object->GetFullName());
-                    if (classify(full_name) != "BP_InGameCard_C"
-                        || !is_live_instance(full_name, "BP_InGameCard_C"))
-                    {
-                        return LoopAction::Continue;
-                    }
-                    if (!address_is_readable(
-                            static_cast<const std::byte*>(static_cast<const void*>(object))
-                                + InGameCardStatePointerOffset,
-                            sizeof(void*)))
-                    {
-                        return LoopAction::Continue;
-                    }
-                    const auto* state = read_native_value<const void*>(
-                        object, InGameCardStatePointerOffset);
-                    if (!state
-                        || !address_is_readable(
-                            static_cast<const std::byte*>(state)
-                                + CardStateEngineStateOffset,
-                            sizeof(void*))
-                        || read_native_value<const void*>(
-                               state, CardStateEngineStateOffset) != engine_state)
-                    {
-                        return LoopAction::Continue;
-                    }
-                    const auto location = native_card_location(
-                        engine_state, state, api.get_card_location);
-                    if (!location || *location != 0)
-                    {
-                        return LoopAction::Continue;
-                    }
-                    target = object;
-                    target_state = state;
-                    target_full_name = full_name;
-                    return LoopAction::Continue;
-                });
-                if (!target || !target_state)
+                const auto* engine_state = api.location.engine_state;
+                const auto field_cards = native_cards_at_location(
+                    objects.card_engine, api.location, 3);
+                std::vector<NativeCardPlacement> occupied{};
+                for (const auto& card : field_cards)
                 {
-                    throw std::runtime_error{"no live hand card passed all safety checks"};
+                    const auto placement = native_card_placement(api, card);
+                    if (!placement || !is_valid_card_placement(*placement))
+                    {
+                        throw std::runtime_error{
+                            "a live field card did not expose a guarded placement"};
+                    }
+                    if (std::any_of(
+                            occupied.begin(),
+                            occupied.end(),
+                            [&](const auto& value) {
+                                return card_placements_equal(value, *placement);
+                            }))
+                    {
+                        throw std::runtime_error{
+                            "duplicate live cards reported the same field slot"};
+                    }
+                    occupied.push_back(*placement);
                 }
-                append_route_c_trace("move-card-probe.target.selected");
 
-                result.card_full_name = std::move(target_full_name);
+                const auto hand_cards = native_cards_at_location(
+                    objects.card_engine, api.location, 0);
+                if (hand_cards.empty())
+                {
+                    throw std::runtime_error{
+                        "no live hand card passed the guarded native location checks"};
+                }
+                std::optional<NativeCardReference> selected_card{};
+                std::string selected_tag{};
+                constexpr std::array<std::string_view, 3> plain_fruit_priority{
+                    "naturalApple", "naturalLemon", "naturalSpring",
+                };
+                for (const auto desired_tag : plain_fruit_priority)
+                {
+                    for (const auto& card : hand_cards)
+                    {
+                        const auto tag = export_zero_argument_getter(
+                            card.card, STR("getTag"));
+                        if (tag && tag->value == desired_tag)
+                        {
+                            selected_card = card;
+                            selected_tag = tag->value;
+                            break;
+                        }
+                    }
+                    if (selected_card)
+                    {
+                        break;
+                    }
+                }
+                if (!selected_card)
+                {
+                    throw std::runtime_error{
+                        "no allowlisted plain fruit card was found in HAND"};
+                }
+                const auto selected = *selected_card;
+                NativeCardPlacement destination{};
+                bool found_destination{};
+                for (std::uint8_t row{}; row <= 1 && !found_destination; ++row)
+                {
+                    for (std::int32_t index{}; index <= 4; ++index)
+                    {
+                        NativeCardPlacement proposed{};
+                        proposed.type = 1;
+                        proposed.index = index;
+                        proposed.row = row;
+                        proposed.side = 0;
+                        const auto is_occupied = std::any_of(
+                            occupied.begin(),
+                            occupied.end(),
+                            [&](const auto& value) {
+                                return card_placements_equal(value, proposed);
+                            });
+                        if (!is_occupied)
+                        {
+                            destination = proposed;
+                            found_destination = true;
+                            break;
+                        }
+                    }
+                }
+                if (!found_destination)
+                {
+                    throw std::runtime_error{
+                        "no empty player field slot was found"};
+                }
+                append_route_c_trace("field-move-probe.target.selected");
+
+                result.card_full_name = to_string(selected.card->GetFullName());
+                result.card_tag = selected_tag;
+                result.selected_plain_fruit = true;
+                if (auto id = export_zero_argument_getter(
+                        selected.card, STR("getId")))
+                {
+                    result.card_id = std::move(id->value);
+                }
                 result.before_location = "HAND";
-                result.state_address = reinterpret_cast<std::uintptr_t>(target_state);
+                result.before_placement = "NOT_ON_FIELD";
+                result.target_placement = card_placement_text(destination);
+                result.state_address = reinterpret_cast<std::uintptr_t>(
+                    selected.state);
                 result.engine_state_address = reinterpret_cast<std::uintptr_t>(engine_state);
+                if (!address_is_readable(
+                        static_cast<const std::byte*>(selected.state)
+                            + CardStateSharedObjectOffset,
+                        sizeof(void*)))
+                {
+                    throw std::runtime_error{
+                        "selected card native object pointer is unreadable"};
+                }
+                const auto* native_card_object = read_native_value<const void*>(
+                    selected.state, CardStateSharedObjectOffset);
+                if (!native_card_object
+                    || !address_is_readable(
+                        static_cast<const std::byte*>(native_card_object)
+                            + NativeCardEffectListPointerOffset,
+                        sizeof(void*) + sizeof(std::int32_t) * 2)
+                    || !address_is_writable(
+                        static_cast<const std::byte*>(native_card_object)
+                            + NativeCardEffectListCountOffset,
+                        sizeof(std::int32_t)))
+                {
+                    throw std::runtime_error{
+                        "selected card play-effect list header is not readable and writable"};
+                }
+                const auto* effect_list_pointer = read_native_value<const void*>(
+                    native_card_object, NativeCardEffectListPointerOffset);
+                const auto effect_list_count = read_native_value<std::int32_t>(
+                    native_card_object, NativeCardEffectListCountOffset);
+                const auto effect_list_capacity = read_native_value<std::int32_t>(
+                    native_card_object, NativeCardEffectListCapacityOffset);
+                if (effect_list_count <= 0 || effect_list_count > 64
+                    || effect_list_capacity < effect_list_count
+                    || effect_list_capacity > 256 || !effect_list_pointer
+                    || !address_is_readable(
+                        effect_list_pointer,
+                        static_cast<std::size_t>(effect_list_count)
+                            * sizeof(NativeSharedPointerPair)))
+                {
+                    throw std::runtime_error{
+                        "selected card play-effect list layout did not pass validation"};
+                }
+                for (std::int32_t index{}; index < effect_list_count; ++index)
+                {
+                    const auto effect = read_native_value<NativeSharedPointerPair>(
+                        effect_list_pointer,
+                        static_cast<std::size_t>(index)
+                            * sizeof(NativeSharedPointerPair));
+                    if (!effect.object || !effect.controller
+                        || !address_is_readable(
+                            static_cast<const std::byte*>(effect.object) + 0x90,
+                            sizeof(std::uint8_t))
+                        || !address_is_readable(
+                            static_cast<const std::byte*>(effect.controller)
+                                + sizeof(void*),
+                            sizeof(std::int32_t))
+                        || read_native_value<std::int32_t>(
+                               effect.controller, sizeof(void*)) <= 0)
+                    {
+                        throw std::runtime_error{
+                            "selected card play-effect entry did not pass validation"};
+                    }
+                }
+                result.suppressed_effect_count = effect_list_count;
                 const auto now = std::chrono::steady_clock::now();
                 g_pending_move_card_probe.emplace(PendingMoveCardProbe{
                     .result = std::move(result),
-                    .card = target,
+                    .card = selected.card,
                     .card_engine = objects.card_engine,
-                    .card_state = target_state,
+                    .card_state = selected.state,
                     .engine_state = engine_state,
-                    .queue_move_card = api.queue_move_card,
-                    .get_card_location = api.get_card_location,
-                    .phase = MoveCardProbePhase::AwaitingTrash,
+                    .queue_move_card = api.location.queue_move_card,
+                    .queue_move_card_on_field = api.queue_move_card_on_field,
+                    .queue_play_card_to_field = api.queue_play_card_to_field,
+                    .get_card_location = api.location.get_card_location,
+                    .get_card_placement = api.get_card_placement,
+                    .native_card_object = native_card_object,
+                    .effect_list_pointer = effect_list_pointer,
+                    .effect_list_count = effect_list_count,
+                    .effect_list_capacity = effect_list_capacity,
+                    .target = destination,
+                    .phase = MoveCardProbePhase::AwaitingTarget,
                     .started_at = now,
                     .phase_started_at = now,
                 });
-                append_route_c_trace("move-card-probe.queue-trash.begin");
-                queue_move_card_probe_action(*g_pending_move_card_probe, 2);
-                append_route_c_trace("move-card-probe.queue-trash.complete");
+                append_route_c_trace("field-move-probe.queue-play-field.begin");
+                queue_move_card_probe_play_action(*g_pending_move_card_probe);
+                append_route_c_trace("field-move-probe.queue-play-field.complete");
                 Output::send<LogLevel::Verbose>(
-                    STR("[QuantumCheckpoint] Move-card probe queued HAND -> TRASH with DEFAULT move type; do not interact.\n"));
+                    STR("[QuantumCheckpoint] Effect-suppressed plain-fruit probe queued HAND -> {}; do not interact.\n"),
+                    to_wstring(g_pending_move_card_probe->result.target_placement));
             }
             catch (const std::exception& error)
             {
-                g_pending_move_card_probe.reset();
+                if (g_pending_move_card_probe)
+                {
+                    complete_move_card_probe("refused", error.what());
+                    return;
+                }
                 result.status = "refused";
                 result.reason = error.what();
                 const auto path = write_move_card_probe_report(result);
                 Output::send<LogLevel::Warning>(
-                    STR("[QuantumCheckpoint] Move-card probe refused: {}; report: {}\n"),
+                    STR("[QuantumCheckpoint] Field-move probe refused: {}; report: {}\n"),
                     to_wstring(result.reason), path.wstring());
             }
         }
@@ -7441,41 +8074,86 @@ namespace QuantumCheckpoint
                         "failed", "target identity changed during the move-card probe");
                     return;
                 }
-                const auto location = move_card_probe_location(pending);
+                const auto location = native_card_location(
+                    pending.engine_state, pending.card_state, pending.get_card_location);
                 if (!location)
                 {
                     if (now - pending.phase_started_at > MoveCardProbeTimeout)
                     {
                         complete_move_card_probe(
-                            "failed", "card location getter remained unavailable");
+                            "failed", "card location remained unavailable");
                     }
                     return;
                 }
 
                 switch (pending.phase)
                 {
-                case MoveCardProbePhase::AwaitingTrash:
-                    if (*location == "TRASH")
+                case MoveCardProbePhase::AwaitingTarget:
+                {
+                    if (*location == 3)
                     {
-                        pending.result.trash_location = *location;
-                        pending.phase = MoveCardProbePhase::HoldingInTrash;
+                        if (!restore_move_card_probe_effect_list(pending))
+                        {
+                            complete_move_card_probe(
+                                "failed",
+                                "card reached FIELD but its play-effect list changed unexpectedly");
+                            return;
+                        }
+                        pending.result.staged_location = "FIELD";
+                    }
+                    else
+                    {
+                        if (now - pending.phase_started_at > MoveCardProbeTimeout)
+                        {
+                            begin_move_card_probe_rollback(
+                                "effect-suppressed HAND -> FIELD action did not reach FIELD");
+                        }
+                        return;
+                    }
+
+                    const auto placement = move_card_probe_placement(pending);
+                    if (!placement)
+                    {
+                        begin_move_card_probe_rollback(
+                            "played FIELD card did not expose an exact placement");
+                        return;
+                    }
+                    pending.result.initial_field_placement =
+                        card_placement_text(*placement);
+                    if (card_placements_equal(*placement, pending.target))
+                    {
+                        pending.result.during_placement = card_placement_text(*placement);
+                        pending.phase = MoveCardProbePhase::HoldingAtTarget;
                         pending.phase_started_at = now;
                         Output::send<LogLevel::Verbose>(
-                            STR("[QuantumCheckpoint] Move-card probe reached TRASH; holding briefly.\n"));
+                            STR("[QuantumCheckpoint] Field-move probe reached the empty target slot; holding briefly.\n"));
                     }
-                    else if (now - pending.phase_started_at > MoveCardProbeTimeout)
+                    else
                     {
-                        pending.result.restored_location = *location;
-                        complete_move_card_probe(
-                            "failed", "HAND -> TRASH action did not reach TRASH");
+                        begin_move_card_probe_rollback(
+                            "play-card action reached the wrong field slot");
                     }
                     break;
-                case MoveCardProbePhase::HoldingInTrash:
-                    if (*location != "TRASH")
+                }
+                case MoveCardProbePhase::HoldingAtTarget:
+                {
+                    if (*location != 3)
                     {
-                        pending.result.restored_location = *location;
-                        complete_move_card_probe(
-                            "failed", "card moved independently during the TRASH hold");
+                        begin_move_card_probe_rollback(
+                            "staged card left FIELD during the target-slot hold");
+                        return;
+                    }
+                    const auto placement = move_card_probe_placement(pending);
+                    if (!placement)
+                    {
+                        begin_move_card_probe_rollback(
+                            "target placement became unavailable during the hold");
+                        return;
+                    }
+                    if (!card_placements_equal(*placement, pending.target))
+                    {
+                        begin_move_card_probe_rollback(
+                            "card moved independently during the target-slot hold");
                         return;
                     }
                     if (now - pending.phase_started_at >= TimedMoveCardProbeHold)
@@ -7484,36 +8162,63 @@ namespace QuantumCheckpoint
                             std::chrono::duration_cast<std::chrono::milliseconds>(
                                 now - pending.phase_started_at).count();
                         pending.result.identity_validated_before_restore = true;
-                        append_route_c_trace("move-card-probe.queue-hand.begin");
-                        queue_move_card_probe_action(pending, 0);
-                        append_route_c_trace("move-card-probe.queue-hand.complete");
+                        append_route_c_trace("field-move-probe.queue-hand.begin");
+                        queue_move_card_probe_location_action(pending, 0);
+                        append_route_c_trace("field-move-probe.queue-hand.complete");
                         pending.phase = MoveCardProbePhase::AwaitingRestore;
                         pending.phase_started_at = now;
                         Output::send<LogLevel::Verbose>(
-                            STR("[QuantumCheckpoint] Move-card probe queued TRASH -> HAND rollback.\n"));
+                            STR("[QuantumCheckpoint] Field-staging probe queued rollback to HAND.\n"));
                     }
                     break;
+                }
                 case MoveCardProbePhase::AwaitingRestore:
-                    if (*location == "HAND")
+                    if (*location == 0)
                     {
-                        pending.result.restored_location = *location;
-                        complete_move_card_probe(
-                            "passed",
-                            "native DEFAULT move action reached TRASH and restored HAND");
+                        pending.result.restored_placement = "NOT_ON_FIELD";
+                        pending.result.restored_location = "HAND";
+                        if (pending.failure_before_rollback.empty())
+                        {
+                            complete_move_card_probe(
+                                "passed",
+                                "effect-suppressed native play reached the exact FIELD slot and restored HAND");
+                        }
+                        else
+                        {
+                            complete_move_card_probe(
+                                "failed",
+                                pending.failure_before_rollback
+                                    + "; automatic source-slot rollback completed");
+                        }
                     }
                     else if (now - pending.phase_started_at > MoveCardProbeTimeout)
                     {
-                        pending.result.restored_location = *location;
+                        if (*location == 3)
+                        {
+                            const auto placement = move_card_probe_placement(pending);
+                            pending.result.restored_placement = placement
+                                ? card_placement_text(*placement) : "UNAVAILABLE";
+                        }
                         complete_move_card_probe(
-                            "failed", "TRASH -> HAND rollback did not reach HAND");
+                            "failed", "FIELD -> HAND rollback did not complete");
                     }
                     break;
                 }
             }
             catch (const std::exception& error)
             {
-                complete_move_card_probe(
-                    "failed", "exception during move-card probe: " + std::string{error.what()});
+                try
+                {
+                    begin_move_card_probe_rollback(
+                        "exception during field-move probe: " + std::string{error.what()});
+                }
+                catch (const std::exception& rollback_error)
+                {
+                    complete_move_card_probe(
+                        "failed",
+                        "field-move probe and rollback both failed: "
+                            + std::string{rollback_error.what()});
+                }
             }
         }
     } // namespace

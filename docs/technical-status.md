@@ -1,6 +1,6 @@
 # 技术状态与已知事实
 
-最后更新：2026-09-08。
+最后更新：2026-09-09。
 
 ## 环境
 
@@ -37,6 +37,7 @@
 - v0.13.0 将未满角色充能存入与 Route C 负载绑定的独立 schema 1 补充文件。恢复只允许公开 `addCharacterAbilityCharge` 的正向差值，需求值不一致或实时值已高于目标时拒绝写入；`4/6` 样本恢复后的 UI、Getter 和语义比较均一致，`characterResourceEqual=True`。满充能因可能创建能力卡而继续排除。详见 [phase-11-character-charge.md](phase-11-character-charge.md)。
 - v0.14.0 确认 `AInGameCard + 0x228` 的共享原生状态可由完整 `getCardLocation` 包装器安全读取，并通过原生 `Action_MoveCard` 入队函数与 `DEFAULT` 类型在 `HAND/DECK/TRASH` 间迁移。引用保活修复后的往返探针保持卡牌身份、顺序和全部语义状态；正式恢复使用独立 schema 1 墓地补充、固定顺序启动、混合牌库/手牌暂存识别、逐卡原位置回滚和三区严格 Getter 复核。最终主菜单恢复为 `passed / exactPlayerTrashStatus=verified`，用户确认 UI 墓地顺序正确。详见 [phase-12-player-trash.md](phase-12-player-trash.md)。
 - v0.15.0 纠正了此前把 `CardEngine:getTurnCount()` 当作玩家可见抽牌进度的错误。真实抽牌延迟来自 CardEngine 原生状态 `+0x48/+0x50` 所持 Deck 状态的 `+0x68/+0x6C` 之和；受保护探针把修正量临时改为 `-1` 时，Getter 和 UI 均按 `5→4→5` 变化并自动回滚。正式 schema 1 补充同时保存全局回合、抽牌延迟和累计威胁，只有三项跨帧全部一致才 `verified`。`waveIndex=1` 样本从启动 `0/5/0` 恢复为 `14/3/5`，完全重启和同进程第二轮均通过。详见 [phase-13-turn-progress.md](phase-13-turn-progress.md)。
+- 玩家场上恢复的两个原生位置原语已实机闭合：`Action_MoveCardOnField` 连续两轮把同一卡从 `PLAYER:BACK:0` 精确移动到 `BACK:1` 再原位回滚；`Action_PlayCardToFieldResolve` 在效果数组数量临时置零的保护窗口内，把 `naturalApple` 从 HAND 精确落到 `PLAYER:FRONT:0`，恢复效果数组后再回到 HAND，用户确认没有触发入场效果。通用 `Action_MoveCard` 的 `FIELD` 目的地只移除来源、不插入场地，已经明确禁用。详见 [phase-14-player-field-primitives.md](phase-14-player-field-primitives.md)。
 
 - C++ 模组可由 UE4SS 3.0.1 正常加载；首份 `Ctrl+F11` 报告成功写入 `Mods/QuantumCheckpoint/Reports`。游戏自身也会把 `F11` 解释为窗口模式切换，因此后续版本改用 `Ctrl+F1`。
 - 第一版 C++ 报告成功读取实时生命 `9/9`、战斗状态 `OPEN`、无限模式 Spawner 的波次索引与倒计时等字段。
