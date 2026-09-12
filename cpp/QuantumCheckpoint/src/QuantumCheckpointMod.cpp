@@ -63,6 +63,9 @@ namespace QuantumCheckpoint
         std::atomic_bool g_route_c_save_requested{false};
         std::atomic_bool g_route_c_load_requested{false};
         std::atomic_bool g_unreal_ready{false};
+        std::atomic_bool g_game_update_requested{false};
+        std::atomic<DWORD> g_game_thread_id{};
+        std::atomic<void(*)()> g_game_thread_pump{};
 
         struct ExecutableFingerprint
         {
@@ -105,12 +108,31 @@ namespace QuantumCheckpoint
             std::uint8_t origin{};
         };
 
+        struct PendingNativeFieldMove
+        {
+            UObject* card{};
+            const void* state{};
+            std::uint8_t origin{};
+            const void* native_card_object{};
+            const void* effect_list_pointer{};
+            std::int32_t effect_list_count{};
+            std::int32_t effect_list_capacity{};
+            std::int32_t row{};
+            std::int32_t index{};
+            std::int32_t target_health{};
+            bool original_turn_active{};
+            bool target_turn_active{};
+            bool turn_active_written{};
+            bool effects_suppressed{};
+        };
+
         struct PendingRouteCRestore
         {
             RouteCCheckpoint checkpoint{};
             std::optional<ExactSpawnPlanCheckpoint> exact_spawn_plan{};
             std::optional<ExactPlayerZonesCheckpoint> exact_player_zones{};
             std::optional<ExactPlayerTrashCheckpoint> exact_player_trash{};
+            std::optional<ExactPlayerFieldCheckpoint> exact_player_field{};
             std::optional<ExactCharacterChargeCheckpoint> exact_character_charge{};
             std::optional<ExactTurnProgressCheckpoint> exact_turn_progress{};
             std::string exact_player_startup_decklist{};
@@ -118,6 +140,7 @@ namespace QuantumCheckpoint
             RouteCRestorePhase phase{RouteCRestorePhase::AwaitingWaveIntercept};
             std::chrono::steady_clock::time_point started_at{};
             std::chrono::steady_clock::time_point phase_ready_at{};
+            std::chrono::steady_clock::time_point stability_deadline{};
             UObject* intercepted_spawner{};
             const void* intercepted_world{};
             bool auto_spawn_suppressed{};
@@ -130,20 +153,23 @@ namespace QuantumCheckpoint
             const void* exact_turn_progress_engine_state{};
             const void* exact_turn_progress_deck_state{};
             const void* exact_turn_progress_deck_state_controller{};
-            std::optional<std::int32_t> exact_turn_progress_original_turn{};
-            std::optional<std::int32_t> exact_turn_progress_original_draw_base{};
-            std::optional<std::int32_t> exact_turn_progress_original_draw_adjustment{};
-            std::optional<std::int32_t> exact_turn_progress_applied_draw_adjustment{};
-            std::optional<std::int32_t> exact_turn_progress_original_wave_alert{};
+            std::optional<bool> exact_turn_progress_target_can_click_to_draw{};
             std::optional<std::int32_t> exact_turn_progress_observed_turn{};
             std::optional<std::int32_t> exact_turn_progress_observed_draw_delay{};
             std::optional<std::int32_t> exact_turn_progress_observed_wave_alert{};
+            std::optional<bool> exact_turn_progress_observed_can_click_to_draw{};
             std::optional<std::chrono::steady_clock::time_point> empty_player_state_since{};
+            std::optional<std::chrono::steady_clock::time_point> startup_open_since{};
+            bool startup_settled{};
             std::optional<std::chrono::steady_clock::time_point>
                 exact_player_zone_mismatch_since{};
             std::optional<std::chrono::steady_clock::time_point>
                 exact_player_trash_move_started_at{};
             std::vector<PendingNativeTrashMove> exact_player_trash_targets{};
+            std::vector<PendingNativeFieldMove> exact_player_field_targets{};
+            std::size_t exact_player_field_target_index{};
+            std::optional<std::chrono::steady_clock::time_point>
+                exact_player_field_move_started_at{};
             std::string original_auto_spawn{};
             std::string original_spawn_list{};
             std::string exact_spawn_plan_status{"unavailable"};
@@ -152,6 +178,9 @@ namespace QuantumCheckpoint
             std::string exact_player_zones_reason{};
             std::string exact_player_trash_status{"unavailable"};
             std::string exact_player_trash_reason{};
+            std::string exact_player_field_status{"unavailable"};
+            std::string exact_player_field_reason{};
+            std::size_t exact_player_field_turn_active_mismatches{};
             std::string exact_character_charge_status{"unavailable"};
             std::string exact_character_charge_reason{};
             std::string exact_turn_progress_status{"unavailable"};
@@ -162,6 +191,10 @@ namespace QuantumCheckpoint
             std::chrono::steady_clock::time_point next_diagnostic_at{};
             std::string status{"running"};
             std::string reason{};
+            std::optional<std::int32_t> exact_turn_progress_observed_draw_base{};
+            std::optional<std::int32_t> exact_turn_progress_observed_draw_adjustment{};
+            bool semantic_fallback{};
+            std::string fallback_reason{};
         };
 
         struct PendingRouteCCapture
@@ -180,6 +213,12 @@ namespace QuantumCheckpoint
 
         std::optional<ExecutableFingerprint> g_executable_fingerprint{};
         std::optional<PendingRouteCRestore> g_pending_route_c_restore{};
+        struct PendingRouteCFallback
+        {
+            RouteCCheckpoint checkpoint{};
+            std::string reason{};
+        };
+        std::optional<PendingRouteCFallback> g_pending_route_c_fallback{};
         std::optional<RouteCCheckpoint> g_last_completed_route_c_checkpoint{};
         std::optional<PendingRouteCCapture> g_pending_route_c_capture{};
         std::optional<RouteCWaveObservation> g_route_c_wave_observation{};
@@ -218,7 +257,7 @@ namespace QuantumCheckpoint
             "UMG_CardEffectDisplay_C ",
         };
 
-        constexpr std::array<StringViewType, 60> CandidateProperties{
+        constexpr std::array<StringViewType, 61> CandidateProperties{
             STR("currentWaveIndex"),
             STR("lastWaveIndex"),
             STR("currentTurnCountdown"),
@@ -278,6 +317,7 @@ namespace QuantumCheckpoint
             STR("rowType"),
             STR("SlotIndex"),
             STR("boardSide"),
+            STR("currentCanClickToDraw"),
         };
 
         constexpr std::array<StringViewType, 5> GameInstanceGetters{
@@ -383,6 +423,7 @@ namespace QuantumCheckpoint
         constexpr std::size_t CardStateCurrentHealthOffset = 0x11C;
         constexpr std::size_t CardStateTurnAdjustmentOffset = 0x194;
         constexpr std::size_t CardStateTurnBaseOffset = 0x198;
+        constexpr std::size_t CardStateTurnActiveOffset = 0x19C;
         constexpr std::uintmax_t ExpectedGameExecutableSize = 82'718'720;
         constexpr std::string_view ExpectedGameExecutableSha256 =
             "0DCF220317FA31667C14DD7FB41A6757B94FF7CDE2262E5A87337D00CCB017A6";
@@ -397,6 +438,8 @@ namespace QuantumCheckpoint
         constexpr std::uintptr_t NativeControllerDeckTurnDrawDelayResolverRva = 0xF9F300;
         constexpr std::uintptr_t NativeDeckTurnDrawDelayGetterRva = 0xE323D0;
         constexpr std::uintptr_t NativeCurrentTurnGetterRva = 0xE323C0;
+        constexpr std::uintptr_t IsTurnActiveGetterThunkRva = 0x102D6A0;
+        constexpr std::uintptr_t NativeIsTurnActiveGetterRva = 0xE27CA0;
         constexpr std::uintptr_t SetCurrentHealthRva = 0xE522E0;
         constexpr std::uintptr_t NativeGetCardLocationRva = 0xE27CC0;
         constexpr std::uintptr_t QueueMoveCardRva = 0xE35A10;
@@ -420,6 +463,10 @@ namespace QuantumCheckpoint
         constexpr std::size_t CardEngineDeckStateControllerOffset = 0x50;
         constexpr std::size_t DeckStateTurnDrawDelayBaseOffset = 0x68;
         constexpr std::size_t DeckStateTurnDrawDelayAdjustmentOffset = 0x6C;
+        constexpr std::uintptr_t NativeDeckCanTurnDrawRva = 0xE11220;
+        constexpr std::array<std::uint8_t, 8> NativeDeckCanTurnDrawSignature{
+            0x83, 0x79, 0x68, 0x00, 0x0F, 0x94, 0xC0, 0xC3,
+        };
         constexpr std::size_t PlayerStateCurrentHealthOffset = 0x1C;
         constexpr std::size_t PlayerStateMaxHealthOffset = 0x20;
         constexpr auto TimedHealthProbeHold = std::chrono::milliseconds{1000};
@@ -435,6 +482,9 @@ namespace QuantumCheckpoint
             0x8B, 0x81, 0x98, 0x01, 0x00, 0x00,
             0x03, 0x81, 0x94, 0x01, 0x00, 0x00,
             0xC3,
+        };
+        constexpr std::array<std::uint8_t, 8> NativeIsTurnActiveGetterSignature{
+            0x0F, 0xB6, 0x81, 0x9C, 0x01, 0x00, 0x00, 0xC3,
         };
         constexpr std::array<std::uint8_t, 15> NativeCardEngineTurnGetterSignature{
             0x48, 0x89, 0x5C, 0x24, 0x08, 0x57, 0x48, 0x83,
@@ -780,6 +830,10 @@ namespace QuantumCheckpoint
         auto native_card_placement(const NativeMoveCardOnFieldApi& api,
                                    const NativeCardReference& card)
             -> std::optional<NativeCardPlacement>;
+        auto is_valid_card_placement(const NativeCardPlacement& placement) -> bool;
+        auto card_placements_equal(const NativeCardPlacement& left,
+                                   const NativeCardPlacement& right) -> bool;
+        auto card_placement_text(const NativeCardPlacement& placement) -> std::string;
 
         enum class MoveCardProbePhase
         {
@@ -1416,6 +1470,14 @@ namespace QuantumCheckpoint
                 / STR("route-c-exact-player-trash.json");
         }
 
+        auto exact_player_field_checkpoint_path() -> std::filesystem::path
+        {
+            const auto mods_directory = std::filesystem::path{
+                UE4SSProgram::get_program().get_mods_directory()};
+            return mods_directory / STR("QuantumCheckpoint") / STR("Checkpoint")
+                / STR("route-c-exact-player-field.json");
+        }
+
         auto exact_character_charge_checkpoint_path() -> std::filesystem::path
         {
             const auto mods_directory = std::filesystem::path{
@@ -1832,6 +1894,83 @@ namespace QuantumCheckpoint
                     + error.what();
                 append_route_c_trace_failure(
                     "restore.exact-player-trash.rejected", reason);
+                return std::nullopt;
+            }
+        }
+
+        auto try_read_exact_player_field_checkpoint(const RouteCCheckpoint& route_c,
+                                                    std::string& reason)
+            -> std::optional<ExactPlayerFieldCheckpoint>
+        {
+            try
+            {
+                const auto path = exact_player_field_checkpoint_path();
+                std::error_code file_error{};
+                if (!std::filesystem::exists(path, file_error))
+                {
+                    reason = file_error
+                        ? "exact player-field path could not be inspected"
+                        : "exact player-field supplement does not exist";
+                    append_route_c_trace_failure(
+                        "restore.exact-player-field.unavailable", reason);
+                    return std::nullopt;
+                }
+                const auto size = std::filesystem::file_size(path, file_error);
+                if (file_error || size == 0 || size > RouteCMaximumFileBytes)
+                {
+                    reason = "exact player-field supplement has an invalid size";
+                    append_route_c_trace_failure(
+                        "restore.exact-player-field.rejected", reason);
+                    return std::nullopt;
+                }
+                std::ifstream input{path, std::ios::binary};
+                if (!input)
+                {
+                    reason = "exact player-field supplement could not be opened";
+                    append_route_c_trace_failure(
+                        "restore.exact-player-field.rejected", reason);
+                    return std::nullopt;
+                }
+                std::string contents(static_cast<std::size_t>(size), '\0');
+                input.read(contents.data(), static_cast<std::streamsize>(contents.size()));
+                if (!input)
+                {
+                    reason = "exact player-field supplement could not be read completely";
+                    append_route_c_trace_failure(
+                        "restore.exact-player-field.rejected", reason);
+                    return std::nullopt;
+                }
+
+                std::string parse_error{};
+                auto exact = parse_exact_player_field_checkpoint(contents, parse_error);
+                if (!exact)
+                {
+                    reason = "exact player-field supplement was rejected: " + parse_error;
+                    append_route_c_trace_failure(
+                        "restore.exact-player-field.rejected", reason);
+                    return std::nullopt;
+                }
+                if (exact->route_c_payload_checksum != route_c.payload_checksum
+                    || exact->game_executable_sha256 != route_c.game_executable_sha256
+                    || exact->game_executable_size != route_c.game_executable_size
+                    || exact->source_level_name != route_c.source_level_name
+                    || exact->wave_index != route_c.wave_index)
+                {
+                    reason = "exact player-field supplement does not match the Route C checkpoint";
+                    append_route_c_trace_failure(
+                        "restore.exact-player-field.stale", reason);
+                    return std::nullopt;
+                }
+                reason = "linked exact player-field supplement loaded";
+                append_route_c_trace("restore.exact-player-field.loaded");
+                return exact;
+            }
+            catch (const std::exception& error)
+            {
+                reason = std::string{"exact player-field supplement was ignored: "}
+                    + error.what();
+                append_route_c_trace_failure(
+                    "restore.exact-player-field.rejected", reason);
                 return std::nullopt;
             }
         }
@@ -2291,6 +2430,15 @@ namespace QuantumCheckpoint
                 STR("getTurnDrawDelay"));
             auto* deck_class = controller_deck->GetClassPrivate();
             auto* engine_class = card_engine->GetClassPrivate();
+            if (!address_is_readable(
+                    reinterpret_cast<const void*>(module_base + NativeDeckCanTurnDrawRva),
+                    NativeDeckCanTurnDrawSignature.size())
+                || !std::equal(NativeDeckCanTurnDrawSignature.begin(),
+                               NativeDeckCanTurnDrawSignature.end(),
+                               reinterpret_cast<const std::uint8_t*>(module_base + NativeDeckCanTurnDrawRva)))
+            {
+                throw std::runtime_error{"native draw-readiness predicate signature changed"};
+            }
             if (!draw_delay_getter
                 || reinterpret_cast<std::uintptr_t>(draw_delay_getter->GetFuncPtr())
                     != module_base + ControllerDeckTurnDrawDelayGetterThunkRva
@@ -2808,6 +2956,130 @@ namespace QuantumCheckpoint
                     "capture.exact-player-trash.skipped", error.what());
             }
 
+            std::optional<ExactPlayerFieldCheckpoint> exact_player_field{};
+            try
+            {
+                append_route_c_trace("capture.exact-player-field.prepare.begin");
+                const auto zones = find_route_c_player_zone_objects(
+                    static_cast<const void*>(objects.card_engine->GetWorld()));
+                if (!zones.deck || !zones.hand || !zones.trash)
+                {
+                    throw std::runtime_error{
+                        "live player deck, hand, and trash controllers were not found"};
+                }
+                const auto api = validated_native_move_card_on_field_api(
+                    objects.card_engine);
+                if (!native_cards_at_location(objects.card_engine, api.location, 4).empty())
+                {
+                    throw std::runtime_error{
+                        "player PENDING cards are outside the player-field slice"};
+                }
+                struct CapturedFieldCard
+                {
+                    NativeCardPlacement placement{};
+                    std::string instance{};
+                    std::int32_t health{};
+                    bool turn_active{};
+                };
+                std::vector<CapturedFieldCard> captured_cards{};
+                for (const auto& card : native_cards_at_location(
+                         objects.card_engine, api.location, 3))
+                {
+                    const auto placement = native_card_placement(api, card);
+                    if (!placement || !is_valid_card_placement(*placement)
+                        || placement->side != 0 || placement->row > 1)
+                    {
+                        throw std::runtime_error{
+                            "a player FIELD card did not expose a guarded combat slot"};
+                    }
+                    const auto health = parse_int32(required_getter_text(
+                        card.card, STR("getCurrentHealth")));
+                    const auto turn_active = required_getter_text(
+                        card.card, STR("isTurnActive"));
+                    if (!health || *health <= 0
+                        || (turn_active != "True" && turn_active != "False"))
+                    {
+                        throw std::runtime_error{
+                            "a player FIELD card exposed invalid health or turn-active state"};
+                    }
+                    captured_cards.push_back(CapturedFieldCard{
+                        .placement = *placement,
+                        .instance = required_getter_text(
+                            card.card, STR("getCardInfoInstance")),
+                        .health = *health,
+                        .turn_active = turn_active == "True",
+                    });
+                }
+                if (captured_cards.empty())
+                {
+                    throw std::runtime_error{
+                        "player FIELD is empty; a field supplement is unnecessary"};
+                }
+                std::sort(
+                    captured_cards.begin(),
+                    captured_cards.end(),
+                    [](const auto& left, const auto& right) {
+                        return left.placement.row < right.placement.row
+                            || (left.placement.row == right.placement.row
+                                && left.placement.index < right.placement.index);
+                    });
+
+                ExactPlayerFieldCheckpoint exact{};
+                exact.captured_at_utc = checkpoint.captured_at_utc;
+                exact.route_c_payload_checksum = checkpoint.payload_checksum;
+                exact.game_executable_sha256 = checkpoint.game_executable_sha256;
+                exact.game_executable_size = checkpoint.game_executable_size;
+                exact.source_level_name = checkpoint.source_level_name;
+                exact.wave_index = checkpoint.wave_index;
+                exact.player_deck = required_getter_text(
+                    zones.deck, STR("getCardInstanceListSorted"));
+                exact.player_hand = required_getter_text(
+                    zones.hand, STR("getCardInstanceListSorted"));
+                exact.player_trash = required_getter_text(
+                    zones.trash, STR("getCardInstanceListSorted"));
+                exact.player_field = "(";
+                std::ostringstream states{};
+                for (std::size_t index{}; index < captured_cards.size(); ++index)
+                {
+                    if (index != 0)
+                    {
+                        exact.player_field += ',';
+                        states << ';';
+                    }
+                    const auto& card = captured_cards[index];
+                    exact.player_field += card.instance;
+                    states << static_cast<std::int32_t>(card.placement.row) << ','
+                           << card.placement.index << ',' << card.health << ','
+                           << (card.turn_active ? 1 : 0);
+                }
+                exact.player_field += ')';
+                exact.player_field_states = states.str();
+                exact.payload_checksum = exact_player_field_payload_checksum(exact);
+                std::string exact_validation_error{};
+                if (!validate_exact_player_field_checkpoint(
+                        exact, exact_validation_error))
+                {
+                    throw std::runtime_error{exact_validation_error};
+                }
+                if (!exact_player_field_startup_decklist(
+                        checkpoint.active_decklist,
+                        exact.player_deck,
+                        exact.player_hand,
+                        exact.player_trash,
+                        exact.player_field,
+                        exact_validation_error))
+                {
+                    throw std::runtime_error{exact_validation_error};
+                }
+                exact_player_field = std::move(exact);
+                append_route_c_trace("capture.exact-player-field.prepare.complete");
+            }
+            catch (const std::exception& error)
+            {
+                append_route_c_trace_failure(
+                    "capture.exact-player-field.skipped", error.what());
+            }
+
             std::optional<ExactCharacterChargeCheckpoint> exact_character_charge{};
             try
             {
@@ -2879,7 +3151,20 @@ namespace QuantumCheckpoint
                 exact.wave_index = checkpoint.wave_index;
                 exact.card_engine_turn_count = turn.native_turn;
                 exact.player_draw_delay = draw.getter;
+                exact.player_draw_base = draw.base;
+                exact.player_draw_adjustment = draw.adjustment;
                 exact.wave_alert_counter = turn.wave_alert_counter;
+                const auto can_click_to_draw = required_text(
+                    export_property_text(
+                        zones.deck, STR("currentCanClickToDraw")),
+                    "ControllerDeck.currentCanClickToDraw");
+                if (can_click_to_draw != "True" && can_click_to_draw != "False")
+                {
+                    throw std::runtime_error{
+                        "player draw-click readiness was not a boolean"};
+                }
+                exact.player_can_click_to_draw =
+                    can_click_to_draw == "True" ? 1 : 0;
                 exact.payload_checksum = exact_turn_progress_payload_checksum(exact);
                 std::string exact_validation_error{};
                 if (!validate_exact_turn_progress_checkpoint(
@@ -2892,7 +3177,8 @@ namespace QuantumCheckpoint
                     "capture.exact-turn-progress.prepare.complete",
                     "engineTurn=" + std::to_string(turn.native_turn)
                         + " drawDelay=" + std::to_string(draw.getter) + " alert="
-                        + std::to_string(turn.wave_alert_counter));
+                        + std::to_string(turn.wave_alert_counter)
+                        + " canClickToDraw=" + can_click_to_draw);
             }
             catch (const std::exception& error)
             {
@@ -2952,6 +3238,23 @@ namespace QuantumCheckpoint
                 {
                     append_route_c_trace_failure(
                         "capture.exact-player-trash.write.failed", error.what());
+                }
+            }
+            if (exact_player_field)
+            {
+                try
+                {
+                    append_route_c_trace("capture.exact-player-field.write.begin");
+                    write_file_atomically(
+                        exact_player_field_checkpoint_path(),
+                        serialize_exact_player_field_checkpoint(
+                            std::move(*exact_player_field)));
+                    append_route_c_trace("capture.exact-player-field.write.complete");
+                }
+                catch (const std::exception& error)
+                {
+                    append_route_c_trace_failure(
+                        "capture.exact-player-field.write.failed", error.what());
                 }
             }
             if (exact_character_charge)
@@ -3067,6 +3370,16 @@ namespace QuantumCheckpoint
                    << json_escape(restore.exact_player_trash_status) << "\",\n"
                    << "  \"exactPlayerTrashReason\": \""
                    << json_escape(restore.exact_player_trash_reason) << "\",\n"
+                   << "  \"exactPlayerFieldSupplementPresent\": "
+                   << (restore.exact_player_field ? "true" : "false") << ",\n"
+                   << "  \"exactPlayerFieldStatus\": \""
+                   << json_escape(restore.exact_player_field_status) << "\",\n"
+                   << "  \"exactPlayerFieldReason\": \""
+                   << json_escape(restore.exact_player_field_reason) << "\",\n"
+                   << "  \"exactPlayerFieldTargetCount\": "
+                   << restore.exact_player_field_targets.size() << ",\n"
+                   << "  \"exactPlayerFieldTurnActiveMismatchCount\": "
+                   << restore.exact_player_field_turn_active_mismatches << ",\n"
                    << "  \"activeDecklistRestoredAfterExactStartup\": "
                    << (restore.active_decklist_restored_after_exact_startup
                            ? "true" : "false") << ",\n"
@@ -3136,10 +3449,142 @@ namespace QuantumCheckpoint
             {
                 output << "null";
             }
-            output << ",\n  \"targetHealth\": " << restore.checkpoint.player_health
+            output << ",\n  \"targetPlayerCanClickToDraw\": ";
+            if (restore.exact_turn_progress_target_can_click_to_draw)
+            {
+                output << (*restore.exact_turn_progress_target_can_click_to_draw
+                               ? "true" : "false");
+            }
+            else
+            {
+                output << "null";
+            }
+            output << ",\n  \"observedPlayerCanClickToDraw\": ";
+            if (restore.exact_turn_progress_observed_can_click_to_draw)
+            {
+                output << (*restore.exact_turn_progress_observed_can_click_to_draw
+                               ? "true" : "false");
+            }
+            else
+            {
+                output << "null";
+            }
+            const auto write_optional_int = [&](std::string_view name, const auto& value) {
+                output << ",\n  \"" << name << "\": ";
+                if (value) output << *value;
+                else output << "null";
+            };
+            write_optional_int("observedPlayerDrawBase", restore.exact_turn_progress_observed_draw_base);
+            write_optional_int("observedPlayerDrawAdjustment", restore.exact_turn_progress_observed_draw_adjustment);
+            write_optional_int("targetPlayerDrawBase", restore.exact_turn_progress
+                ? std::optional{restore.exact_turn_progress->player_draw_base} : std::nullopt);
+            write_optional_int("targetPlayerDrawAdjustment", restore.exact_turn_progress
+                ? std::optional{restore.exact_turn_progress->player_draw_adjustment} : std::nullopt);
+            output << ",\n  \"restoreMode\": \""
+                   << (restore.semantic_fallback ? "semantic-fallback"
+                           : restore.fallback_reason.empty() ? "requested" : "preflight-route-c") << "\""
+                   << ",\n  \"fallbackReason\": \"" << json_escape(restore.fallback_reason) << "\""
+                   << ",\n  \"gameThreadId\": " << g_game_thread_id.load()
+                   << ",\n  \"targetHealth\": " << restore.checkpoint.player_health
                    << "\n}\n";
             write_file_atomically(path, output.str());
             return path;
+        }
+
+        auto resume_native_restore_actions(UObject* engine) -> void
+        {
+            // E51B50(false) calls the native queue driver E54510. Resume queued
+            // automatic work only at our controller-tick boundary, and never
+            // override a pause owned by the game or the player.
+            if (!engine || !address_is_readable(engine, 0x415)
+                || read_native_value<std::uint8_t>(engine, 0x414) != 0)
+            {
+                throw std::runtime_error{"native restore actions cannot override a paused queue"};
+            }
+            call_reflected(engine, STR("setActionQueueSystemPaused"), {{STR("IsPaused"), "False"}});
+        }
+
+        auto native_queue_diagnostic(const void* state) -> std::string
+        {
+            if (!state || !address_is_readable(state, 0x40)) return "unreadable state";
+            const auto* owner = read_native_value<const void*>(state, 0x10);
+            const auto* manager = read_native_value<const void*>(state, 0x38);
+            if (!manager || !address_is_readable(manager, sizeof(void*))) return "unreadable manager";
+            const auto* root = read_native_value<const void*>(manager, 0);
+            if (!root || !address_is_readable(root, 0x30)) return "unreadable root";
+            return "queues=" + std::to_string(read_native_value<std::int32_t>(root, 8))
+                + "/" + std::to_string(read_native_value<std::int32_t>(root, 0x18))
+                + "/" + std::to_string(read_native_value<std::int32_t>(root, 0x28))
+                + " paused=" + (owner && address_is_readable(owner, 0x415)
+                    ? std::to_string(read_native_value<std::uint8_t>(owner, 0x414)) : "?");
+        }
+
+        auto retain_native_card_argument(const void* object, const void* controller)
+            -> NativeSharedPointerPair
+        {
+            if (GetCurrentThreadId() != g_game_thread_id.load(std::memory_order_acquire)
+                || !object || !controller
+                || !address_is_writable(static_cast<const std::byte*>(controller) + sizeof(void*),
+                                        sizeof(std::int32_t)))
+            {
+                throw std::runtime_error{"native card argument requires live ownership on the game thread"};
+            }
+            const auto count = read_native_value<std::int32_t>(controller, sizeof(void*));
+            if (count <= 0 || count >= 1'000'000)
+            {
+                throw std::runtime_error{"native card reference count is outside the guarded range"};
+            }
+            // These native queue entries consume a shared pointer passed by value.
+            // Their callers retain it first (e.g. E025B0 before E37F10); the callee
+            // releases this temporary. A borrowed pair would steal a live reference.
+            write_native_value(controller, sizeof(void*), count + 1);
+            return {object, controller};
+        }
+
+        auto restore_field_card_effects(PendingNativeFieldMove& target) -> bool
+        {
+            if (!target.effects_suppressed)
+            {
+                return true;
+            }
+            if (!target.native_card_object
+                || !address_is_readable(
+                    static_cast<const std::byte*>(target.native_card_object)
+                        + NativeCardEffectListPointerOffset,
+                    sizeof(void*) + sizeof(std::int32_t) * 2)
+                || !address_is_writable(
+                    static_cast<const std::byte*>(target.native_card_object)
+                        + NativeCardEffectListCountOffset,
+                    sizeof(std::int32_t)))
+            {
+                return false;
+            }
+            const auto* pointer = read_native_value<const void*>(
+                target.native_card_object, NativeCardEffectListPointerOffset);
+            const auto count = read_native_value<std::int32_t>(
+                target.native_card_object, NativeCardEffectListCountOffset);
+            const auto capacity = read_native_value<std::int32_t>(
+                target.native_card_object, NativeCardEffectListCapacityOffset);
+            if (pointer != target.effect_list_pointer || count != 0
+                || capacity != target.effect_list_capacity
+                || capacity < target.effect_list_count)
+            {
+                return false;
+            }
+            write_native_value(
+                target.native_card_object,
+                NativeCardEffectListCountOffset,
+                target.effect_list_count);
+            if (read_native_value<std::int32_t>(
+                    target.native_card_object,
+                    NativeCardEffectListCountOffset) != target.effect_list_count)
+            {
+                return false;
+            }
+            target.effects_suppressed = false;
+            append_route_c_trace(
+                "restore.exact-player-field.effects.restored");
+            return true;
         }
 
         auto finish_route_c_restore(std::string status, std::string reason) -> void
@@ -3152,12 +3597,50 @@ namespace QuantumCheckpoint
             completed.status = std::move(status);
             completed.reason = std::move(reason);
 
+            // Every terminal path, including timeout and unexpected exceptions,
+            // must release temporary effect suppression before discarding targets.
+            for (auto& target : completed.exact_player_field_targets)
+            {
+                if (!target.effects_suppressed)
+                {
+                    continue;
+                }
+                try
+                {
+                    const auto live = find_route_c_objects();
+                    if (!live.card_engine || live.card_engine->GetWorld() != completed.intercepted_world)
+                    {
+                        throw std::runtime_error{"effect owner world is no longer live"};
+                    }
+                    const auto api = validated_native_move_card_api(live.card_engine);
+                    bool found{};
+                    for (const auto location : {0, 1, 2, 3, 4})
+                    {
+                        for (const auto& card : native_cards_at_location(live.card_engine, api, location))
+                        {
+                            found = found || (card.card == target.card && card.state == target.state);
+                        }
+                    }
+                    if (!found || !restore_field_card_effects(target))
+                    {
+                        throw std::runtime_error{"suppressed effect owner or array no longer matches"};
+                    }
+                }
+                catch (const std::exception& error)
+                {
+                    completed.status = "failed";
+                    completed.reason += "; effect cleanup: " + std::string{error.what()};
+                }
+            }
+
             if (completed.auto_spawn_suppressed && !completed.original_auto_spawn.empty())
             {
                 try
                 {
                     const auto live_objects = find_route_c_objects();
                     if (!live_objects.spawner
+                        || live_objects.spawner != completed.intercepted_spawner
+                        || live_objects.spawner->GetWorld() != completed.intercepted_world
                         || object_class_name(live_objects.spawner)
                             != completed.checkpoint.spawner_class)
                     {
@@ -3183,6 +3666,17 @@ namespace QuantumCheckpoint
             // The replacement battle must not overwrite the checkpoint merely because its
             // Spawner is a new object. The next stable observation becomes the baseline; a
             // subsequent genuine wave change can auto-save normally.
+            if (completed.status == "failed" && !completed.semantic_fallback
+                && completed.game_instance_reimported_at_card_engine_begin_play
+                && (completed.exact_player_field || completed.exact_player_trash
+                    || completed.exact_player_zones || completed.exact_turn_progress
+                    || completed.exact_character_charge || completed.exact_spawn_plan))
+            {
+                g_pending_route_c_fallback = PendingRouteCFallback{
+                    completed.checkpoint, completed.reason};
+                completed.status = "retrying-route-c";
+                append_route_c_trace_failure("restore.semantic-fallback.scheduled", completed.reason);
+            }
             g_adopt_next_route_c_wave_without_capture = true;
             if (completed.status == "passed")
             {
@@ -3211,7 +3705,8 @@ namespace QuantumCheckpoint
             }
         }
 
-        auto begin_route_c_restore() -> void
+        auto begin_route_c_restore(std::optional<RouteCCheckpoint> fallback_checkpoint = std::nullopt,
+                                   std::string fallback_reason = {}) -> void
         {
             append_route_c_trace("restore.begin");
             if (g_pending_route_c_restore || g_pending_health_write_probe
@@ -3221,7 +3716,8 @@ namespace QuantumCheckpoint
             {
                 throw std::runtime_error{"A restore or native write probe is already active"};
             }
-            auto checkpoint = read_route_c_checkpoint();
+            const bool semantic_only = fallback_checkpoint.has_value();
+            auto checkpoint = semantic_only ? std::move(*fallback_checkpoint) : read_route_c_checkpoint();
             append_route_c_trace("restore.checkpoint-loaded");
             const auto& fingerprint = executable_fingerprint();
             if (!fingerprint_matches_supported_game(fingerprint)
@@ -3232,15 +3728,35 @@ namespace QuantumCheckpoint
                     "Route C checkpoint belongs to a different game executable"};
             }
             std::string exact_spawn_plan_reason{};
-            auto exact_spawn_plan = try_read_exact_spawn_plan_checkpoint(
+            auto exact_spawn_plan = semantic_only ? std::nullopt : try_read_exact_spawn_plan_checkpoint(
                 checkpoint, exact_spawn_plan_reason);
             std::string exact_player_zones_reason{};
-            auto exact_player_zones = try_read_exact_player_zones_checkpoint(
+            auto exact_player_zones = semantic_only ? std::nullopt : try_read_exact_player_zones_checkpoint(
                 checkpoint, exact_player_zones_reason);
             std::string exact_player_trash_reason{};
-            auto exact_player_trash = try_read_exact_player_trash_checkpoint(
+            auto exact_player_trash = semantic_only ? std::nullopt : try_read_exact_player_trash_checkpoint(
                 checkpoint, exact_player_trash_reason);
-            if (exact_player_zones && exact_player_trash)
+            std::string exact_player_field_reason{};
+            auto exact_player_field = semantic_only ? std::nullopt : try_read_exact_player_field_checkpoint(
+                checkpoint, exact_player_field_reason);
+            if (exact_player_field)
+            {
+                if (exact_player_zones)
+                {
+                    exact_player_zones_reason =
+                        "exact player zones were superseded by the linked player-field supplement";
+                    exact_player_zones.reset();
+                }
+                if (exact_player_trash)
+                {
+                    exact_player_trash_reason =
+                        "exact player trash was superseded by the linked player-field supplement";
+                    exact_player_trash.reset();
+                }
+                append_route_c_trace(
+                    "restore.exact-player-field.supersedes-clean-zones-and-trash");
+            }
+            else if (exact_player_zones && exact_player_trash)
             {
                 exact_player_zones_reason =
                     "exact player zones were superseded by the linked player-trash supplement";
@@ -3248,11 +3764,36 @@ namespace QuantumCheckpoint
                 append_route_c_trace("restore.exact-player-trash.supersedes-clean-zones");
             }
             std::string exact_character_charge_reason{};
-            auto exact_character_charge = try_read_exact_character_charge_checkpoint(
+            auto exact_character_charge = semantic_only ? std::nullopt : try_read_exact_character_charge_checkpoint(
                 checkpoint, exact_character_charge_reason);
             std::string exact_turn_progress_reason{};
-            auto exact_turn_progress = try_read_exact_turn_progress_checkpoint(
+            auto exact_turn_progress = semantic_only ? std::nullopt : try_read_exact_turn_progress_checkpoint(
                 checkpoint, exact_turn_progress_reason);
+
+            const bool legacy_turn = exact_turn_progress && exact_turn_progress->schema_version < 2;
+            const bool missing_turn_for_cards = (exact_player_field || exact_player_trash) && !exact_turn_progress;
+            const bool missing_cards_for_turn = exact_turn_progress
+                && !exact_player_field && !exact_player_trash && !exact_player_zones;
+            if (legacy_turn || missing_turn_for_cards || missing_cards_for_turn)
+            {
+                fallback_reason = legacy_turn
+                    ? "legacy turn supplement has no native countdown/modifier"
+                    : missing_turn_for_cards
+                        ? "field/trash supplement requires valid native turn progress"
+                        : "turn progress requires a linked exact player-card layout";
+                fallback_reason += "; combat supplements were disabled before startup; recapture to enable them";
+                exact_turn_progress_reason = fallback_reason;
+                exact_player_field_reason = fallback_reason;
+                exact_player_trash_reason = fallback_reason;
+                exact_player_zones_reason = fallback_reason;
+                exact_character_charge_reason = fallback_reason;
+                exact_turn_progress.reset();
+                exact_player_field.reset();
+                exact_player_trash.reset();
+                exact_player_zones.reset();
+                exact_character_charge.reset();
+                append_route_c_trace_failure("restore.combat-supplements.preflight-disabled", fallback_reason);
+            }
 
             const auto objects = find_route_c_objects();
             if (!objects.game_instance)
@@ -3271,7 +3812,14 @@ namespace QuantumCheckpoint
                 "original GameInstance.sourceLevelName");
             std::string original_deck{};
             std::string original_storage{};
-            if (g_last_completed_route_c_checkpoint
+            if (semantic_only)
+            {
+                // The failed attempt already imported this payload. Avoid stale
+                // post-travel DeckRun getters while constructing a fresh world.
+                original_deck = checkpoint.active_decklist;
+                original_storage = checkpoint.active_storage;
+            }
+            else if (g_last_completed_route_c_checkpoint
                 && g_last_completed_route_c_checkpoint->payload_checksum
                     == checkpoint.payload_checksum)
             {
@@ -3292,7 +3840,34 @@ namespace QuantumCheckpoint
                 append_route_c_trace("restore.original-storage.complete");
             }
             auto startup_decklist = route_c_startup_decklist(checkpoint.active_decklist);
-            if (exact_player_trash)
+            if (exact_player_field)
+            {
+                std::string fixed_order_error{};
+                auto fixed_order = exact_player_field_startup_decklist(
+                    checkpoint.active_decklist,
+                    exact_player_field->player_deck,
+                    exact_player_field->player_hand,
+                    exact_player_field->player_trash,
+                    exact_player_field->player_field,
+                    fixed_order_error);
+                if (fixed_order)
+                {
+                    startup_decklist = std::move(*fixed_order);
+                    exact_player_field_reason =
+                        "linked exact player field prepared a guarded fixed-order startup deck";
+                    append_route_c_trace("restore.exact-player-field.prepared");
+                }
+                else
+                {
+                    exact_player_field_reason =
+                        "exact player-field supplement was ignored: " + fixed_order_error;
+                    append_route_c_trace_failure(
+                        "restore.exact-player-field.rejected",
+                        exact_player_field_reason);
+                    exact_player_field.reset();
+                }
+            }
+            else if (exact_player_trash)
             {
                 std::string fixed_order_error{};
                 auto fixed_order = exact_player_trash_startup_decklist(
@@ -3420,6 +3995,7 @@ namespace QuantumCheckpoint
             const bool exact_spawn_plan_available = exact_spawn_plan.has_value();
             const bool exact_player_zones_available = exact_player_zones.has_value();
             const bool exact_player_trash_available = exact_player_trash.has_value();
+            const bool exact_player_field_available = exact_player_field.has_value();
             const bool exact_character_charge_available = exact_character_charge.has_value();
             const bool exact_turn_progress_available = exact_turn_progress.has_value();
             g_pending_route_c_capture.reset();
@@ -3428,6 +4004,7 @@ namespace QuantumCheckpoint
                 .exact_spawn_plan = std::move(exact_spawn_plan),
                 .exact_player_zones = std::move(exact_player_zones),
                 .exact_player_trash = std::move(exact_player_trash),
+                .exact_player_field = std::move(exact_player_field),
                 .exact_character_charge = std::move(exact_character_charge),
                 .exact_turn_progress = std::move(exact_turn_progress),
                 .exact_player_startup_decklist = startup_decklist,
@@ -3444,12 +4021,17 @@ namespace QuantumCheckpoint
                 .exact_player_trash_status = exact_player_trash_available
                     ? "pending" : "unavailable",
                 .exact_player_trash_reason = std::move(exact_player_trash_reason),
+                .exact_player_field_status = exact_player_field_available
+                    ? "pending" : "unavailable",
+                .exact_player_field_reason = std::move(exact_player_field_reason),
                 .exact_character_charge_status = exact_character_charge_available
                     ? "pending" : "unavailable",
                 .exact_character_charge_reason = std::move(exact_character_charge_reason),
                 .exact_turn_progress_status = exact_turn_progress_available
                     ? "pending" : "unavailable",
                 .exact_turn_progress_reason = std::move(exact_turn_progress_reason),
+                .semantic_fallback = semantic_only,
+                .fallback_reason = std::move(fallback_reason),
             });
 
             try
@@ -4058,6 +4640,7 @@ namespace QuantumCheckpoint
                         NativeCardReference{.card = target.card, .state = target.state},
                         2);
                 }
+                resume_native_restore_actions(objects.card_engine);
                 append_route_c_trace("restore.exact-player-trash.queue.complete");
                 restore.exact_player_trash_status = "moving-to-trash";
                 restore.exact_player_trash_move_started_at = now;
@@ -4090,6 +4673,7 @@ namespace QuantumCheckpoint
                             target.origin);
                     }
                 }
+                resume_native_restore_actions(objects.card_engine);
                 append_route_c_trace("restore.exact-player-trash.rollback-queue.complete");
                 restore.exact_player_trash_status = "rollback-to-origin";
                 restore.exact_player_trash_move_started_at = now;
@@ -4126,6 +4710,786 @@ namespace QuantumCheckpoint
             return false;
         }
 
+        auto update_exact_player_field_turn_diagnostic(PendingRouteCRestore& restore)
+            -> void
+        {
+            if (!restore.exact_player_field
+                || restore.exact_player_field_status != "verified-position-health")
+            {
+                return;
+            }
+            std::size_t mismatches{};
+            for (const auto& target : restore.exact_player_field_targets)
+            {
+                const auto value = export_zero_argument_getter(
+                    target.card, STR("isTurnActive"));
+                if (!value
+                    || (value->value != "True" && value->value != "False")
+                    || (value->value == "True") != target.target_turn_active)
+                {
+                    ++mismatches;
+                }
+            }
+            restore.exact_player_field_turn_active_mismatches = mismatches;
+            restore.exact_player_field_reason =
+                "native fixed-order staging and effect-suppressed play restored exact "
+                "player-field positions, current health, and turn-active state "
+                "(mismatches=" + std::to_string(mismatches) + ")";
+        }
+
+        auto verify_exact_player_field(PendingRouteCRestore& restore,
+                                       const RouteCBattleObjects& objects,
+                                       std::chrono::steady_clock::time_point now) -> bool
+        {
+            if (!restore.exact_player_field)
+            {
+                return true;
+            }
+            if (restore.exact_player_field_status == "verified-position-health")
+            {
+                update_exact_player_field_turn_diagnostic(restore);
+            }
+            if (restore.exact_player_field_status != "pending"
+                && restore.exact_player_field_status != "moving-field-to-hand"
+                && restore.exact_player_field_status != "playing-field"
+                && restore.exact_player_field_status != "verified-position-health")
+            {
+                return true;
+            }
+
+            const auto rollback_active_decklist = [&]() {
+                if (restore.active_decklist_restored_after_exact_startup)
+                {
+                    return;
+                }
+                append_route_c_trace(
+                    "restore.exact-player-field.active-deck-rollback.begin");
+                call_reflected(objects.game_instance,
+                               STR("setActiveDecklist"),
+                               {{STR("newDecklist"), restore.checkpoint.active_decklist}});
+                restore.active_decklist_restored_after_exact_startup = true;
+                append_route_c_trace(
+                    "restore.exact-player-field.active-deck-rollback.complete");
+            };
+            const auto fail_without_write = [&](std::string reason) {
+                rollback_active_decklist();
+                restore.exact_player_field_status = "unsupported-no-zone-write";
+                restore.exact_player_field_reason = std::move(reason);
+                append_route_c_trace_failure(
+                    "restore.exact-player-field.unsupported-no-zone-write",
+                    restore.exact_player_field_reason);
+                return true;
+            };
+            const auto restore_effects = [&](PendingNativeFieldMove& target) {
+                return restore_field_card_effects(target);
+            };
+            const auto fail_after_write = [&](std::string reason) -> bool {
+                for (auto& target : restore.exact_player_field_targets)
+                {
+                    if (!restore_effects(target))
+                    {
+                        reason += "; a suppressed card effect list could not be restored";
+                    }
+                    if (target.turn_active_written)
+                    {
+                        const auto expected = static_cast<std::uint8_t>(
+                            target.target_turn_active ? 1 : 0);
+                        const auto original = static_cast<std::uint8_t>(
+                            target.original_turn_active ? 1 : 0);
+                        if (!address_is_writable(
+                                static_cast<const std::byte*>(target.state)
+                                    + CardStateTurnActiveOffset,
+                                sizeof(std::uint8_t))
+                            || read_native_value<std::uint8_t>(
+                                   target.state, CardStateTurnActiveOffset) != expected)
+                        {
+                            reason += "; a written turn-active byte could not be rolled back safely";
+                            continue;
+                        }
+                        write_native_value(
+                            target.state, CardStateTurnActiveOffset, original);
+                        if (read_native_value<std::uint8_t>(
+                                target.state, CardStateTurnActiveOffset) != original)
+                        {
+                            reason += "; a turn-active rollback did not verify";
+                            continue;
+                        }
+                        target.turn_active_written = false;
+                    }
+                }
+                rollback_active_decklist();
+                restore.exact_player_field_status = "failed-after-zone-write";
+                restore.exact_player_field_reason = reason;
+                append_route_c_trace_failure(
+                    "restore.exact-player-field.failed-after-zone-write", reason);
+                throw std::runtime_error{
+                    "Exact player-field restore stopped after a guarded native write: "
+                    + reason};
+            };
+
+            const auto zones = find_route_c_player_zone_objects(
+                static_cast<const void*>(objects.card_engine->GetWorld()));
+            if (!zones.deck || !zones.hand || !zones.trash)
+            {
+                if (now - restore.started_at <= std::chrono::seconds{5})
+                {
+                    return false;
+                }
+                return fail_without_write(
+                    "player deck, hand, and trash controllers were unavailable after five seconds");
+            }
+            const auto actual_deck = export_zero_argument_getter(
+                zones.deck, STR("getCardInstanceListSorted"));
+            const auto actual_hand = export_zero_argument_getter(
+                zones.hand, STR("getCardInstanceListSorted"));
+            const auto actual_trash = export_zero_argument_getter(
+                zones.trash, STR("getCardInstanceListSorted"));
+            if (!actual_deck || !actual_hand || !actual_trash)
+            {
+                if (now - restore.started_at <= std::chrono::seconds{5})
+                {
+                    return false;
+                }
+                return fail_without_write(
+                    "player deck, hand, or trash getter was unavailable after five seconds");
+            }
+
+            std::string array_error{};
+            const auto expected_deck = split_route_c_unreal_array(
+                restore.exact_player_field->player_deck, array_error);
+            const auto expected_hand = split_route_c_unreal_array(
+                restore.exact_player_field->player_hand, array_error);
+            const auto expected_trash = split_route_c_unreal_array(
+                restore.exact_player_field->player_trash, array_error);
+            const auto expected_field = split_route_c_unreal_array(
+                restore.exact_player_field->player_field, array_error);
+            const auto expected_states = parse_exact_player_field_states(
+                restore.exact_player_field->player_field_states, array_error);
+            if (!expected_deck || !expected_hand || !expected_trash || !expected_field
+                || !expected_states || expected_field->size() != expected_states->size())
+            {
+                throw std::runtime_error{
+                    "exact player-field verification exposed invalid saved arrays: "
+                    + array_error};
+            }
+
+            const auto api = validated_native_move_card_on_field_api(objects.card_engine);
+            const auto module = GetModuleHandleW(L"Quantum-Win64-Shipping.exe");
+            if (!module)
+            {
+                return fail_without_write("game executable module was unavailable");
+            }
+            const auto module_base = reinterpret_cast<std::uintptr_t>(module);
+            if (!std::equal(
+                    SetCurrentHealthSignature.begin(),
+                    SetCurrentHealthSignature.end(),
+                    reinterpret_cast<const std::uint8_t*>(
+                        module_base + SetCurrentHealthRva)))
+            {
+                return fail_without_write(
+                    "native card-health setter signature did not match");
+            }
+            if (!address_is_readable(
+                    reinterpret_cast<const void*>(
+                        module_base + NativeIsTurnActiveGetterRva),
+                    NativeIsTurnActiveGetterSignature.size())
+                || !std::equal(
+                    NativeIsTurnActiveGetterSignature.begin(),
+                    NativeIsTurnActiveGetterSignature.end(),
+                    reinterpret_cast<const std::uint8_t*>(
+                        module_base + NativeIsTurnActiveGetterRva)))
+            {
+                return fail_without_write(
+                    "native turn-active getter signature did not match");
+            }
+            const auto set_current_health = reinterpret_cast<SetCurrentHealthFunction>(
+                module_base + SetCurrentHealthRva);
+
+            const auto final_state_matches = [&]() {
+                if (actual_deck->value != restore.exact_player_field->player_deck
+                    || actual_hand->value != restore.exact_player_field->player_hand
+                    || actual_trash->value != restore.exact_player_field->player_trash)
+                {
+                    return false;
+                }
+                struct Observed
+                {
+                    NativeCardPlacement placement{};
+                    std::string key{};
+                    std::int32_t health{};
+                    bool turn_active{};
+                };
+                std::vector<Observed> observed{};
+                for (const auto& card : native_cards_at_location(
+                         objects.card_engine, api.location, 3))
+                {
+                    const auto placement = native_card_placement(api, card);
+                    const auto health = parse_int32(required_getter_text(
+                        card.card, STR("getCurrentHealth")));
+                    const auto turn_active = required_getter_text(
+                        card.card, STR("isTurnActive"));
+                    auto key = exact_card_identity_key_from_instance(
+                        required_getter_text(card.card, STR("getCardInfoInstance")),
+                        array_error);
+                    if (!placement || !key || !health
+                        || (turn_active != "True" && turn_active != "False"))
+                    {
+                        return false;
+                    }
+                    observed.push_back(Observed{
+                        .placement = *placement,
+                        .key = std::move(*key),
+                        .health = *health,
+                        .turn_active = turn_active == "True",
+                    });
+                }
+                std::sort(observed.begin(), observed.end(), [](const auto& left,
+                                                               const auto& right) {
+                    return left.placement.row < right.placement.row
+                        || (left.placement.row == right.placement.row
+                            && left.placement.index < right.placement.index);
+                });
+                if (observed.size() != expected_field->size())
+                {
+                    return false;
+                }
+                for (std::size_t index{}; index < observed.size(); ++index)
+                {
+                    auto expected_key = exact_card_identity_key_from_instance(
+                        (*expected_field)[index], array_error);
+                    if (!expected_key || observed[index].key != *expected_key
+                        || observed[index].placement.type != 1
+                        || observed[index].placement.side != 0
+                        || observed[index].placement.row
+                            != (*expected_states)[index].row
+                        || observed[index].placement.index
+                            != (*expected_states)[index].index
+                        || observed[index].health
+                            != (*expected_states)[index].current_health
+                        || observed[index].turn_active
+                            != (*expected_states)[index].turn_active)
+                    {
+                        return false;
+                    }
+                }
+                return true;
+            };
+
+            if (restore.exact_player_field_target_index
+                    == restore.exact_player_field_targets.size()
+                && !restore.exact_player_field_targets.empty()
+                && final_state_matches())
+            {
+                rollback_active_decklist();
+                restore.exact_player_field_status = "verified-position-health";
+                append_route_c_trace(
+                    "restore.exact-player-field.verified-position-health");
+                update_exact_player_field_turn_diagnostic(restore);
+                return true;
+            }
+            if (restore.exact_player_field_target_index
+                    == restore.exact_player_field_targets.size()
+                && !restore.exact_player_field_targets.empty())
+            {
+                if (restore.exact_player_field_move_started_at
+                    && now - *restore.exact_player_field_move_started_at
+                        <= std::chrono::seconds{2})
+                {
+                    return false;
+                }
+                return fail_after_write(
+                    "final deck, hand, trash, field placement, or field health did not verify");
+            }
+
+            const auto suppress_effects = [&](PendingNativeFieldMove& target) {
+                if (!target.native_card_object || target.effect_list_count <= 0
+                    || target.effect_list_count > 64
+                    || target.effect_list_capacity < target.effect_list_count
+                    || target.effect_list_capacity > 256
+                    || !address_is_writable(
+                        static_cast<const std::byte*>(target.native_card_object)
+                            + NativeCardEffectListCountOffset,
+                        sizeof(std::int32_t)))
+                {
+                    throw std::runtime_error{
+                        "field target play-effect list did not pass guarded write validation"};
+                }
+                const auto* pointer = read_native_value<const void*>(
+                    target.native_card_object, NativeCardEffectListPointerOffset);
+                const auto count = read_native_value<std::int32_t>(
+                    target.native_card_object, NativeCardEffectListCountOffset);
+                const auto capacity = read_native_value<std::int32_t>(
+                    target.native_card_object, NativeCardEffectListCapacityOffset);
+                if (pointer != target.effect_list_pointer
+                    || count != target.effect_list_count
+                    || capacity != target.effect_list_capacity)
+                {
+                    throw std::runtime_error{
+                        "field target play-effect list changed before suppression"};
+                }
+                write_native_value(
+                    target.native_card_object,
+                    NativeCardEffectListCountOffset,
+                    std::int32_t{});
+                target.effects_suppressed = true;
+                if (read_native_value<std::int32_t>(
+                        target.native_card_object,
+                        NativeCardEffectListCountOffset) != 0)
+                {
+                    throw std::runtime_error{
+                        "field target play-effect suppression did not verify"};
+                }
+                append_route_c_trace(
+                    "restore.exact-player-field.effects.suppressed");
+            };
+            const auto queue_play = [&](PendingNativeFieldMove& target) {
+                const auto location = native_card_location(
+                    api.location.engine_state,
+                    target.state,
+                    api.location.get_card_location);
+                if (!location || *location != 0)
+                {
+                    throw std::runtime_error{
+                        "field target was not in HAND before native play"};
+                }
+                const auto* shared_object = read_native_value<const void*>(
+                    target.state, CardStateSharedObjectOffset);
+                const auto* shared_controller = read_native_value<const void*>(
+                    target.state, CardStateSharedControllerOffset);
+                if (shared_object != target.native_card_object || !shared_controller
+                    || !address_is_readable(
+                        static_cast<const std::byte*>(shared_controller) + sizeof(void*),
+                        sizeof(std::int32_t))
+                    || read_native_value<std::int32_t>(
+                           shared_controller, sizeof(void*)) <= 0)
+                {
+                    throw std::runtime_error{
+                        "field target shared ownership did not pass validation"};
+                }
+                suppress_effects(target);
+                const NativeSharedPointerPair empty{};
+                const NativeCardPlacement destination{
+                    .type = 1,
+                    .index = target.index,
+                    .row = static_cast<std::uint8_t>(target.row),
+                    .side = 0,
+                };
+                try
+                {
+                    const auto card = retain_native_card_argument(shared_object, shared_controller);
+                    api.queue_play_card_to_field(
+                        api.location.engine_state,
+                        &empty,
+                        &card,
+                        &destination,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0);
+                    // An automatic action can remain in the idle queue until its
+                    // native driver is resumed. This public API drains queued work
+                    // without fabricating a manual turn or dispatching UI events.
+                    resume_native_restore_actions(objects.card_engine);
+                }
+                catch (...)
+                {
+                    restore_effects(target);
+                    throw;
+                }
+                restore.exact_player_field_status = "playing-field";
+                restore.exact_player_field_move_started_at = now;
+                append_route_c_trace_failure(
+                    "restore.exact-player-field.play.queued",
+                    card_placement_text(destination) + " actor="
+                        + to_string(target.card->GetName()) + " "
+                        + native_queue_diagnostic(api.location.engine_state));
+            };
+            const auto queue_current_target = [&]() {
+                auto& target = restore.exact_player_field_targets.at(
+                    restore.exact_player_field_target_index);
+                const auto location = native_card_location(
+                    api.location.engine_state,
+                    target.state,
+                    api.location.get_card_location);
+                if (!location)
+                {
+                    throw std::runtime_error{
+                        "field target location was unavailable before staging"};
+                }
+                if (*location == 0)
+                {
+                    queue_play(target);
+                    return;
+                }
+                if (*location != 1)
+                {
+                    throw std::runtime_error{
+                        "field target was outside DECK and HAND before staging"};
+                }
+                queue_native_move_card_action(
+                    api.location,
+                    NativeCardReference{.card = target.card, .state = target.state},
+                    0);
+                resume_native_restore_actions(objects.card_engine);
+                restore.exact_player_field_status = "moving-field-to-hand";
+                restore.exact_player_field_move_started_at = now;
+                append_route_c_trace(
+                    "restore.exact-player-field.deck-to-hand.queued");
+            };
+
+            if (restore.exact_player_field_status == "pending")
+            {
+                std::string staging_error{};
+                if (!exact_player_field_staging_matches(
+                        restore.exact_player_field->player_deck,
+                        restore.exact_player_field->player_hand,
+                        restore.exact_player_field->player_trash,
+                        restore.exact_player_field->player_field,
+                        actual_deck->value,
+                        actual_hand->value,
+                        actual_trash->value,
+                        staging_error))
+                {
+                    if (now - restore.started_at <= std::chrono::seconds{7})
+                    {
+                        return false;
+                    }
+                    append_route_c_trace_failure(
+                        "restore.exact-player-field.staging-mismatch",
+                        "reason=" + staging_error
+                            + " expectedDeck="
+                            + restore.exact_player_field->player_deck
+                            + " expectedHand="
+                            + restore.exact_player_field->player_hand
+                            + " expectedTrash="
+                            + restore.exact_player_field->player_trash
+                            + " expectedField="
+                            + restore.exact_player_field->player_field
+                            + " actualDeck=" + actual_deck->value
+                            + " actualHand=" + actual_hand->value
+                            + " actualTrash=" + actual_trash->value);
+                    return fail_without_write(
+                        "fixed-order startup did not reproduce field staging: "
+                        + staging_error);
+                }
+                if (!expected_trash->empty())
+                {
+                    return fail_without_write(
+                        "the first exact player-field restore slice leaves non-empty trash "
+                        "to the ordinary Route C fallback");
+                }
+                if (!native_cards_at_location(
+                         objects.card_engine, api.location, 3).empty())
+                {
+                    return fail_without_write(
+                        "native startup unexpectedly produced player FIELD cards");
+                }
+
+                std::vector<std::string> hand_keys{};
+                for (const auto& card : *expected_hand)
+                {
+                    auto key = exact_card_identity_key_from_instance(card, array_error);
+                    if (!key)
+                    {
+                        throw std::runtime_error{
+                            "saved hand identity was invalid: " + array_error};
+                    }
+                    hand_keys.push_back(std::move(*key));
+                }
+                for (const auto& card : *expected_field)
+                {
+                    auto key = exact_card_identity_key_from_instance(card, array_error);
+                    if (!key)
+                    {
+                        throw std::runtime_error{
+                            "saved field identity was invalid: " + array_error};
+                    }
+                    if (std::find(hand_keys.begin(), hand_keys.end(), *key)
+                        != hand_keys.end())
+                    {
+                        return fail_without_write(
+                            "the first exact player-field restore slice leaves a shared "
+                            "hand/field identity to the ordinary Route C fallback");
+                    }
+                }
+
+                struct Candidate
+                {
+                    NativeCardReference reference{};
+                    std::string key{};
+                    std::uint8_t origin{};
+                };
+                std::vector<Candidate> candidates{};
+                for (const auto origin : {std::uint8_t{0}, std::uint8_t{1}})
+                {
+                    for (const auto& card : native_cards_at_location(
+                             objects.card_engine, api.location, origin))
+                    {
+                        auto key = exact_card_identity_key_from_instance(
+                            required_getter_text(
+                                card.card, STR("getCardInfoInstance")),
+                            array_error);
+                        if (!key)
+                        {
+                            throw std::runtime_error{
+                                "live staged card identity was invalid: " + array_error};
+                        }
+                        candidates.push_back(Candidate{
+                            .reference = card,
+                            .key = std::move(*key),
+                            .origin = origin,
+                        });
+                    }
+                }
+                std::vector<bool> used(candidates.size());
+                std::vector<PendingNativeFieldMove> targets{};
+                targets.reserve(expected_field->size());
+                for (std::size_t saved_index{}; saved_index < expected_field->size();
+                     ++saved_index)
+                {
+                    auto key = exact_card_identity_key_from_instance(
+                        (*expected_field)[saved_index], array_error);
+                    bool found{};
+                    for (std::size_t candidate_index{};
+                         key && candidate_index < candidates.size();
+                         ++candidate_index)
+                    {
+                        if (used[candidate_index]
+                            || candidates[candidate_index].key != *key)
+                        {
+                            continue;
+                        }
+                        const auto& candidate = candidates[candidate_index];
+                        const auto* native_card_object = read_native_value<const void*>(
+                            candidate.reference.state, CardStateSharedObjectOffset);
+                        if (!native_card_object
+                            || !address_is_readable(
+                                static_cast<const std::byte*>(native_card_object)
+                                    + NativeCardEffectListPointerOffset,
+                                sizeof(void*) + sizeof(std::int32_t) * 2)
+                            || !address_is_writable(
+                                static_cast<const std::byte*>(native_card_object)
+                                    + NativeCardEffectListCountOffset,
+                                sizeof(std::int32_t)))
+                        {
+                            throw std::runtime_error{
+                                "field target effect-list header was unavailable"};
+                        }
+                        const auto* effect_pointer = read_native_value<const void*>(
+                            native_card_object, NativeCardEffectListPointerOffset);
+                        const auto effect_count = read_native_value<std::int32_t>(
+                            native_card_object, NativeCardEffectListCountOffset);
+                        const auto effect_capacity = read_native_value<std::int32_t>(
+                            native_card_object, NativeCardEffectListCapacityOffset);
+                        if (!effect_pointer || effect_count <= 0 || effect_count > 64
+                            || effect_capacity < effect_count || effect_capacity > 256
+                            || !address_is_readable(
+                                effect_pointer,
+                                static_cast<std::size_t>(effect_count)
+                                    * sizeof(NativeSharedPointerPair)))
+                        {
+                            throw std::runtime_error{
+                                "field target effect-list layout did not pass validation"};
+                        }
+                        const auto base_health = read_native_value<std::int32_t>(
+                            candidate.reference.state, CardStateBaseHealthOffset);
+                        const auto target_health =
+                            (*expected_states)[saved_index].current_health;
+                        if (base_health <= 0 || target_health <= 0
+                            || target_health > base_health)
+                        {
+                            throw std::runtime_error{
+                                "saved field-card health exceeded the live card base health"};
+                        }
+                        auto* turn_active_getter =
+                            candidate.reference.card->GetFunctionByNameInChain(
+                                STR("isTurnActive"));
+                        const auto turn_active_text = required_getter_text(
+                            candidate.reference.card, STR("isTurnActive"));
+                        const auto native_turn_active =
+                            read_native_value<std::uint8_t>(
+                                candidate.reference.state,
+                                CardStateTurnActiveOffset);
+                        if (!turn_active_getter
+                            || reinterpret_cast<std::uintptr_t>(
+                                   turn_active_getter->GetFuncPtr())
+                                != module_base + IsTurnActiveGetterThunkRva
+                            || !address_is_writable(
+                                static_cast<const std::byte*>(
+                                    candidate.reference.state)
+                                    + CardStateTurnActiveOffset,
+                                sizeof(std::uint8_t))
+                            || native_turn_active > 1
+                            || (turn_active_text != "True"
+                                && turn_active_text != "False")
+                            || (turn_active_text == "True")
+                                != (native_turn_active != 0))
+                        {
+                            throw std::runtime_error{
+                                "field target turn-active state did not pass validation"};
+                        }
+                        used[candidate_index] = true;
+                        targets.push_back(PendingNativeFieldMove{
+                            .card = candidate.reference.card,
+                            .state = candidate.reference.state,
+                            .origin = candidate.origin,
+                            .native_card_object = native_card_object,
+                            .effect_list_pointer = effect_pointer,
+                            .effect_list_count = effect_count,
+                            .effect_list_capacity = effect_capacity,
+                            .row = (*expected_states)[saved_index].row,
+                            .index = (*expected_states)[saved_index].index,
+                            .target_health = target_health,
+                            .original_turn_active = native_turn_active != 0,
+                            .target_turn_active =
+                                (*expected_states)[saved_index].turn_active,
+                        });
+                        found = true;
+                        break;
+                    }
+                    if (!found)
+                    {
+                        return fail_without_write(
+                            "native deck/hand objects did not contain every saved field identity");
+                    }
+                }
+                std::stable_sort(targets.begin(), targets.end(), [](const auto& left,
+                                                                    const auto& right) {
+                    return left.origin < right.origin;
+                });
+                if (targets.empty() || targets.front().origin != 0)
+                {
+                    return fail_without_write(
+                        "native initial hand contained no staged field target; the guarded "
+                        "deck-to-hand sequence would exceed hand capacity");
+                }
+                restore.exact_player_field_targets = std::move(targets);
+                restore.exact_player_field_target_index = 0;
+                append_route_c_trace_failure(
+                    "restore.exact-player-field.targets.prepared",
+                    "count="
+                        + std::to_string(restore.exact_player_field_targets.size()));
+                queue_current_target();
+                return false;
+            }
+
+            auto& target = restore.exact_player_field_targets.at(
+                restore.exact_player_field_target_index);
+            const auto location = native_card_location(
+                api.location.engine_state,
+                target.state,
+                api.location.get_card_location);
+            if (!location)
+            {
+                return fail_after_write("current field target location became unavailable");
+            }
+            if (restore.exact_player_field_status == "moving-field-to-hand")
+            {
+                if (*location == 0)
+                {
+                    queue_play(target);
+                    return false;
+                }
+                if (restore.exact_player_field_move_started_at
+                    && now - *restore.exact_player_field_move_started_at
+                        > std::chrono::seconds{8})
+                {
+                    return fail_after_write("DECK to HAND staging did not complete");
+                }
+                return false;
+            }
+
+            if (*location == 3)
+            {
+                const auto placement = native_card_placement(
+                    api, NativeCardReference{.card = target.card, .state = target.state});
+                const NativeCardPlacement expected{
+                    .type = 1,
+                    .index = target.index,
+                    .row = static_cast<std::uint8_t>(target.row),
+                    .side = 0,
+                };
+                if (!placement || !card_placements_equal(*placement, expected))
+                {
+                    return fail_after_write(
+                        "native play reached FIELD at a different placement");
+                }
+                if (!restore_effects(target))
+                {
+                    return fail_after_write(
+                        "card effect list could not be restored after native play");
+                }
+                set_current_health(target.state, target.target_health);
+                const auto private_health = read_native_value<std::int32_t>(
+                    target.state, CardStateCurrentHealthOffset);
+                const auto public_health = parse_int32(required_getter_text(
+                    target.card, STR("getCurrentHealth")));
+                if (private_health != target.target_health || !public_health
+                    || *public_health != target.target_health)
+                {
+                    return fail_after_write(
+                        "field-card current health did not verify after native setter");
+                }
+                const auto desired_turn_active = static_cast<std::uint8_t>(
+                    target.target_turn_active ? 1 : 0);
+                const auto current_turn_active = read_native_value<std::uint8_t>(
+                    target.state, CardStateTurnActiveOffset);
+                if (current_turn_active != desired_turn_active)
+                {
+                    write_native_value(
+                        target.state,
+                        CardStateTurnActiveOffset,
+                        desired_turn_active);
+                    target.turn_active_written = true;
+                }
+                const auto public_turn_active = required_getter_text(
+                    target.card, STR("isTurnActive"));
+                if (read_native_value<std::uint8_t>(
+                        target.state, CardStateTurnActiveOffset)
+                        != desired_turn_active
+                    || (public_turn_active != "True"
+                        && public_turn_active != "False")
+                    || (public_turn_active == "True")
+                        != target.target_turn_active)
+                {
+                    return fail_after_write(
+                        "field-card turn-active state did not verify after guarded write");
+                }
+                append_route_c_trace_failure(
+                    "restore.exact-player-field.card.complete",
+                    card_placement_text(expected) + " health="
+                        + std::to_string(target.target_health)
+                        + " turnActive="
+                        + (target.target_turn_active ? "True" : "False"));
+                ++restore.exact_player_field_target_index;
+                if (restore.exact_player_field_target_index
+                    < restore.exact_player_field_targets.size())
+                {
+                    queue_current_target();
+                    return false;
+                }
+                if (!final_state_matches())
+                {
+                    return false;
+                }
+                rollback_active_decklist();
+                restore.exact_player_field_status = "verified-position-health";
+                append_route_c_trace(
+                    "restore.exact-player-field.verified-position-health");
+                update_exact_player_field_turn_diagnostic(restore);
+                return true;
+            }
+            if (restore.exact_player_field_move_started_at
+                && now - *restore.exact_player_field_move_started_at
+                    > std::chrono::seconds{8})
+            {
+                return fail_after_write("HAND to FIELD native play did not complete; "
+                                        + native_queue_diagnostic(api.location.engine_state));
+            }
+            return false;
+        }
+
         auto update_exact_character_charge(
             PendingRouteCRestore& restore,
             const RouteCBattleObjects& objects,
@@ -4134,7 +5498,8 @@ namespace QuantumCheckpoint
         {
             if (!restore.exact_character_charge
                 || (restore.exact_character_charge_status != "pending"
-                    && restore.exact_character_charge_status != "applied"))
+                    && restore.exact_character_charge_status != "applied"
+                    && restore.exact_character_charge_status != "verified"))
             {
                 return;
             }
@@ -4155,7 +5520,8 @@ namespace QuantumCheckpoint
                 return;
             }
 
-            if (restore.exact_character_charge_status == "applied")
+            if (restore.exact_character_charge_status == "applied"
+                || restore.exact_character_charge_status == "verified")
             {
                 if (*current_charge == exact.charge)
                 {
@@ -4214,287 +5580,115 @@ namespace QuantumCheckpoint
         auto update_exact_turn_progress(PendingRouteCRestore& restore,
                                         const RouteCBattleObjects& objects) -> void
         {
-            if (!restore.exact_turn_progress
-                || (restore.exact_turn_progress_status != "pending"
-                    && restore.exact_turn_progress_status != "applied"))
+            if (!restore.exact_turn_progress)
             {
                 return;
             }
-
-            NativeBattleTurnSnapshot turn{};
-            NativeDrawDelaySnapshot draw{};
-            UObject* controller_deck{};
-            try
+            const auto& exact = *restore.exact_turn_progress;
+            if (exact.schema_version < 2)
             {
-                const auto zones = find_route_c_player_zone_objects(
-                    objects.card_engine
-                        ? static_cast<const void*>(objects.card_engine->GetWorld())
-                        : nullptr);
-                controller_deck = zones.deck;
-                turn = read_validated_battle_turn(
-                    objects.card_engine, objects.spawner);
-                draw = read_validated_draw_delay(controller_deck, objects.card_engine);
-                if (draw.engine_state != turn.engine_state)
-                {
-                    throw std::runtime_error{
-                        "turn and player-draw state did not share one CardEngine"};
-                }
-            }
-            catch (const std::exception& error)
-            {
-                restore.exact_turn_progress_status =
-                    restore.exact_turn_progress_status == "applied"
-                    ? "failed-after-write"
-                    : "failed-no-write";
-                restore.exact_turn_progress_reason = error.what();
-                append_route_c_trace_failure(
-                    "restore.exact-turn-progress."
-                        + restore.exact_turn_progress_status,
-                    restore.exact_turn_progress_reason);
-                return;
+                throw std::runtime_error{
+                    "legacy draw sum cannot identify native draw readiness; recapture is required"};
             }
 
+            const auto zones = find_route_c_player_zone_objects(
+                static_cast<const void*>(objects.card_engine->GetWorld()));
+            const auto turn = read_validated_battle_turn(objects.card_engine, objects.spawner);
+            const auto draw = read_validated_draw_delay(zones.deck, objects.card_engine);
+            const auto cache = required_text(
+                export_property_text(zones.deck, STR("currentCanClickToDraw")),
+                "ControllerDeck.currentCanClickToDraw");
+            if (draw.engine_state != turn.engine_state
+                || (cache != "True" && cache != "False"))
+            {
+                throw std::runtime_error{"draw progress ownership or readiness cache was invalid"};
+            }
+            const bool target_ready = exact.player_draw_base == 0;
+            restore.exact_turn_progress_target_can_click_to_draw = target_ready;
+            restore.exact_turn_progress_observed_can_click_to_draw = cache == "True";
             restore.exact_turn_progress_observed_turn = turn.native_turn;
             restore.exact_turn_progress_observed_draw_delay = draw.getter;
+            restore.exact_turn_progress_observed_draw_base = draw.base;
+            restore.exact_turn_progress_observed_draw_adjustment = draw.adjustment;
             restore.exact_turn_progress_observed_wave_alert = turn.wave_alert_counter;
-            const auto& exact = *restore.exact_turn_progress;
 
-            const auto rollback_if_unchanged = [&]() -> bool {
-                if (!restore.exact_turn_progress_original_turn
-                    || !restore.exact_turn_progress_original_draw_base
-                    || !restore.exact_turn_progress_original_draw_adjustment
-                    || !restore.exact_turn_progress_applied_draw_adjustment
-                    || !restore.exact_turn_progress_original_wave_alert)
-                {
-                    return false;
-                }
-                try
-                {
-                    const auto current_turn = read_validated_battle_turn(
-                        objects.card_engine, objects.spawner);
-                    const auto zones = find_route_c_player_zone_objects(
-                        static_cast<const void*>(objects.card_engine->GetWorld()));
-                    const auto current_draw = read_validated_draw_delay(
-                        zones.deck, objects.card_engine);
-                    const auto original_turn =
-                        *restore.exact_turn_progress_original_turn;
-                    const auto original_base =
-                        *restore.exact_turn_progress_original_draw_base;
-                    const auto original_adjustment =
-                        *restore.exact_turn_progress_original_draw_adjustment;
-                    const auto applied_adjustment =
-                        *restore.exact_turn_progress_applied_draw_adjustment;
-                    const auto original_alert =
-                        *restore.exact_turn_progress_original_wave_alert;
-                    if (current_turn.engine_state
-                            != restore.exact_turn_progress_engine_state
-                        || current_draw.engine_state
-                            != restore.exact_turn_progress_engine_state
-                        || current_draw.deck_state
-                            != restore.exact_turn_progress_deck_state
-                        || current_draw.deck_state_controller
-                            != restore.exact_turn_progress_deck_state_controller
-                        || current_draw.base != original_base
-                        || (current_turn.native_turn
-                                != exact.card_engine_turn_count
-                            && current_turn.native_turn != original_turn)
-                        || (current_draw.adjustment != applied_adjustment
-                            && current_draw.adjustment != original_adjustment)
-                        || (current_turn.wave_alert_counter
-                                != exact.wave_alert_counter
-                            && current_turn.wave_alert_counter != original_alert))
-                    {
-                        return false;
-                    }
-
-                    write_native_value(
-                        current_turn.engine_state,
-                        CardEngineNativeTurnOffset,
-                        original_turn);
-                    write_native_value(
-                        current_draw.deck_state,
-                        DeckStateTurnDrawDelayAdjustmentOffset,
-                        original_adjustment);
-                    import_property_text(
-                        objects.spawner,
-                        STR("currentWaveAlertCounter"),
-                        std::to_string(original_alert));
-                    const auto rolled_back_turn = read_validated_battle_turn(
-                        objects.card_engine, objects.spawner);
-                    const auto rolled_back_draw = read_validated_draw_delay(
-                        zones.deck, objects.card_engine);
-                    restore.exact_turn_progress_observed_turn =
-                        rolled_back_turn.native_turn;
-                    restore.exact_turn_progress_observed_draw_delay =
-                        rolled_back_draw.getter;
-                    restore.exact_turn_progress_observed_wave_alert =
-                        rolled_back_turn.wave_alert_counter;
-                    return rolled_back_turn.engine_state
-                            == restore.exact_turn_progress_engine_state
-                        && rolled_back_draw.deck_state
-                            == restore.exact_turn_progress_deck_state
-                        && rolled_back_draw.base == original_base
-                        && rolled_back_draw.adjustment == original_adjustment
-                        && rolled_back_turn.native_turn == original_turn
-                        && rolled_back_turn.wave_alert_counter == original_alert;
-                }
-                catch (...)
-                {
-                    return false;
-                }
+            const auto values_match = [&]() {
+                return turn.native_turn == exact.card_engine_turn_count
+                    && turn.wave_alert_counter == exact.wave_alert_counter
+                    && draw.base == exact.player_draw_base
+                    && draw.adjustment == exact.player_draw_adjustment
+                    && draw.getter == exact.player_draw_delay;
             };
-
-            if (restore.exact_turn_progress_status == "applied")
+            // A verified layer is re-read throughout the outer stability window.
+            // Never repair a drift by repeatedly forcing a value against gameplay.
+            if (restore.exact_turn_progress_status == "applied"
+                || restore.exact_turn_progress_status == "verified")
             {
-                if (turn.engine_state == restore.exact_turn_progress_engine_state
-                    && draw.deck_state == restore.exact_turn_progress_deck_state
-                    && draw.deck_state_controller
-                        == restore.exact_turn_progress_deck_state_controller
-                    && restore.exact_turn_progress_original_draw_base
-                    && restore.exact_turn_progress_applied_draw_adjustment
-                    && draw.base == *restore.exact_turn_progress_original_draw_base
-                    && draw.adjustment
-                        == *restore.exact_turn_progress_applied_draw_adjustment
-                    && turn.native_turn == exact.card_engine_turn_count
-                    && draw.getter == exact.player_draw_delay
-                    && turn.wave_alert_counter == exact.wave_alert_counter)
+                if (turn.engine_state != restore.exact_turn_progress_engine_state
+                    || draw.deck_state != restore.exact_turn_progress_deck_state
+                    || draw.deck_state_controller != restore.exact_turn_progress_deck_state_controller
+                    || !values_match() || (cache == "True") != target_ready)
                 {
-                    restore.exact_turn_progress_status = "verified";
+                    restore.exact_turn_progress_status = "failed-after-write";
                     restore.exact_turn_progress_reason =
-                        "CardEngine turn, player draw delay, and wave-alert counter retained the saved values across frames";
-                    append_route_c_trace("restore.exact-turn-progress.verified");
-                    return;
+                        "native draw components, turn progress, or game-derived readiness drifted";
+                    throw std::runtime_error{restore.exact_turn_progress_reason};
                 }
-
-                const bool rolled_back = rollback_if_unchanged();
-                restore.exact_turn_progress_status = rolled_back
-                    ? "failed-rolled-back" : "failed-after-write";
-                restore.exact_turn_progress_reason = rolled_back
-                    ? "turn-progress write did not persist and was rolled back"
-                    : "turn-progress state changed concurrently; no rollback was attempted";
-                append_route_c_trace_failure(
-                    "restore.exact-turn-progress."
-                        + restore.exact_turn_progress_status,
-                    restore.exact_turn_progress_reason);
-                return;
-            }
-
-            if (turn.native_turn == exact.card_engine_turn_count
-                && draw.getter == exact.player_draw_delay
-                && turn.wave_alert_counter == exact.wave_alert_counter)
-            {
+                if (restore.exact_turn_progress_status != "verified")
+                {
+                    append_route_c_trace("restore.exact-turn-progress.verified");
+                }
                 restore.exact_turn_progress_status = "verified";
                 restore.exact_turn_progress_reason =
-                    "native startup already matched all saved turn-progress values";
-                append_route_c_trace(
-                    "restore.exact-turn-progress.verified-no-write");
+                    "native countdown and modifier, global turn, threat, and game-derived readiness agree";
                 return;
+            }
+            if (restore.exact_turn_progress_status != "pending")
+            {
+                throw std::runtime_error{"exact turn progress did not complete"};
             }
             if (turn.native_turn != 0 || turn.wave_alert_counter != 0)
             {
                 restore.exact_turn_progress_status = "failed-no-write";
-                restore.exact_turn_progress_reason =
-                    "CardEngine turn or wave-alert counter advanced before guarded restoration";
-                append_route_c_trace_failure(
-                    "restore.exact-turn-progress.failed-no-write",
-                    "engineTurn=" + std::to_string(turn.native_turn)
-                        + " drawDelay=" + std::to_string(draw.getter) + " alert="
-                        + std::to_string(turn.wave_alert_counter));
-                return;
+                throw std::runtime_error{"battle advanced before native turn-progress restoration"};
             }
-
-            const auto draw_delta = static_cast<std::int64_t>(
-                exact.player_draw_delay) - draw.computed;
-            const auto target_adjustment = static_cast<std::int64_t>(draw.adjustment)
-                + draw_delta;
-            if (target_adjustment < std::numeric_limits<std::int32_t>::min()
-                || target_adjustment > std::numeric_limits<std::int32_t>::max()
-                || target_adjustment < -100'000 || target_adjustment > 100'000)
-            {
-                restore.exact_turn_progress_status = "failed-no-write";
-                restore.exact_turn_progress_reason =
-                    "saved player draw delay required an unsafe native adjustment";
-                append_route_c_trace_failure(
-                    "restore.exact-turn-progress.failed-no-write",
-                    restore.exact_turn_progress_reason);
-                return;
-            }
-
             restore.exact_turn_progress_engine_state = turn.engine_state;
             restore.exact_turn_progress_deck_state = draw.deck_state;
-            restore.exact_turn_progress_deck_state_controller =
-                draw.deck_state_controller;
-            restore.exact_turn_progress_original_turn = turn.native_turn;
-            restore.exact_turn_progress_original_draw_base = draw.base;
-            restore.exact_turn_progress_original_draw_adjustment = draw.adjustment;
-            restore.exact_turn_progress_applied_draw_adjustment =
-                static_cast<std::int32_t>(target_adjustment);
-            restore.exact_turn_progress_original_wave_alert =
-                turn.wave_alert_counter;
-            try
+            restore.exact_turn_progress_deck_state_controller = draw.deck_state_controller;
+            restore.exact_turn_progress_status = "applying";
+            append_route_c_trace_failure(
+                "restore.exact-turn-progress.apply.begin",
+                "base=" + std::to_string(draw.base) + "->" + std::to_string(exact.player_draw_base)
+                    + " adjustment=" + std::to_string(draw.adjustment) + "->"
+                    + std::to_string(exact.player_draw_adjustment));
+            // All object operations run on the game thread. Restore the actual
+            // countdown and modifier separately; leave the presentation cache and
+            // its false->true event to AControllerDeck's next native tick.
+            write_native_value(turn.engine_state, CardEngineNativeTurnOffset,
+                               exact.card_engine_turn_count);
+            write_native_value(draw.deck_state, DeckStateTurnDrawDelayBaseOffset,
+                               exact.player_draw_base);
+            write_native_value(draw.deck_state, DeckStateTurnDrawDelayAdjustmentOffset,
+                               exact.player_draw_adjustment);
+            import_property_text(objects.spawner, STR("currentWaveAlertCounter"),
+                                 std::to_string(exact.wave_alert_counter));
+            const auto written_turn = read_validated_battle_turn(objects.card_engine, objects.spawner);
+            const auto written_draw = read_validated_draw_delay(zones.deck, objects.card_engine);
+            if (written_turn.engine_state != turn.engine_state
+                || written_draw.deck_state != draw.deck_state
+                || written_draw.deck_state_controller != draw.deck_state_controller
+                || written_turn.native_turn != exact.card_engine_turn_count
+                || written_turn.wave_alert_counter != exact.wave_alert_counter
+                || written_draw.base != exact.player_draw_base
+                || written_draw.adjustment != exact.player_draw_adjustment
+                || written_draw.getter != exact.player_draw_delay)
             {
-                append_route_c_trace_failure(
-                    "restore.exact-turn-progress.apply.begin",
-                    "engineTurn=0->"
-                        + std::to_string(exact.card_engine_turn_count)
-                        + " drawDelay=" + std::to_string(draw.getter) + "->"
-                        + std::to_string(exact.player_draw_delay) + " alert=0->"
-                        + std::to_string(exact.wave_alert_counter));
-                write_native_value(
-                    turn.engine_state,
-                    CardEngineNativeTurnOffset,
-                    exact.card_engine_turn_count);
-                write_native_value(
-                    draw.deck_state,
-                    DeckStateTurnDrawDelayAdjustmentOffset,
-                    static_cast<std::int32_t>(target_adjustment));
-                import_property_text(
-                    objects.spawner,
-                    STR("currentWaveAlertCounter"),
-                    std::to_string(exact.wave_alert_counter));
-                const auto written_turn = read_validated_battle_turn(
-                    objects.card_engine, objects.spawner);
-                const auto written_draw = read_validated_draw_delay(
-                    controller_deck, objects.card_engine);
-                restore.exact_turn_progress_observed_turn = written_turn.native_turn;
-                restore.exact_turn_progress_observed_draw_delay = written_draw.getter;
-                restore.exact_turn_progress_observed_wave_alert =
-                    written_turn.wave_alert_counter;
-                if (written_turn.engine_state
-                        != restore.exact_turn_progress_engine_state
-                    || written_draw.engine_state
-                        != restore.exact_turn_progress_engine_state
-                    || written_draw.deck_state
-                        != restore.exact_turn_progress_deck_state
-                    || written_draw.deck_state_controller
-                        != restore.exact_turn_progress_deck_state_controller
-                    || written_draw.base != draw.base
-                    || written_draw.adjustment != target_adjustment
-                    || written_turn.native_turn != exact.card_engine_turn_count
-                    || written_draw.getter != exact.player_draw_delay
-                    || written_turn.wave_alert_counter != exact.wave_alert_counter)
-                {
-                    throw std::runtime_error{
-                        "turn-progress write did not verify immediately"};
-                }
-                restore.exact_turn_progress_status = "applied";
-                restore.exact_turn_progress_reason =
-                    "all turn-progress values were written; awaiting cross-frame verification";
-                append_route_c_trace("restore.exact-turn-progress.apply.complete");
+                restore.exact_turn_progress_status = "failed-after-write";
+                throw std::runtime_error{"native turn-progress components did not verify immediately"};
             }
-            catch (const std::exception& error)
-            {
-                const bool rolled_back = rollback_if_unchanged();
-                restore.exact_turn_progress_status = rolled_back
-                    ? "failed-rolled-back" : "failed-after-write";
-                restore.exact_turn_progress_reason = std::string{error.what()}
-                    + (rolled_back ? "; original values restored"
-                                   : "; rollback could not be proven safe");
-                append_route_c_trace_failure(
-                    "restore.exact-turn-progress."
-                        + restore.exact_turn_progress_status,
-                    restore.exact_turn_progress_reason);
-            }
+            restore.exact_turn_progress_status = "applied";
+            restore.exact_turn_progress_reason = "awaiting native deck tick and cross-frame verification";
+            append_route_c_trace("restore.exact-turn-progress.apply.complete");
         }
 
         auto update_route_c_restore() -> void
@@ -4714,6 +5908,9 @@ namespace QuantumCheckpoint
 
                 if (!game_state || *game_state != "OPEN" || !wave)
                 {
+                    restore.startup_open_since.reset();
+                    if (restore.phase == RouteCRestorePhase::AwaitingPostRestoreStability)
+                        restore.stability_deadline = now + std::chrono::seconds{3};
                     return;
                 }
                 if (!wave || *wave != restore.checkpoint.wave_index)
@@ -4744,6 +5941,25 @@ namespace QuantumCheckpoint
                     return;
                 }
 
+                if (!restore.startup_settled)
+                {
+                    if (!restore.startup_open_since)
+                    {
+                        restore.startup_open_since = now;
+                        return;
+                    }
+                    if (now - *restore.startup_open_since < std::chrono::milliseconds{750})
+                    {
+                        return;
+                    }
+                    restore.startup_settled = true;
+                    append_route_c_trace("restore.startup-open.settled");
+                }
+
+                if (!verify_exact_player_field(restore, objects, now))
+                {
+                    return;
+                }
                 if (!verify_exact_player_zones(restore, objects, now))
                 {
                     return;
@@ -4751,6 +5967,14 @@ namespace QuantumCheckpoint
                 if (!verify_exact_player_trash(restore, objects, now))
                 {
                     return;
+                }
+                if ((restore.exact_player_field && restore.exact_player_field_status != "verified-position-health")
+                    || (restore.exact_player_zones && restore.exact_player_zones_status != "verified")
+                    || (restore.exact_player_trash && restore.exact_player_trash_status != "verified"))
+                {
+                    throw std::runtime_error{"exact player-card layout failed; "
+                        + restore.exact_player_field_reason + "; "
+                        + restore.exact_player_zones_reason + "; " + restore.exact_player_trash_reason};
                 }
 
                 if (restore.exact_spawn_plan_status == "pending")
@@ -4769,6 +5993,7 @@ namespace QuantumCheckpoint
                     character_card_charge,
                     character_card_charge_requirement);
                 update_exact_turn_progress(restore, objects);
+                update_exact_player_field_turn_diagnostic(restore);
                 if (restore.exact_character_charge_status == "pending")
                 {
                     if (now - restore.started_at <= std::chrono::seconds{5})
@@ -4885,15 +6110,54 @@ namespace QuantumCheckpoint
                         restore.auto_spawn_suppressed = false;
                     }
                     restore.phase = RouteCRestorePhase::AwaitingPostRestoreStability;
-                    restore.phase_ready_at = now + std::chrono::seconds{3};
+                    restore.stability_deadline = now + std::chrono::seconds{3};
                     append_route_c_trace(
                         "restore.post-restore-stability.begin");
                     return;
                 }
 
+                const auto final_zones = find_route_c_player_zone_objects(
+                    static_cast<const void*>(objects.card_engine->GetWorld()));
+                const auto verify_final_zones = [&](const auto& exact) {
+                    if (!final_zones.deck || !final_zones.hand
+                        || required_getter_text(final_zones.deck, STR("getCardInstanceListSorted")) != exact.player_deck
+                        || required_getter_text(final_zones.hand, STR("getCardInstanceListSorted")) != exact.player_hand)
+                    {
+                        throw std::runtime_error{"player deck/hand drifted during final stability window"};
+                    }
+                };
+                if (restore.exact_player_zones) verify_final_zones(*restore.exact_player_zones);
+                if (restore.exact_player_trash)
+                {
+                    verify_final_zones(*restore.exact_player_trash);
+                    if (!final_zones.trash
+                        || required_getter_text(final_zones.trash, STR("getCardInstanceListSorted"))
+                            != restore.exact_player_trash->player_trash)
+                    {
+                        throw std::runtime_error{"player trash drifted during final stability window"};
+                    }
+                }
+                if ((restore.exact_spawn_plan && restore.exact_spawn_plan_status != "verified")
+                    || (restore.exact_player_zones && restore.exact_player_zones_status != "verified")
+                    || (restore.exact_player_trash && restore.exact_player_trash_status != "verified")
+                    || (restore.exact_player_field && restore.exact_player_field_status != "verified-position-health")
+                    || (restore.exact_character_charge && restore.exact_character_charge_status != "verified")
+                    || (restore.exact_turn_progress && restore.exact_turn_progress_status != "verified"))
+                {
+                    throw std::runtime_error{"requested exact layers did not all verify; fresh Route C is required"};
+                }
+                if (now < restore.stability_deadline)
+                {
+                    return;
+                }
                 finish_route_c_restore(
                     "passed",
-                    restore.exact_turn_progress_status == "verified"
+                    restore.exact_player_field_status == "verified-position-health"
+                        && restore.exact_turn_progress_status == "verified"
+                        ? "ordinary substage semantics, exact player deck, hand, field positions, field health, field turn-active state, CardEngine turn, player draw delay, and wave-alert counter were restored"
+                    : restore.exact_player_field_status == "verified-position-health"
+                        ? "ordinary substage semantics and exact player deck, hand, field positions, field health, and field turn-active state were restored"
+                    : restore.exact_turn_progress_status == "verified"
                         && restore.exact_player_trash_status == "verified"
                         ? "ordinary substage semantics, exact player deck, hand, trash, CardEngine turn, player draw delay, and wave-alert counter were restored"
                     : restore.exact_turn_progress_status == "verified"
@@ -4948,6 +6212,10 @@ namespace QuantumCheckpoint
 
         auto route_c_actor_begin_play_pre(AActor* actor) -> void
         {
+            // BeginPlay establishes the engine thread. Background UE4SS on_update
+            // only requests work; reflected/native object access stays here.
+            DWORD unset{};
+            g_game_thread_id.compare_exchange_strong(unset, GetCurrentThreadId());
             try
             {
                 if (!actor || !g_pending_route_c_restore
@@ -4992,7 +6260,8 @@ namespace QuantumCheckpoint
                                    STR("setActiveDecklist"),
                                    {{STR("newDecklist"),
                                       (restore.exact_player_zones
-                                       || restore.exact_player_trash)
+                                       || restore.exact_player_trash
+                                       || restore.exact_player_field)
                                          ? restore.exact_player_startup_decklist
                                          : route_c_startup_decklist(
                                              restore.checkpoint.active_decklist)}});
@@ -5057,7 +6326,8 @@ namespace QuantumCheckpoint
                                STR("setActiveDecklist"),
                                {{STR("newDecklist"),
                                   (restore.exact_player_zones
-                                   || restore.exact_player_trash)
+                                   || restore.exact_player_trash
+                                   || restore.exact_player_field)
                                      ? restore.exact_player_startup_decklist
                                      : restore.checkpoint.active_decklist}});
                 call_reflected(game_instance,
@@ -5449,6 +6719,21 @@ namespace QuantumCheckpoint
                     append_getters(snapshot, object, ControllerDeckGetters);
                     append_function_pointers(
                         snapshot, object, ControllerDeckDiagnosticFunctions);
+                    if (export_property_text(object, STR("boardSide")) == "PLAYER")
+                    {
+                        try
+                        {
+                            const auto live = find_route_c_objects();
+                            const auto draw = read_validated_draw_delay(object, live.card_engine);
+                            snapshot.properties.push_back({"native:drawBase", std::to_string(draw.base)});
+                            snapshot.properties.push_back({"native:drawAdjustment", std::to_string(draw.adjustment)});
+                            snapshot.properties.push_back({"native:canTurnDraw", draw.base == 0 ? "True" : "False"});
+                        }
+                        catch (const std::exception& error)
+                        {
+                            snapshot.properties.push_back({"native:drawReadError", error.what()});
+                        }
+                    }
                 }
                 else if (role.starts_with("BP_Controller") && role != "BP_ControllerBoard_C"
                          && role != "BP_FieldSlot_C")
@@ -7458,7 +8743,7 @@ namespace QuantumCheckpoint
             }
 
             const NativeSharedPointerPair empty{};
-            const NativeSharedPointerPair target{shared_object, shared_controller};
+            const auto target = retain_native_card_argument(shared_object, shared_controller);
             api.queue_move_card(
                 api.engine_state, &empty, &target, &empty, destination, 0);
         }
@@ -7588,7 +8873,7 @@ namespace QuantumCheckpoint
                     "move-card-on-field shared ownership did not pass validation"};
             }
             const NativeSharedPointerPair empty{};
-            const NativeSharedPointerPair target{shared_object, shared_controller};
+            const auto target = retain_native_card_argument(shared_object, shared_controller);
             pending.queue_move_card_on_field(
                 pending.engine_state,
                 &empty,
@@ -7728,7 +9013,7 @@ namespace QuantumCheckpoint
             }
             suppress_move_card_probe_effect_list(pending);
             const NativeSharedPointerPair empty{};
-            const NativeSharedPointerPair target{shared_object, shared_controller};
+            const auto target = retain_native_card_argument(shared_object, shared_controller);
             pending.queue_play_card_to_field(
                 pending.engine_state,
                 &empty,
@@ -8229,7 +9514,7 @@ namespace QuantumCheckpoint
         QuantumCheckpointMod()
         {
             ModName = STR("QuantumCheckpoint");
-            ModVersion = STR("0.15.0-dev");
+            ModVersion = STR("0.16.0");
             ModDescription = STR("Route C checkpoint with optional exact-state supplements");
             ModAuthors = STR("zaofenMachine and contributors");
             ModIntendedSDKVersion = STR("3.0.1");
@@ -8237,6 +9522,7 @@ namespace QuantumCheckpoint
 
         ~QuantumCheckpointMod() override
         {
+            g_game_thread_pump.store(nullptr, std::memory_order_release);
             try
             {
                 if (g_spawn_next_wave_function && g_spawn_next_wave_hook_ids)
@@ -8316,6 +9602,27 @@ namespace QuantumCheckpoint
 
         auto on_unreal_init() -> void override
         {
+            g_game_thread_pump.store(&QuantumCheckpointMod::process_game_update,
+                                     std::memory_order_release);
+            Hook::RegisterProcessEventPostCallback([](UObject* context, UFunction* function, void*) {
+                static thread_local bool executing{};
+                if (executing || !g_unreal_ready.load(std::memory_order_acquire)
+                    || GetCurrentThreadId() != g_game_thread_id.load(std::memory_order_acquire)
+                    || !g_game_update_requested.load(std::memory_order_acquire)
+                    || !function || function->GetName() != STR("ReceiveTick")
+                    || !context || object_class_name(context) != "BP_MousePlayerController_C")
+                {
+                    return;
+                }
+                const auto pump = g_game_thread_pump.load(std::memory_order_acquire);
+                if (!pump || !g_game_update_requested.exchange(false, std::memory_order_acq_rel))
+                {
+                    return;
+                }
+                executing = true;
+                pump();
+                executing = false;
+            });
             g_spawn_wave_index_function = UObjectGlobals::StaticFindObject<UFunction*>(
                 nullptr,
                 nullptr,
@@ -8377,9 +9684,41 @@ namespace QuantumCheckpoint
 
         auto on_update() -> void override
         {
+            g_game_update_requested.store(true, std::memory_order_release);
+        }
+
+        static auto process_game_update() -> void
+        {
             try
             {
+                if (g_pending_route_c_fallback && !g_pending_route_c_restore)
+                {
+                    auto fallback = std::move(*g_pending_route_c_fallback);
+                    g_pending_route_c_fallback.reset();
+                    try
+                    {
+                        begin_route_c_restore(fallback.checkpoint, fallback.reason);
+                    }
+                    catch (const std::exception& error)
+                    {
+                        // A second attempt is never scheduled. Surface the failure
+                        // instead of looping or labeling the old world as recovered.
+                        append_route_c_trace_failure("restore.semantic-fallback.failed-to-start", error.what());
+                        PendingRouteCRestore failed{};
+                        failed.checkpoint = std::move(fallback.checkpoint);
+                        failed.semantic_fallback = true;
+                        failed.fallback_reason = std::move(fallback.reason);
+                        failed.status = "failed";
+                        failed.reason = "semantic fallback could not start: " + std::string{error.what()};
+                        write_route_c_restore_report(failed);
+                    }
+                    return;
+                }
                 update_route_c_restore();
+                if (g_pending_route_c_fallback)
+                {
+                    return;
+                }
                 update_route_c_capture();
                 update_route_c_wave_poll();
                 finish_health_write_probe_if_due();

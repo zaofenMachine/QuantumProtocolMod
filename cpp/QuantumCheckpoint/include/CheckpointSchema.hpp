@@ -20,10 +20,13 @@ namespace QuantumCheckpoint
     inline constexpr int ExactPlayerTrashSchemaVersion = 1;
     inline constexpr std::string_view ExactPlayerTrashCheckpointKind =
         "route-c-exact-player-trash";
+    inline constexpr int ExactPlayerFieldSchemaVersion = 1;
+    inline constexpr std::string_view ExactPlayerFieldCheckpointKind =
+        "route-c-exact-player-field";
     inline constexpr int ExactCharacterChargeSchemaVersion = 1;
     inline constexpr std::string_view ExactCharacterChargeCheckpointKind =
         "route-c-exact-character-charge";
-    inline constexpr int ExactTurnProgressSchemaVersion = 1;
+    inline constexpr int ExactTurnProgressSchemaVersion = 2;
     inline constexpr std::string_view ExactTurnProgressCheckpointKind =
         "route-c-exact-turn-progress";
     inline constexpr std::string_view RouteCSupportedMode = "DUNGEON";
@@ -128,6 +131,35 @@ namespace QuantumCheckpoint
         std::string payload_checksum{};
     };
 
+    struct ExactPlayerFieldCardState
+    {
+        std::int32_t row{};
+        std::int32_t index{};
+        std::int32_t current_health{};
+        bool turn_active{};
+    };
+
+    // This supersedes both clean player-zone supplements when a supported player
+    // FIELD is present. Card instances and compact field-state records are aligned
+    // by deterministic row/index order.
+    struct ExactPlayerFieldCheckpoint
+    {
+        int schema_version{ExactPlayerFieldSchemaVersion};
+        std::string kind{ExactPlayerFieldCheckpointKind};
+        std::string captured_at_utc{};
+        std::string route_c_payload_checksum{};
+        std::string game_executable_sha256{};
+        std::uint64_t game_executable_size{};
+        std::string source_level_name{};
+        std::int32_t wave_index{};
+        std::string player_deck{};
+        std::string player_hand{};
+        std::string player_trash{};
+        std::string player_field{};
+        std::string player_field_states{};
+        std::string payload_checksum{};
+    };
+
     struct ExactCharacterChargeCheckpoint
     {
         int schema_version{ExactCharacterChargeSchemaVersion};
@@ -156,6 +188,13 @@ namespace QuantumCheckpoint
         std::int32_t card_engine_turn_count{};
         std::int32_t player_draw_delay{};
         std::int32_t wave_alert_counter{};
+        // -1 is the legacy schema-1 sentinel. New captures persist 0/1 while
+        // remaining checksum-compatible with existing schema-1 supplements.
+        std::int32_t player_can_click_to_draw{-1};
+        // Schema 2 preserves both inputs. The displayed sum alone cannot identify
+        // draw readiness: the native predicate checks only player_draw_base == 0.
+        std::int32_t player_draw_base{};
+        std::int32_t player_draw_adjustment{};
         std::string payload_checksum{};
     };
 } // namespace QuantumCheckpoint

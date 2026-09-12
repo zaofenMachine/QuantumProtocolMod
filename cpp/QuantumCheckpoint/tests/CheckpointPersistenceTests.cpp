@@ -88,6 +88,26 @@ namespace
         };
     }
 
+    auto sample_exact_player_field(const QuantumCheckpoint::RouteCCheckpoint& route_c)
+        -> QuantumCheckpoint::ExactPlayerFieldCheckpoint
+    {
+        return {
+            .captured_at_utc = route_c.captured_at_utc,
+            .route_c_payload_checksum = route_c.payload_checksum,
+            .game_executable_sha256 = route_c.game_executable_sha256,
+            .game_executable_size = route_c.game_executable_size,
+            .source_level_name = route_c.source_level_name,
+            .wave_index = route_c.wave_index,
+            .player_deck = "((CardInfo=(Tag=\"a\")))",
+            .player_hand = "((CardInfo=(Tag=\"b\")))",
+            .player_trash = "((CardInfo=(Tag=\"c\")))",
+            .player_field =
+                "((CardInfo=(Tag=\"naturalApple\")),"
+                "(CardInfo=(Tag=\"naturalLemon\")))",
+            .player_field_states = "0,0,1,0;1,3,2,1",
+        };
+    }
+
     auto sample_exact_character_charge(const QuantumCheckpoint::RouteCCheckpoint& route_c)
         -> QuantumCheckpoint::ExactCharacterChargeCheckpoint
     {
@@ -116,6 +136,9 @@ namespace
             .card_engine_turn_count = 5,
             .player_draw_delay = 4,
             .wave_alert_counter = 5,
+            .player_can_click_to_draw = 1,
+            .player_draw_base = 4,
+            .player_draw_adjustment = 0,
         };
     }
 }
@@ -327,6 +350,20 @@ int main()
                 "()",
                 error),
             error.c_str());
+
+    error.clear();
+    require(exact_player_trash_staging_matches(
+                "((CardInfo=(Tag=\"a\")))",
+                "((CardInfo=(Tag=\"b\")))",
+                "((CardInfo=(Tag=\"naturalApple\",Level=1,rarityTier=1),"
+                "upgradeLevel=0))",
+                "((CardInfo=(Tag=\"a\")))",
+                "((CardInfo=(Tag=\"naturalApple\",usageType=STARTER),"
+                "upgradeLevel=0),(CardInfo=(Tag=\"b\")))",
+                "()",
+                error),
+            "staging compares semantic card identity across runtime normalization");
+
     require(!exact_player_trash_staging_matches(
                 "((CardInfo=(Tag=\"a\")),(CardInfo=(Tag=\"e\")))",
                 "((CardInfo=(Tag=\"b\")),(CardInfo=(Tag=\"f\")))",
@@ -375,6 +412,143 @@ int main()
     require(error.find("checksum") != std::string::npos,
             "player-trash corruption reports checksum error");
 
+    auto field_route = original;
+    field_route.active_decklist =
+        "(deckTag=\"field-test\",cardList=((cardName=\"a\",count=1),"
+        "(cardName=\"b\",count=1),(cardName=\"c\",count=1),"
+        "(cardName=\"naturalApple\",count=1),"
+        "(cardName=\"naturalLemon\",count=1)))";
+    field_route.payload_checksum = route_c_payload_checksum(field_route);
+    auto field = sample_exact_player_field(field_route);
+    const auto field_json = serialize_exact_player_field_checkpoint(field);
+    error.clear();
+    const auto parsed_field = parse_exact_player_field_checkpoint(field_json, error);
+    require(parsed_field.has_value(), error.c_str());
+    require(parsed_field->player_field == field.player_field,
+            "exact player field round trip");
+    require(parsed_field->payload_checksum
+                == exact_player_field_payload_checksum(*parsed_field),
+            "exact player-field checksum round trip");
+
+    error.clear();
+    const auto field_states = parse_exact_player_field_states(
+        field.player_field_states, error);
+    require(field_states && field_states->size() == 2,
+            "aligned player-field states parse");
+    require((*field_states)[0].row == 0 && (*field_states)[0].index == 0
+                && (*field_states)[0].current_health == 1
+                && !(*field_states)[0].turn_active,
+            "front player-field state parses exactly");
+    require((*field_states)[1].row == 1 && (*field_states)[1].index == 3
+                && (*field_states)[1].current_health == 2
+                && (*field_states)[1].turn_active,
+            "back player-field state parses exactly");
+
+    error.clear();
+    const auto field_startup = exact_player_field_startup_decklist(
+        field_route.active_decklist,
+        field.player_deck,
+        field.player_hand,
+        field.player_trash,
+        field.player_field,
+        error);
+    require(field_startup.has_value(), error.c_str());
+    require(field_startup->find("fixedOrder=True") != std::string::npos,
+            "player-field startup enables fixed order");
+    require(field_startup->find("cardName=\"naturalApple\"")
+                < field_startup->find("cardName=\"naturalLemon\""),
+            "player-field startup preserves placement order below the saved hand");
+
+    error.clear();
+    require(exact_player_field_staging_matches(
+                field.player_deck,
+                field.player_hand,
+                field.player_trash,
+                field.player_field,
+                "((CardInfo=(Tag=\"a\")))",
+                "((CardInfo=(Tag=\"c\")),(CardInfo=(Tag=\"naturalApple\")),"
+                "(CardInfo=(Tag=\"naturalLemon\")),(CardInfo=(Tag=\"b\")))",
+                "()",
+                error),
+            error.c_str());
+
+    error.clear();
+    require(exact_player_field_staging_matches(
+                field.player_deck,
+                field.player_hand,
+                field.player_trash,
+                field.player_field,
+                "((CardInfo=(Tag=\"a\")))",
+                "((CardInfo=(Tag=\"b\")),(CardInfo=(Tag=\"c\")),"
+                "(CardInfo=(Tag=\"naturalApple\")),"
+                "(CardInfo=(Tag=\"naturalLemon\")))",
+                "()",
+                error),
+            "player-field staging accepts sorted interleaving of saved hand and extras");
+
+    auto ambiguous_field = field;
+    // Runtime regression: field slots are Apple/Lemon/Apple, but native hand
+    // sorting exposes Cherry/Cherry/Apple/Lemon/Spring during five-card startup.
+    const std::string retained_deck = "((CardInfo=(Tag=\"genericBattery\")),(CardInfo=(Tag=\"spDeckEdit\")))";
+    const std::string retained_hand = "((CardInfo=(Tag=\"naturalCherry\")),(CardInfo=(Tag=\"naturalCherry\")),(CardInfo=(Tag=\"naturalSpring\")))";
+    const std::string slot_order = "((CardInfo=(Tag=\"naturalApple\")),(CardInfo=(Tag=\"naturalLemon\"),upgradeLevel=1),(CardInfo=(Tag=\"naturalApple\")))";
+    const std::string sorted_stage_deck = "((CardInfo=(Tag=\"naturalApple\")),(CardInfo=(Tag=\"genericBattery\")),(CardInfo=(Tag=\"spDeckEdit\")))";
+    const std::string sorted_stage_hand = "((CardInfo=(Tag=\"naturalCherry\")),(CardInfo=(Tag=\"naturalCherry\")),(CardInfo=(Tag=\"naturalApple\")),(CardInfo=(Tag=\"naturalLemon\"),upgradeLevel=1),(CardInfo=(Tag=\"naturalSpring\")))";
+    error.clear();
+    require(exact_player_field_staging_matches(retained_deck, retained_hand, "()", slot_order,
+                sorted_stage_deck, sorted_stage_hand, "()", error), error.c_str());
+    error.clear();
+    require(!exact_player_field_staging_matches(retained_deck, retained_hand, "()", slot_order,
+                sorted_stage_deck,
+                "((CardInfo=(Tag=\"naturalSpring\")),(CardInfo=(Tag=\"naturalCherry\")),(CardInfo=(Tag=\"naturalCherry\")),(CardInfo=(Tag=\"naturalApple\")),(CardInfo=(Tag=\"naturalLemon\"),upgradeLevel=1))",
+                "()", error), "staging must still preserve retained hand order");
+    auto wrong_upgrade = sorted_stage_hand;
+    wrong_upgrade.replace(wrong_upgrade.find("upgradeLevel=1"), 14, "upgradeLevel=2");
+    error.clear();
+    require(!exact_player_field_staging_matches(retained_deck, retained_hand, "()", slot_order,
+                sorted_stage_deck, wrong_upgrade, "()", error),
+            "relaxed temporary field order must not permit changed upgrades");
+
+    ambiguous_field.player_hand = "((CardInfo=(Tag=\"naturalApple\")))";
+    error.clear();
+    require(parse_exact_player_field_checkpoint(
+                serialize_exact_player_field_checkpoint(ambiguous_field), error)
+                .has_value(),
+            "equivalent hand/field card identities remain valid staging inputs");
+
+    auto six_visible_cards = field;
+    six_visible_cards.player_hand =
+        "((CardInfo=(Tag=\"b\")),(CardInfo=(Tag=\"d\")),"
+        "(CardInfo=(Tag=\"e\")),(CardInfo=(Tag=\"f\")))";
+    const std::string six_visible_decklist =
+        "(deckTag=\"field-capacity-test\",cardList=((cardName=\"a\",count=1),"
+        "(cardName=\"b\",count=1),(cardName=\"c\",count=1),"
+        "(cardName=\"d\",count=1),(cardName=\"e\",count=1),"
+        "(cardName=\"f\",count=1),(cardName=\"naturalApple\",count=1),"
+        "(cardName=\"naturalLemon\",count=1)))";
+    error.clear();
+    require(exact_player_field_startup_decklist(
+                six_visible_decklist,
+                six_visible_cards.player_deck,
+                six_visible_cards.player_hand,
+                six_visible_cards.player_trash,
+                six_visible_cards.player_field,
+                error)
+                .has_value(),
+            "field staging supports more than five cards across saved hand and field");
+
+    auto unsupported_field = field;
+    unsupported_field.player_field = "((CardInfo=(Tag=\"spStorageHit\")))";
+    unsupported_field.player_field_states = "0,0,1,1";
+    error.clear();
+    require(!parse_exact_player_field_checkpoint(
+                serialize_exact_player_field_checkpoint(unsupported_field), error),
+            "special cards are outside the first guarded player-field slice");
+
+    error.clear();
+    require(!parse_exact_player_field_states("1,3,2,1;0,0,1,0", error),
+            "player-field states reject non-canonical slot order");
+
     auto charge = sample_exact_character_charge(original);
     const auto charge_json = serialize_exact_character_charge_checkpoint(charge);
     error.clear();
@@ -412,11 +586,73 @@ int main()
     require(parsed_turn_progress.has_value(), error.c_str());
     require(parsed_turn_progress->card_engine_turn_count == 5
                 && parsed_turn_progress->player_draw_delay == 4
-                && parsed_turn_progress->wave_alert_counter == 5,
+                && parsed_turn_progress->wave_alert_counter == 5
+                && parsed_turn_progress->player_can_click_to_draw == 1,
             "exact turn progress round trip");
     require(parsed_turn_progress->payload_checksum
                 == exact_turn_progress_payload_checksum(*parsed_turn_progress),
             "exact turn-progress checksum round trip");
+
+    // Regression: these states display the same zero, but only base=0 can draw.
+    auto display_only_zero = turn_progress;
+    display_only_zero.player_draw_delay = 0;
+    display_only_zero.player_draw_base = 5;
+    display_only_zero.player_draw_adjustment = -5;
+    auto ready_zero = display_only_zero;
+    ready_zero.player_draw_base = 0;
+    ready_zero.player_draw_adjustment = 0;
+    error.clear();
+    const auto parsed_display_only = parse_exact_turn_progress_checkpoint(
+        serialize_exact_turn_progress_checkpoint(display_only_zero), error);
+    const auto parsed_ready = parse_exact_turn_progress_checkpoint(
+        serialize_exact_turn_progress_checkpoint(ready_zero), error);
+    require(parsed_display_only && parsed_ready
+                && parsed_display_only->player_draw_base == 5
+                && parsed_display_only->player_draw_adjustment == -5
+                && parsed_ready->player_draw_base == 0
+                && parsed_ready->player_draw_adjustment == 0
+                && parsed_display_only->payload_checksum != parsed_ready->payload_checksum,
+            "equal displayed delays preserve distinct native readiness states");
+
+    auto missing_components = turn_progress_json;
+    const auto component_start = missing_components.find("  \"playerDrawBase\":");
+    require(component_start != std::string::npos, "schema 2 emits native countdown");
+    missing_components.erase(component_start, missing_components.find('\n', component_start) - component_start + 1);
+    error.clear();
+    require(!parse_exact_turn_progress_checkpoint(missing_components, error),
+            "schema 2 must not invent missing native countdown");
+
+    auto inconsistent_components = turn_progress;
+    inconsistent_components.player_draw_base = 5;
+    error.clear();
+    require(!parse_exact_turn_progress_checkpoint(
+                serialize_exact_turn_progress_checkpoint(inconsistent_components), error),
+            "valid checksum does not permit inconsistent native draw components");
+
+    auto tampered_components = turn_progress_json;
+    const auto base_field = tampered_components.find("\"playerDrawBase\": 4");
+    require(base_field != std::string::npos, "countdown corruption fixture exists");
+    tampered_components.replace(base_field, std::string{"\"playerDrawBase\": 4"}.size(),
+                                "\"playerDrawBase\": 3");
+    error.clear();
+    require(!parse_exact_turn_progress_checkpoint(tampered_components, error),
+            "native countdown tampering is rejected");
+
+    auto legacy_turn_progress = turn_progress;
+    legacy_turn_progress.schema_version = 1;
+    legacy_turn_progress.player_can_click_to_draw = -1;
+    const auto legacy_turn_progress_json =
+        serialize_exact_turn_progress_checkpoint(legacy_turn_progress);
+    require(legacy_turn_progress_json.find("playerCanClickToDraw")
+                == std::string::npos,
+            "legacy turn progress omits draw-click readiness");
+    error.clear();
+    const auto parsed_legacy_turn_progress =
+        parse_exact_turn_progress_checkpoint(legacy_turn_progress_json, error);
+    require(parsed_legacy_turn_progress
+                && parsed_legacy_turn_progress->player_can_click_to_draw == -1
+                && parsed_legacy_turn_progress->schema_version == 1,
+            "legacy schema-1 turn progress remains readable");
 
     auto corrupt_turn_progress = turn_progress_json;
     const auto draw_delay_field = corrupt_turn_progress.find("\"playerDrawDelay\": 4");

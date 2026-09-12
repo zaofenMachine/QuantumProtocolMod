@@ -2,7 +2,7 @@
 
 《Quantum Protocol》局内检查点 Mod 的可行性研究与实验原型。
 
-当前路线 C“普通地牢小关语义重开”的核心垂直切片已经闭环。v0.10.1 以独立补充文件恢复未来 `spawnList`；v0.11.3 通过原生 `FDecklist.fixedOrder` 恢复纯净小关开头的精确牌库与手牌；v0.12.1 完成复杂 wave 2 样本的向下生命恢复；v0.13.0 恢复低于满充阈值的角色充能；v0.14.0 又在无玩家场上/待处理卡的受限样本中恢复了精确墓地；v0.15.0 成组恢复全局回合、玩家抽牌延迟和累计威胁进度。主菜单和战斗内恢复均实测 `passed`。玩家场上状态和复杂敌方运行状态仍未完整精确复原。
+当前 v0.16.0 保留路线 C“普通地牢小关语义重开”，并支持受限玩家场地的格位、生命和攻击状态恢复。回合补充升级为 schema 2，保存原生抽牌基础倒计时与修正量，由游戏自行计算可抽牌状态。恢复在游戏线程执行，精确层失败后重新加载一次纯 Route C；敌人伤势、行动倒计时及复杂效果仍未精确恢复。
 
 ## 当前结论
 
@@ -29,7 +29,8 @@
 - [复杂战斗差异与向下生命恢复](docs/phase-10-complex-combat-gap.md)
 - [角色充能精确恢复](docs/phase-11-character-charge.md)
 - [玩家墓地精确恢复](docs/phase-12-player-trash.md)
-- [回合进度精确恢复](docs/phase-13-turn-progress.md)
+- [回合进度实验及后续修正](docs/phase-13-turn-progress.md)
+- [受限场地、真实抽牌与失败回退](docs/phase-15-player-field-and-draw-authority.md)
 - [文档索引](docs/README.md)
 
 ## 目录
@@ -89,7 +90,7 @@ C++ 构建前提、已验证工具链和反射结构提取方法见 [C++ 开发�
 
 安装器会把 DLL 部署为 `Mods\QuantumCheckpoint\dlls\main.dll`，在现有 `mods.txt` 中加入 `QuantumCheckpoint : 1`，并把精确回滚材料保存在被 Git 忽略的 `backups/cpp` 与 `runtime` 目录。若旧 Lua 研究探针存在，安装器会在本次 C++ 部署中将其禁用；回滚时会恢复部署前配置。
 
-v0.15.0 路线 C 与精确补充切片的热键和输出：
+v0.16.0 路线 C 与精确补充切片的热键和输出：
 
 - `Ctrl+Shift+F5`：在受支持的稳定普通小关手动保存；每次正常波次生成后也会自动保存。
 - `Ctrl+Shift+F6`：读取唯一检查点并执行语义重开。
@@ -99,11 +100,12 @@ v0.15.0 路线 C 与精确补充切片的热键和输出：
 - 初始牌区补充：`Mods\QuantumCheckpoint\Checkpoint\route-c-exact-player-zones.json`；只在所有活动玩家卡仍位于牌库/手牌且总集合完全匹配时生成。
 - 墓地补充：`Mods\QuantumCheckpoint\Checkpoint\route-c-exact-player-trash.json`；只在牌库、手牌、墓地构成完整牌组、玩家场上/待处理区为空且手牌/墓地身份无歧义时生成，恢复时通过原生 `DEFAULT` MoveCard 重建并严格复核三区顺序。
 - 角色充能补充：`Mods\QuantumCheckpoint\Checkpoint\route-c-exact-character-charge.json`；只保存低于满充阈值的值，恢复时通过公开增量 API 写回并由 Getter 复核。
-- 回合进度补充：`Mods\QuantumCheckpoint\Checkpoint\route-c-exact-turn-progress.json`；成组保存全局回合、玩家抽牌延迟和累计威胁，三项跨帧全部一致才通过。
+- 玩家场地补充：`Mods\QuantumCheckpoint\Checkpoint\route-c-exact-player-field.json`；限已验证水果、空墓地/PENDING、无手牌与场地身份歧义，恢复格位、生命和攻击状态。
+- 回合进度补充：`Mods\QuantumCheckpoint\Checkpoint\route-c-exact-turn-progress.json`；schema 2 成组保存全局回合、抽牌基础倒计时与修正量、累计威胁；同时核验游戏自行计算的抽牌缓存。旧 schema 1 只用于读取诊断，需重新保存以启用战斗补充。
 - 恢复结果：`Mods\QuantumCheckpoint\Reports\route-c-restore-*.json`。
 - 诊断轨迹：`Mods\QuantumCheckpoint\route-c-trace.log`；F5/F6 和各高风险阶段都会立即刷盘。
 
-当前 schema 2 主检查点仅接受已验证游戏 EXE 的完整 SHA-256，且只允许普通 `DUNGEON`、无活动提示、稳定 `OPEN` 状态和无额外状态的普通 Spawner。五个独立 schema 1 补充已验证可恢复完整未来小关计划、精确牌库/手牌、受限墓地、未满角色充能，以及全局回合/玩家抽牌延迟/累计威胁。玩家场上或待处理区非空时，牌区补充会安全跳过；项目仍不宣称完整中途战场快照。
+当前 schema 2 主检查点仅接受已验证游戏 EXE 的完整 SHA-256，且只允许普通 `DUNGEON`、无活动提示、稳定 `OPEN` 状态和无额外状态的普通 Spawner。补充文件分别维护格式版本，并在写入前检查依赖。缺少有效回合补充时禁用场地/墓地等战斗补充；缺少精确玩家牌区时也不单独写回合。写后失败会重新加载纯 Route C，报告明确区分 requested、preflight-route-c 与 semantic-fallback。项目仍不宣称完整中途战场快照。
 
 旧的生命与回合写入探针仍保留用于可丢弃测试局，但不属于路线 C 的日常操作。路线 C 的实现和验收步骤见 [第七阶段报告](docs/phase-7-route-c-vertical-slice.md)。
 

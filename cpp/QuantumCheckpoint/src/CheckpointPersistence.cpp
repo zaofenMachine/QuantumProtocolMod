@@ -367,9 +367,7 @@ namespace QuantumCheckpoint
                 return std::nullopt;
             }
             const auto value = std::get<std::int64_t>(found->second);
-            if (value < static_cast<std::int64_t>(std::numeric_limits<Number>::min())
-                || static_cast<std::uint64_t>(value)
-                    > static_cast<std::uint64_t>(std::numeric_limits<Number>::max()))
+            if (!std::in_range<Number>(value))
             {
                 error = "integer field is out of range: " + std::string{name};
                 return std::nullopt;
@@ -737,6 +735,105 @@ namespace QuantumCheckpoint
         return elements;
     }
 
+    auto parse_exact_player_field_states(std::string_view value, std::string& error)
+        -> std::optional<std::vector<ExactPlayerFieldCardState>>
+    {
+        error.clear();
+        if (value.empty() || value.size() > 4096)
+        {
+            error = "exact player-field state list is empty or too large";
+            return std::nullopt;
+        }
+        const auto parse_int = [&](std::string_view token)
+            -> std::optional<std::int32_t> {
+            std::int32_t parsed{};
+            const auto result = std::from_chars(
+                token.data(), token.data() + token.size(), parsed);
+            if (token.empty() || result.ec != std::errc{}
+                || result.ptr != token.data() + token.size())
+            {
+                return std::nullopt;
+            }
+            return parsed;
+        };
+
+        std::vector<ExactPlayerFieldCardState> states{};
+        std::size_t record_start{};
+        while (record_start < value.size())
+        {
+            const auto record_end = value.find(';', record_start);
+            const auto record = value.substr(
+                record_start,
+                (record_end == std::string_view::npos ? value.size() : record_end)
+                    - record_start);
+            std::array<std::string_view, 4> fields{};
+            std::size_t field_start{};
+            bool malformed{};
+            for (std::size_t index{}; index < fields.size(); ++index)
+            {
+                const auto field_end = record.find(',', field_start);
+                if ((index + 1 < fields.size()
+                     && field_end == std::string_view::npos)
+                    || (index + 1 == fields.size()
+                        && field_end != std::string_view::npos))
+                {
+                    malformed = true;
+                    break;
+                }
+                fields[index] = record.substr(
+                    field_start,
+                    (field_end == std::string_view::npos ? record.size() : field_end)
+                        - field_start);
+                field_start = field_end == std::string_view::npos
+                    ? record.size() : field_end + 1;
+            }
+            const auto row = malformed ? std::nullopt : parse_int(fields[0]);
+            const auto index = malformed ? std::nullopt : parse_int(fields[1]);
+            const auto health = malformed ? std::nullopt : parse_int(fields[2]);
+            const auto turn_active = malformed ? std::nullopt : parse_int(fields[3]);
+            if (!row || !index || !health || !turn_active || *row < 0 || *row > 1
+                || *index < 0 || *index > 4 || *health <= 0 || *health > 10000
+                || (*turn_active != 0 && *turn_active != 1))
+            {
+                error = "exact player-field state record is invalid";
+                return std::nullopt;
+            }
+            const ExactPlayerFieldCardState state{
+                .row = *row,
+                .index = *index,
+                .current_health = *health,
+                .turn_active = *turn_active != 0,
+            };
+            if (!states.empty())
+            {
+                const auto& previous = states.back();
+                if (state.row < previous.row
+                    || (state.row == previous.row && state.index <= previous.index))
+                {
+                    error = "exact player-field states are not in unique slot order";
+                    return std::nullopt;
+                }
+            }
+            states.push_back(state);
+            if (states.size() > 10)
+            {
+                error = "exact player-field state list contains too many cards";
+                return std::nullopt;
+            }
+            if (record_end == std::string_view::npos)
+            {
+                break;
+            }
+            record_start = record_end + 1;
+            if (record_start == value.size())
+            {
+                error = "exact player-field state list has a trailing separator";
+                return std::nullopt;
+            }
+        }
+        return states;
+    }
+
     auto exact_player_zones_startup_decklist(std::string_view active_decklist,
                                              std::string_view player_deck,
                                              std::string_view player_hand,
@@ -945,49 +1042,109 @@ namespace QuantumCheckpoint
             return false;
         }
 
-        const auto expected_total = saved_deck->size() + saved_hand->size()
-            + saved_trash->size();
-        const auto live_total = staged_deck->size() + staged_hand->size()
-            + staged_trash->size();
+        // A card that has been played can contain runtime-only/default-expanded
+        // CardInfoInstance fields that native startup does not reproduce verbatim.
+        // Staging only needs to prove that the same ordered card identities are
+        // present; exact instance text is verified again for the final non-field
+        // zones after the native moves have completed.
+        const auto identity_keys = [&](const std::vector<std::string>& cards,
+                                       std::string_view label)
+            -> std::optional<std::vector<std::string>> {
+            std::vector<std::string> keys{};
+            keys.reserve(cards.size());
+            for (const auto& card : cards)
+            {
+                std::string card_error{};
+                auto parsed = exact_card_from_instance(card, card_error);
+                if (!parsed)
+                {
+                    error = std::string{label} + " contains an invalid card identity: "
+                        + card_error;
+                    return std::nullopt;
+                }
+                keys.push_back(ordered_card_key(*parsed));
+            }
+            return keys;
+        };
+
+        const auto saved_deck_keys = identity_keys(*saved_deck, "saved deck");
+        const auto saved_hand_keys = identity_keys(*saved_hand, "saved hand");
+        const auto saved_trash_keys = identity_keys(*saved_trash, "saved extras");
+        const auto staged_deck_keys = identity_keys(*staged_deck, "live deck");
+        const auto staged_hand_keys = identity_keys(*staged_hand, "live hand");
+        const auto staged_trash_keys = identity_keys(*staged_trash, "live trash");
+        if (!saved_deck_keys || !saved_hand_keys || !saved_trash_keys
+            || !staged_deck_keys || !staged_hand_keys || !staged_trash_keys)
+        {
+            return false;
+        }
+
+        const auto expected_total = saved_deck_keys->size() + saved_hand_keys->size()
+            + saved_trash_keys->size();
+        const auto live_total = staged_deck_keys->size() + staged_hand_keys->size()
+            + staged_trash_keys->size();
         if (live_total != expected_total)
         {
             error = "staged player-card total does not match the checkpoint";
             return false;
         }
-        if (!staged_trash->empty())
+        if (!staged_trash_keys->empty())
         {
             error = "live trash is not empty before native staging moves";
             return false;
         }
-        if (staged_hand->size() < saved_hand->size())
+        if (staged_hand_keys->size() < saved_hand_keys->size())
         {
             error = "live hand is shorter than the saved hand";
             return false;
         }
-        const auto hand_overflow_count = staged_hand->size() - saved_hand->size();
-        if (hand_overflow_count > saved_trash->size())
+        const auto hand_overflow_count = staged_hand_keys->size() - saved_hand_keys->size();
+        if (hand_overflow_count > saved_trash_keys->size())
         {
             error = "live hand overflow is larger than the saved trash";
             return false;
         }
-        if (!std::equal(saved_hand->begin(),
-                        saved_hand->end(),
-                        staged_hand->begin()
-                            + static_cast<std::ptrdiff_t>(hand_overflow_count)))
+        const auto trash_in_deck_count = saved_trash_keys->size() - hand_overflow_count;
+
+        // Controller getters expose a stable sorted view, not insertion order. The
+        // overflow suffix drawn from the staged extras can therefore interleave with
+        // the saved hand. Require an order-preserving merge of both sequences.
+        const auto hand_columns = hand_overflow_count + 1;
+        std::vector<bool> hand_reachable(
+            (saved_hand_keys->size() + 1) * hand_columns);
+        hand_reachable[0] = true;
+        for (std::size_t hand_index{}; hand_index <= saved_hand_keys->size(); ++hand_index)
         {
-            error = "live hand does not end with the saved hand";
+            for (std::size_t extra_index{}; extra_index <= hand_overflow_count;
+                 ++extra_index)
+            {
+                if (!hand_reachable[hand_index * hand_columns + extra_index])
+                {
+                    continue;
+                }
+                const auto live_index = hand_index + extra_index;
+                if (hand_index < saved_hand_keys->size()
+                    && (*staged_hand_keys)[live_index] == (*saved_hand_keys)[hand_index])
+                {
+                    hand_reachable[(hand_index + 1) * hand_columns + extra_index] = true;
+                }
+                if (extra_index < hand_overflow_count
+                    && (*staged_hand_keys)[live_index]
+                        == (*saved_trash_keys)[trash_in_deck_count + extra_index])
+                {
+                    hand_reachable[hand_index * hand_columns + extra_index + 1] = true;
+                }
+            }
+        }
+        if (!hand_reachable[
+                saved_hand_keys->size() * hand_columns + hand_overflow_count])
+        {
+            error = "live hand is not an order-preserving merge of the saved hand and "
+                "staged extras suffix";
             return false;
         }
-        const auto trash_in_deck_count = saved_trash->size() - hand_overflow_count;
-        if (!std::equal(saved_trash->begin()
-                            + static_cast<std::ptrdiff_t>(trash_in_deck_count),
-                        saved_trash->end(),
-                        staged_hand->begin()))
-        {
-            error = "live hand overflow does not reproduce the saved trash suffix";
-            return false;
-        }
-        if (staged_deck->size() != saved_deck->size() + trash_in_deck_count)
+        if (staged_deck_keys->size()
+            != saved_deck_keys->size() + trash_in_deck_count)
         {
             error = "live deck size does not match the staged deck/trash merge";
             return false;
@@ -997,9 +1154,9 @@ namespace QuantumCheckpoint
         // undrawn trash prefix. Preserve the order of both input sequences, while
         // accepting either branch when duplicate identities make the merge ambiguous.
         const auto columns = trash_in_deck_count + 1;
-        std::vector<bool> reachable((saved_deck->size() + 1) * columns);
+        std::vector<bool> reachable((saved_deck_keys->size() + 1) * columns);
         reachable[0] = true;
-        for (std::size_t deck_index{}; deck_index <= saved_deck->size(); ++deck_index)
+        for (std::size_t deck_index{}; deck_index <= saved_deck_keys->size(); ++deck_index)
         {
             for (std::size_t trash_index{}; trash_index <= trash_in_deck_count;
                  ++trash_index)
@@ -1009,21 +1166,133 @@ namespace QuantumCheckpoint
                     continue;
                 }
                 const auto live_index = deck_index + trash_index;
-                if (deck_index < saved_deck->size()
-                    && (*staged_deck)[live_index] == (*saved_deck)[deck_index])
+                if (deck_index < saved_deck_keys->size()
+                    && (*staged_deck_keys)[live_index] == (*saved_deck_keys)[deck_index])
                 {
                     reachable[(deck_index + 1) * columns + trash_index] = true;
                 }
                 if (trash_index < trash_in_deck_count
-                    && (*staged_deck)[live_index] == (*saved_trash)[trash_index])
+                    && (*staged_deck_keys)[live_index]
+                        == (*saved_trash_keys)[trash_index])
                 {
                     reachable[deck_index * columns + trash_index + 1] = true;
                 }
             }
         }
-        if (!reachable[saved_deck->size() * columns + trash_in_deck_count])
+        if (!reachable[saved_deck_keys->size() * columns + trash_in_deck_count])
         {
             error = "live deck is not an order-preserving merge of the saved deck and trash";
+            return false;
+        }
+        return true;
+    }
+
+    auto exact_player_field_startup_decklist(std::string_view active_decklist,
+                                             std::string_view player_deck,
+                                             std::string_view player_hand,
+                                             std::string_view player_trash,
+                                             std::string_view player_field,
+                                             std::string& error)
+        -> std::optional<std::string>
+    {
+        error.clear();
+        auto deck = split_route_c_unreal_array(player_deck, error);
+        auto hand = split_route_c_unreal_array(player_hand, error);
+        auto trash = split_route_c_unreal_array(player_trash, error);
+        auto field = split_route_c_unreal_array(player_field, error);
+        if (!deck || deck->empty() || !hand || hand->empty() || !trash || !field
+            || field->empty()
+            || deck->size() + hand->size() + trash->size() + field->size() > 128)
+        {
+            error = "exact player-field zones are invalid or exceed 128 cards: " + error;
+            return std::nullopt;
+        }
+        std::string staged_deck{"("};
+        bool first = true;
+        for (const auto* zone : {&*deck, &*trash, &*field})
+        {
+            for (const auto& card : *zone)
+            {
+                if (!first)
+                {
+                    staged_deck += ',';
+                }
+                first = false;
+                staged_deck += card;
+            }
+        }
+        staged_deck += ')';
+        return exact_player_zones_startup_decklist(
+            active_decklist, staged_deck, player_hand, error);
+    }
+
+    auto exact_player_field_staging_matches(std::string_view expected_deck,
+                                            std::string_view expected_hand,
+                                            std::string_view expected_trash,
+                                            std::string_view expected_field,
+                                            std::string_view live_deck,
+                                            std::string_view live_hand,
+                                            std::string_view live_trash,
+                                            std::string& error) -> bool
+    {
+        error.clear();
+        const auto keys = [&](std::string_view array) -> std::optional<std::vector<std::string>> {
+            auto cards = split_route_c_unreal_array(array, error);
+            if (!cards || cards->size() > 128) return std::nullopt;
+            std::vector<std::string> result{};
+            for (const auto& instance : *cards)
+            {
+                const auto card = exact_card_from_instance(instance, error);
+                if (!card) return std::nullopt;
+                result.push_back(ordered_card_key(*card));
+            }
+            return result;
+        };
+        const auto deck = keys(expected_deck);
+        const auto hand = keys(expected_hand);
+        const auto trash = keys(expected_trash);
+        const auto field = keys(expected_field);
+        const auto staged_deck = keys(live_deck);
+        const auto staged_hand = keys(live_hand);
+        const auto staged_trash = keys(live_trash);
+        if (!deck || !hand || !trash || !field || field->empty()
+            || !staged_deck || !staged_hand || !staged_trash || !staged_trash->empty())
+        {
+            error = "field staging arrays are invalid or live trash is not empty: " + error;
+            return false;
+        }
+
+        // FIELD is serialized by destination slot, whereas the native controller
+        // sorts temporarily drawn cards. Extra cards have no required temporary
+        // order: they will be selected individually and placed into exact slots.
+        // Still prove the complete multiset and the relative order of every card
+        // that must remain in DECK/HAND. Final zones are checked verbatim afterward.
+        const auto subsequence = [](const auto& expected, const auto& live) {
+            std::size_t index{};
+            for (const auto& key : live)
+            {
+                if (index < expected.size() && expected[index] == key) ++index;
+            }
+            return index == expected.size();
+        };
+        if (!subsequence(*deck, *staged_deck) || !subsequence(*hand, *staged_hand))
+        {
+            error = "field staging changed the retained deck/hand order";
+            return false;
+        }
+        std::unordered_map<std::string, std::int32_t> expected_counts{};
+        std::unordered_map<std::string, std::int32_t> live_counts{};
+        for (const auto* zone : {&*deck, &*hand, &*trash, &*field})
+        {
+            for (const auto& key : *zone) ++expected_counts[key];
+        }
+        for (const auto* zone : {&*staged_deck, &*staged_hand})
+        {
+            for (const auto& key : *zone) ++live_counts[key];
+        }
+        if (expected_counts != live_counts)
+        {
+            error = "field staging changed card identities, upgrades, or multiplicities";
             return false;
         }
         return true;
@@ -1740,6 +2009,211 @@ namespace QuantumCheckpoint
         return checkpoint;
     }
 
+    auto exact_player_field_payload_checksum(const ExactPlayerFieldCheckpoint& checkpoint)
+        -> std::string
+    {
+        std::uint64_t hash = 14695981039346656037ULL;
+        append_hash_number(hash, checkpoint.schema_version);
+        append_hash_bytes(hash, checkpoint.kind);
+        append_hash_bytes(hash, checkpoint.captured_at_utc);
+        append_hash_bytes(hash, checkpoint.route_c_payload_checksum);
+        append_hash_bytes(hash, checkpoint.game_executable_sha256);
+        append_hash_number(hash, checkpoint.game_executable_size);
+        append_hash_bytes(hash, checkpoint.source_level_name);
+        append_hash_number(hash, checkpoint.wave_index);
+        append_hash_bytes(hash, checkpoint.player_deck);
+        append_hash_bytes(hash, checkpoint.player_hand);
+        append_hash_bytes(hash, checkpoint.player_trash);
+        append_hash_bytes(hash, checkpoint.player_field);
+        append_hash_bytes(hash, checkpoint.player_field_states);
+
+        std::ostringstream output{};
+        output << std::hex << std::uppercase << std::setw(16) << std::setfill('0') << hash;
+        return output.str();
+    }
+
+    auto serialize_exact_player_field_checkpoint(ExactPlayerFieldCheckpoint checkpoint)
+        -> std::string
+    {
+        checkpoint.payload_checksum = exact_player_field_payload_checksum(checkpoint);
+        std::ostringstream output{};
+        output << "{\n"
+               << "  \"schemaVersion\": " << checkpoint.schema_version << ",\n"
+               << "  \"kind\": \"" << json_escape(checkpoint.kind) << "\",\n"
+               << "  \"capturedAtUtc\": \""
+               << json_escape(checkpoint.captured_at_utc) << "\",\n"
+               << "  \"routeCPayloadChecksum\": \""
+               << json_escape(checkpoint.route_c_payload_checksum) << "\",\n"
+               << "  \"gameExecutableSha256\": \""
+               << json_escape(checkpoint.game_executable_sha256) << "\",\n"
+               << "  \"gameExecutableSize\": " << checkpoint.game_executable_size << ",\n"
+               << "  \"sourceLevelName\": \""
+               << json_escape(checkpoint.source_level_name) << "\",\n"
+               << "  \"waveIndex\": " << checkpoint.wave_index << ",\n"
+               << "  \"playerDeck\": \"" << json_escape(checkpoint.player_deck)
+               << "\",\n"
+               << "  \"playerHand\": \"" << json_escape(checkpoint.player_hand)
+               << "\",\n"
+               << "  \"playerTrash\": \"" << json_escape(checkpoint.player_trash)
+               << "\",\n"
+               << "  \"playerField\": \"" << json_escape(checkpoint.player_field)
+               << "\",\n"
+               << "  \"playerFieldStates\": \""
+               << json_escape(checkpoint.player_field_states) << "\",\n"
+               << "  \"payloadChecksum\": \"" << checkpoint.payload_checksum << "\"\n"
+               << "}\n";
+        return output.str();
+    }
+
+    auto validate_exact_player_field_checkpoint(
+        const ExactPlayerFieldCheckpoint& checkpoint, std::string& error) -> bool
+    {
+        if (checkpoint.schema_version != ExactPlayerFieldSchemaVersion)
+        {
+            error = "unsupported exact player-field schema version";
+            return false;
+        }
+        if (checkpoint.kind != ExactPlayerFieldCheckpointKind)
+        {
+            error = "checkpoint kind is not exact player field";
+            return false;
+        }
+        if (checkpoint.captured_at_utc.empty()
+            || !is_hex_digest(checkpoint.route_c_payload_checksum, 16))
+        {
+            error = "exact player field has invalid Route C linkage";
+            return false;
+        }
+        if (!is_sha256(checkpoint.game_executable_sha256)
+            || checkpoint.game_executable_size == 0)
+        {
+            error = "exact player field has an invalid game executable fingerprint";
+            return false;
+        }
+        if (checkpoint.source_level_name.empty() || checkpoint.source_level_name == "None"
+            || checkpoint.source_level_name.size() > 256 || checkpoint.wave_index < 0
+            || checkpoint.wave_index > 1000)
+        {
+            error = "exact player field has invalid level or wave data";
+            return false;
+        }
+
+        std::string array_error{};
+        const auto deck = split_route_c_unreal_array(checkpoint.player_deck, array_error);
+        const auto hand = split_route_c_unreal_array(checkpoint.player_hand, array_error);
+        const auto trash = split_route_c_unreal_array(checkpoint.player_trash, array_error);
+        const auto field = split_route_c_unreal_array(checkpoint.player_field, array_error);
+        const auto states = parse_exact_player_field_states(
+            checkpoint.player_field_states, array_error);
+        if (!deck || !hand || !trash || !field || !states)
+        {
+            error = "exact player-field zones or aligned states are invalid: " + array_error;
+            return false;
+        }
+        if (deck->empty() || hand->empty() || field->empty())
+        {
+            error = "exact player-field capture requires non-empty deck, hand, and field";
+            return false;
+        }
+        if (states->size() != field->size())
+        {
+            error = "exact player-field card and state counts do not match";
+            return false;
+        }
+        if (deck->size() + hand->size() + trash->size() + field->size() > 128)
+        {
+            error = "exact player-field capture exceeds 128 cards";
+            return false;
+        }
+
+        for (const auto& element : *hand)
+        {
+            auto card = exact_card_from_instance(element, array_error);
+            if (!card)
+            {
+                error = "exact player-field hand contains an invalid card: " + array_error;
+                return false;
+            }
+        }
+        for (const auto* zone : {&*deck, &*trash, &*field})
+        {
+            for (const auto& element : *zone)
+            {
+                auto card = exact_card_from_instance(element, array_error);
+                if (!card)
+                {
+                    error = "exact player-field zone contains an invalid card: "
+                        + array_error;
+                    return false;
+                }
+                if (zone == &*field
+                    && card->tag != "naturalApple" && card->tag != "naturalLemon"
+                    && card->tag != "naturalSpring")
+                {
+                    error = "exact player field contains a card outside the first guarded "
+                        "plain-fruit slice";
+                    return false;
+                }
+            }
+        }
+        if (checkpoint.payload_checksum != exact_player_field_payload_checksum(checkpoint))
+        {
+            error = "exact player-field payload checksum does not match";
+            return false;
+        }
+        return true;
+    }
+
+    auto parse_exact_player_field_checkpoint(std::string_view json, std::string& error)
+        -> std::optional<ExactPlayerFieldCheckpoint>
+    {
+        if (json.empty() || json.size() > RouteCMaximumFileBytes)
+        {
+            error = "exact player-field file is empty or exceeds the 2 MiB limit";
+            return std::nullopt;
+        }
+        auto values = FlatJsonParser{json}.parse(error);
+        if (!values)
+        {
+            return std::nullopt;
+        }
+
+        ExactPlayerFieldCheckpoint checkpoint{};
+#define READ_FIELD_STRING(Field, JsonName) \
+        do { auto value = required_string(*values, JsonName, error); if (!value) return std::nullopt; checkpoint.Field = std::move(*value); } while (false)
+#define READ_FIELD_INTEGER(Field, JsonName, Type) \
+        do { auto value = required_integer<Type>(*values, JsonName, error); if (!value) return std::nullopt; checkpoint.Field = *value; } while (false)
+
+        READ_FIELD_INTEGER(schema_version, "schemaVersion", int);
+        if (checkpoint.schema_version != ExactPlayerFieldSchemaVersion)
+        {
+            error = "unsupported exact player-field schema version";
+            return std::nullopt;
+        }
+        READ_FIELD_STRING(kind, "kind");
+        READ_FIELD_STRING(captured_at_utc, "capturedAtUtc");
+        READ_FIELD_STRING(route_c_payload_checksum, "routeCPayloadChecksum");
+        READ_FIELD_STRING(game_executable_sha256, "gameExecutableSha256");
+        READ_FIELD_INTEGER(game_executable_size, "gameExecutableSize", std::uint64_t);
+        READ_FIELD_STRING(source_level_name, "sourceLevelName");
+        READ_FIELD_INTEGER(wave_index, "waveIndex", std::int32_t);
+        READ_FIELD_STRING(player_deck, "playerDeck");
+        READ_FIELD_STRING(player_hand, "playerHand");
+        READ_FIELD_STRING(player_trash, "playerTrash");
+        READ_FIELD_STRING(player_field, "playerField");
+        READ_FIELD_STRING(player_field_states, "playerFieldStates");
+        READ_FIELD_STRING(payload_checksum, "payloadChecksum");
+
+#undef READ_FIELD_INTEGER
+#undef READ_FIELD_STRING
+
+        if (!validate_exact_player_field_checkpoint(checkpoint, error))
+        {
+            return std::nullopt;
+        }
+        return checkpoint;
+    }
+
     auto exact_character_charge_payload_checksum(
         const ExactCharacterChargeCheckpoint& checkpoint) -> std::string
     {
@@ -1890,6 +2364,15 @@ namespace QuantumCheckpoint
         append_hash_number(hash, checkpoint.card_engine_turn_count);
         append_hash_number(hash, checkpoint.player_draw_delay);
         append_hash_number(hash, checkpoint.wave_alert_counter);
+        if (checkpoint.player_can_click_to_draw >= 0)
+        {
+            append_hash_number(hash, checkpoint.player_can_click_to_draw);
+        }
+        if (checkpoint.schema_version >= 2)
+        {
+            append_hash_number(hash, checkpoint.player_draw_base);
+            append_hash_number(hash, checkpoint.player_draw_adjustment);
+        }
 
         std::ostringstream output{};
         output << std::hex << std::uppercase << std::setw(16) << std::setfill('0') << hash;
@@ -1917,8 +2400,18 @@ namespace QuantumCheckpoint
                << "  \"cardEngineTurnCount\": "
                << checkpoint.card_engine_turn_count << ",\n"
                << "  \"playerDrawDelay\": " << checkpoint.player_draw_delay << ",\n"
-               << "  \"waveAlertCounter\": " << checkpoint.wave_alert_counter << ",\n"
-               << "  \"payloadChecksum\": \"" << checkpoint.payload_checksum << "\"\n"
+               << "  \"waveAlertCounter\": " << checkpoint.wave_alert_counter << ",\n";
+        if (checkpoint.player_can_click_to_draw >= 0)
+        {
+            output << "  \"playerCanClickToDraw\": "
+                   << checkpoint.player_can_click_to_draw << ",\n";
+        }
+        if (checkpoint.schema_version >= 2)
+        {
+            output << "  \"playerDrawBase\": " << checkpoint.player_draw_base << ",\n"
+                   << "  \"playerDrawAdjustment\": " << checkpoint.player_draw_adjustment << ",\n";
+        }
+        output << "  \"payloadChecksum\": \"" << checkpoint.payload_checksum << "\"\n"
                << "}\n";
         return output.str();
     }
@@ -1926,7 +2419,8 @@ namespace QuantumCheckpoint
     auto validate_exact_turn_progress_checkpoint(
         const ExactTurnProgressCheckpoint& checkpoint, std::string& error) -> bool
     {
-        if (checkpoint.schema_version != ExactTurnProgressSchemaVersion)
+        if (checkpoint.schema_version != 1
+            && checkpoint.schema_version != ExactTurnProgressSchemaVersion)
         {
             error = "unsupported exact turn-progress schema version";
             return false;
@@ -1956,7 +2450,9 @@ namespace QuantumCheckpoint
             || checkpoint.player_draw_delay < 0
             || checkpoint.player_draw_delay > 1'000'000
             || checkpoint.wave_alert_counter < 0
-            || checkpoint.wave_alert_counter > 1'000'000)
+            || checkpoint.wave_alert_counter > 1'000'000
+            || checkpoint.player_can_click_to_draw < -1
+            || checkpoint.player_can_click_to_draw > 1)
         {
             error = "exact turn-progress value is outside the supported range";
             return false;
@@ -1964,6 +2460,16 @@ namespace QuantumCheckpoint
         if (checkpoint.payload_checksum != exact_turn_progress_payload_checksum(checkpoint))
         {
             error = "exact turn-progress payload checksum does not match";
+            return false;
+        }
+        if (checkpoint.schema_version >= 2
+            && (checkpoint.player_draw_base < 0 || checkpoint.player_draw_base > 100'000
+                || checkpoint.player_draw_adjustment < -100'000
+                || checkpoint.player_draw_adjustment > 100'000
+                || static_cast<std::int64_t>(checkpoint.player_draw_base)
+                        + checkpoint.player_draw_adjustment != checkpoint.player_draw_delay))
+        {
+            error = "native draw components are out of range or disagree with the displayed delay";
             return false;
         }
         return true;
@@ -1990,7 +2496,8 @@ namespace QuantumCheckpoint
         do { auto value = required_integer<Type>(*values, JsonName, error); if (!value) return std::nullopt; checkpoint.Field = *value; } while (false)
 
         READ_TURN_PROGRESS_INTEGER(schema_version, "schemaVersion", int);
-        if (checkpoint.schema_version != ExactTurnProgressSchemaVersion)
+        if (checkpoint.schema_version != 1
+            && checkpoint.schema_version != ExactTurnProgressSchemaVersion)
         {
             error = "unsupported exact turn-progress schema version";
             return std::nullopt;
@@ -2007,6 +2514,18 @@ namespace QuantumCheckpoint
         READ_TURN_PROGRESS_INTEGER(player_draw_delay, "playerDrawDelay", std::int32_t);
         READ_TURN_PROGRESS_INTEGER(
             wave_alert_counter, "waveAlertCounter", std::int32_t);
+        if (values->contains("playerCanClickToDraw"))
+        {
+            READ_TURN_PROGRESS_INTEGER(
+                player_can_click_to_draw,
+                "playerCanClickToDraw",
+                std::int32_t);
+        }
+        if (checkpoint.schema_version >= 2)
+        {
+            READ_TURN_PROGRESS_INTEGER(player_draw_base, "playerDrawBase", std::int32_t);
+            READ_TURN_PROGRESS_INTEGER(player_draw_adjustment, "playerDrawAdjustment", std::int32_t);
+        }
         READ_TURN_PROGRESS_STRING(payload_checksum, "payloadChecksum");
 
 #undef READ_TURN_PROGRESS_INTEGER

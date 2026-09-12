@@ -1,6 +1,6 @@
 # 文档索引
 
-以下三份文件是后续维护时应优先更新的权威文档：
+以下文件是后续维护时应优先更新的权威文档：
 
 - [requirements.md](requirements.md)：用户需求、检查点语义、未决产品问题。
 - [architecture-options.md](architecture-options.md)：小关开头与重编程锚点两条路线的成本和取舍。
@@ -25,5 +25,8 @@
 - [phase-11-character-charge.md](phase-11-character-charge.md)：未满角色充能的独立精确补充层、公开 API 写回门禁，以及 4/6 实机验收。
 - [phase-12-player-trash.md](phase-12-player-trash.md)：原生卡牌位置迁移、共享引用崩溃修正、受限玩家墓地补充，以及混合牌库/手牌暂存的实机闭环。
 - [phase-13-turn-progress.md](phase-13-turn-progress.md)：拆分累计威胁、敌人单卡倒计时和玩家抽牌延迟，并完成全局回合、抽牌延迟与威胁进度的成组跨进程恢复。
+
+- [phase-14-player-field-primitives.md](phase-14-player-field-primitives.md)：玩家场内换格及抑制效果的出牌原语。
+- [phase-15-player-field-and-draw-authority.md](phase-15-player-field-and-draw-authority.md)：受限场地恢复、原生抽牌倒计时、游戏线程执行、补充依赖和失败重开。
 
 维护规则：需求发生变化时先更新 `requirements.md`；技术实验产生新证据时更新 `technical-status.md` 并补充对应阶段报告；正式选定恢复路线后在 `architecture-options.md` 记录决定与理由。

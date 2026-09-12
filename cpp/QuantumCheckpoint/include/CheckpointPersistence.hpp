@@ -60,6 +60,31 @@ namespace QuantumCheckpoint
                                             std::string_view live_hand,
                                             std::string_view live_trash,
                                             std::string& error) -> bool;
+    auto exact_player_field_payload_checksum(const ExactPlayerFieldCheckpoint& checkpoint)
+        -> std::string;
+    auto serialize_exact_player_field_checkpoint(ExactPlayerFieldCheckpoint checkpoint)
+        -> std::string;
+    auto parse_exact_player_field_checkpoint(std::string_view json, std::string& error)
+        -> std::optional<ExactPlayerFieldCheckpoint>;
+    auto validate_exact_player_field_checkpoint(
+        const ExactPlayerFieldCheckpoint& checkpoint, std::string& error) -> bool;
+    auto exact_player_field_startup_decklist(std::string_view active_decklist,
+                                             std::string_view player_deck,
+                                             std::string_view player_hand,
+                                             std::string_view player_trash,
+                                             std::string_view player_field,
+                                             std::string& error)
+        -> std::optional<std::string>;
+    auto exact_player_field_staging_matches(std::string_view expected_deck,
+                                            std::string_view expected_hand,
+                                            std::string_view expected_trash,
+                                            std::string_view expected_field,
+                                            std::string_view live_deck,
+                                            std::string_view live_hand,
+                                            std::string_view live_trash,
+                                            std::string& error) -> bool;
+    auto parse_exact_player_field_states(std::string_view value, std::string& error)
+        -> std::optional<std::vector<ExactPlayerFieldCardState>>;
     auto exact_card_identity_key_from_instance(std::string_view card_instance,
                                                std::string& error)
         -> std::optional<std::string>;
