@@ -2,6 +2,7 @@
 #include "PlayerRestorePlan.hpp"
 
 #include <cstdlib>
+#include <algorithm>
 #include <iostream>
 #include <string>
 
@@ -615,6 +616,84 @@ int main()
     trash_frees_hand[3].location = 1;
     require(!plan_player_field_restore(field, trash_frees_hand, error),
             "layout without a movable initial hand target keeps the capacity guard");
+    require(plan_player_field_restore(field, trash_frees_hand, error, 7).has_value(),
+            "the public hand capacity can prove room for a deck-to-field staging move");
+    require(!plan_player_field_restore(field, trash_frees_hand, error, 1),
+            "a full hand still needs a movable target or a deferred saved card");
+
+    auto full_hand_layout = field;
+    full_hand_layout.player_deck = "()";
+    full_hand_layout.player_trash = "()";
+    full_hand_layout.player_field = card_array({"naturalApple"});
+    full_hand_layout.player_hand = card_array({"a", "a", "c", "d", "e", "f", "g"});
+    const std::vector<PlayerRestoreCandidate> initial_full_hand{
+        {"a@0",0},{"a@0",0},{"c@0",0},{"d@0",0},{"e@0",0},
+        {"naturalApple@0",1},{"g@0",1},{"f@0",1}};
+    const auto full_hand_staging = plan_player_hand_staging(full_hand_layout, initial_full_hand, 7, error);
+    require(full_hand_staging && full_hand_staging->moves.size() == 12
+                && full_hand_staging->before_field_move_count == 11,
+            "a full hand defers its last card until the native field staging slot is no longer needed");
+    std::vector<std::size_t> staged_deck_indices{5,6,7}, staged_hand_indices{0,1,2,3,4};
+    for (std::size_t step{}; step < full_hand_staging->moves.size(); ++step)
+    {
+        if (step == full_hand_staging->before_field_move_count)
+        {
+            require(staged_hand_indices.size() == 6 && staged_deck_indices == std::vector<std::size_t>{5,6},
+                    "the field phase retains the final hand card behind its remaining field target");
+            staged_deck_indices.erase(staged_deck_indices.begin()); // FIELD restoration consumes Apple.
+        }
+        const auto move = full_hand_staging->moves[step];
+        auto& source = move.destination == 0 ? staged_deck_indices : staged_hand_indices;
+        auto& destination = move.destination == 0 ? staged_hand_indices : staged_deck_indices;
+        const auto found = std::find(source.begin(), source.end(), move.candidate);
+        require(found != source.end(), "every hand staging action moves exactly one existing native object");
+        source.erase(found);
+        destination.push_back(move.candidate);
+        require(staged_hand_indices.size() <= 7, "hand staging must respect capacity after every native action");
+    }
+    require(staged_deck_indices.empty()
+                && staged_hand_indices == std::vector<std::size_t>{0,1,2,3,4,7,6},
+            "full-hand staging restores both equal copies in original order and leaves no deck card");
+    require(!plan_player_hand_staging(full_hand_layout, initial_full_hand, 6, error),
+            "a target larger than the native public hand capacity is rejected before movement");
+    auto reordered_initial = initial_full_hand;
+    std::swap(reordered_initial[5], reordered_initial[6]);
+    require(!plan_player_hand_staging(full_hand_layout, reordered_initial, 7, error),
+            "matching counts cannot hide a changed native startup deck order");
+    full_hand_layout.schema_version = 1;
+    require(!plan_player_hand_staging(full_hand_layout, initial_full_hand, 7, error),
+            "hand reconstruction requires native-order provenance");
+    auto shared_deferred_layout = field;
+    shared_deferred_layout.player_deck = card_array({"naturalApple"});
+    shared_deferred_layout.player_hand = card_array({"b", "c", "d", "e", "f", "g"});
+    shared_deferred_layout.player_trash = "()";
+    shared_deferred_layout.player_field = card_array({"naturalApple"});
+    const std::vector<PlayerRestoreCandidate> shared_deferred_cards{
+        {"naturalApple@0",1},{"naturalApple@0",1},
+        {"b@0",0},{"c@0",0},{"d@0",0},{"e@0",0},{"f@0",0},{"g@0",0}};
+    const auto shared_deferred_plan = plan_player_field_restore(shared_deferred_layout, shared_deferred_cards, error, 7);
+    require(shared_deferred_plan && shared_deferred_plan->field_candidates == std::vector<std::size_t>{1},
+            "the deferred hand copy must be rebound after the field plan reserves an equivalent deck copy");
+    auto unsupported_hand_overlap = field;
+    unsupported_hand_overlap.player_deck = unsupported_hand_overlap.player_field = "()";
+    unsupported_hand_overlap.player_hand = unsupported_hand_overlap.player_trash = card_array({"naturalCherry"});
+    require(!plan_player_hand_staging(unsupported_hand_overlap, {{"naturalCherry@0",0},{"naturalCherry@0",0}}, 7, error)
+                && error.find("special-card overlap") != std::string::npos,
+            "unsupported overlap is refused before any native hand reconstruction");
+
+    auto deck_only_layout = field;
+    deck_only_layout.player_deck = card_array({"a", "b", "c", "d", "e", "f", "g", "h"});
+    deck_only_layout.player_hand = deck_only_layout.player_field = deck_only_layout.player_trash = "()";
+    const std::vector<PlayerRestoreCandidate> initial_deck_only{
+        {"a@0",1},{"b@0",1},{"c@0",1},{"h@0",0},{"g@0",0},{"f@0",0},{"e@0",0},{"d@0",0}};
+    const auto deck_only_staging = plan_player_hand_staging(deck_only_layout, initial_deck_only, 7, error);
+    require(deck_only_staging && deck_only_staging->moves.size() == 5
+                && deck_only_staging->before_field_move_count == 5,
+            "an empty saved hand returns every native startup draw without requiring field or trash");
+    for (std::size_t index{}; index < 5; ++index)
+        require(deck_only_staging->moves[index].candidate == 7 - index
+                    && deck_only_staging->moves[index].destination == 1,
+                "startup draws return in reverse hand order to preserve the next deck pop");
 
     auto wrong_candidates = mixed_candidates;
     wrong_candidates[0].identity = "naturalLemon@1";

@@ -37,8 +37,9 @@ if ($runningProcesses.Count -gt 0) {
 }
 
 $sourceHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $resolvedDllPath).Hash
-$runtimeFixturesEnabled = [System.Text.Encoding]::ASCII.GetString(
-    [System.IO.File]::ReadAllBytes($resolvedDllPath)).Contains('development-empty-hand-fixture')
+$dllText = [System.Text.Encoding]::ASCII.GetString([System.IO.File]::ReadAllBytes($resolvedDllPath))
+$runtimeFixturesEnabled = $dllText.Contains('development-empty-hand-fixture') -or
+    $dllText.Contains('development-player-hand-fixture')
 if ($runtimeFixturesEnabled -and -not $AllowRuntimeTestFixtures) {
     throw 'This DLL contains disposable-battle test fixtures. Rebuild with fixtures OFF for normal deployment, or specify -AllowRuntimeTestFixtures for a test session.'
 }

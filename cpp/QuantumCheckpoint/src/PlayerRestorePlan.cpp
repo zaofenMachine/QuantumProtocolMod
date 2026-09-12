@@ -5,11 +5,100 @@
 
 namespace QuantumCheckpoint
 {
+    auto plan_player_hand_staging(
+        const ExactPlayerFieldCheckpoint& layout,
+        const std::vector<PlayerRestoreCandidate>& candidates,
+        std::size_t hand_limit,
+        std::string& error) -> std::optional<PlayerHandStagingPlan>
+    {
+        error.clear();
+        const auto keys = [&](const std::string& text)
+            -> std::optional<std::vector<std::string>> {
+            const auto cards = split_route_c_unreal_array(text, error);
+            if (!cards) return std::nullopt;
+            std::vector<std::string> result{};
+            for (const auto& card : *cards)
+            {
+                auto key = exact_card_identity_key_from_instance(card, error);
+                if (!key) return std::nullopt;
+                result.push_back(std::move(*key));
+            }
+            return result;
+        };
+        const auto deck = keys(layout.player_deck), hand = keys(layout.player_hand);
+        const auto trash = keys(layout.player_trash), field = keys(layout.player_field);
+        if (layout.schema_version != 2 || !deck || !hand || !trash || !field
+            || hand_limit == 0 || hand_limit > 16 || hand->size() > hand_limit
+            || candidates.empty() || candidates.size() > 128)
+        {
+            error = "hand staging requires native-order arrays and a valid hand capacity";
+            return std::nullopt;
+        }
+        const auto unsupported_overlap = [](const auto& left, const auto& right) {
+            return std::any_of(left.begin(), left.end(), [&](const auto& key) {
+                return std::find(right.begin(), right.end(), key) != right.end()
+                    && !supports_plain_player_field_card(
+                        std::string_view{key}.substr(0, key.find('@')));
+            });
+        };
+        if (unsupported_overlap(*hand, *trash) || unsupported_overlap(*hand, *field)
+            || unsupported_overlap(*trash, *field))
+        {
+            error = "special-card overlap is outside the guarded player layout";
+            return std::nullopt;
+        }
+        std::vector<std::string> expected = *deck;
+        expected.insert(expected.end(), trash->begin(), trash->end());
+        expected.insert(expected.end(), field->begin(), field->end());
+        expected.insert(expected.end(), hand->rbegin(), hand->rend());
+        std::vector<std::size_t> deck_indices{}, hand_indices{};
+        for (std::size_t index{}; index < candidates.size(); ++index)
+        {
+            const auto& card = candidates[index];
+            if (card.identity.empty() || card.location > 1)
+            {
+                error = "hand staging found an invalid candidate";
+                return std::nullopt;
+            }
+            (card.location == 0 ? hand_indices : deck_indices).push_back(index);
+        }
+        if (hand_indices.size() > hand_limit)
+        {
+            error = "native initial hand exceeds its public capacity";
+            return std::nullopt;
+        }
+        auto reunited = deck_indices;
+        reunited.insert(reunited.end(), hand_indices.rbegin(), hand_indices.rend());
+        if (expected.size() != reunited.size())
+        {
+            error = "hand staging changed the complete player card count";
+            return std::nullopt;
+        }
+        for (std::size_t index{}; index < reunited.size(); ++index)
+        {
+            if (candidates[reunited[index]].identity != expected[index])
+            {
+                error = "native startup does not reconstruct the saved fixed-order sequence";
+                return std::nullopt;
+            }
+        }
+        PlayerHandStagingPlan plan{};
+        for (auto index = hand_indices.rbegin(); index != hand_indices.rend(); ++index)
+            plan.moves.push_back({*index, 1});
+        for (std::size_t index{}; index < hand->size(); ++index)
+            plan.moves.push_back({reunited[reunited.size() - 1 - index], 0});
+        plan.before_field_move_count = plan.moves.size();
+        if (!field->empty() && hand->size() == hand_limit)
+            --plan.before_field_move_count;
+        return plan;
+    }
+
     static auto plan_player_cards_restore(
         const ExactPlayerFieldCheckpoint& checkpoint,
         const std::vector<PlayerRestoreCandidate>& candidates,
         bool require_field,
-        std::string& error) -> std::optional<PlayerFieldRestorePlan>
+        std::string& error,
+        std::size_t hand_limit = 0) -> std::optional<PlayerFieldRestorePlan>
     {
         error.clear();
         const auto keys = [&](const std::string& array)
@@ -130,7 +219,10 @@ namespace QuantumCheckpoint
                 return candidates[index].location == 0;
             });
         };
-        if (!field->empty()
+        const auto hand_count = static_cast<std::size_t>(std::count_if(
+            candidates.begin(), candidates.end(), [](const auto& card) { return card.location == 0; }));
+        const bool has_staging_room = hand_limit > hand_count && hand_limit <= 16;
+        if (!field->empty() && !has_staging_room
             && !frees_hand_slot(plan.trash_candidates) && !frees_hand_slot(plan.field_candidates))
         {
             error = "native initial hand has no movable target to free a guarded staging slot";
@@ -142,9 +234,10 @@ namespace QuantumCheckpoint
     auto plan_player_field_restore(
         const ExactPlayerFieldCheckpoint& checkpoint,
         const std::vector<PlayerRestoreCandidate>& candidates,
-        std::string& error) -> std::optional<PlayerFieldRestorePlan>
+        std::string& error,
+        std::size_t hand_limit) -> std::optional<PlayerFieldRestorePlan>
     {
-        return plan_player_cards_restore(checkpoint, candidates, true, error);
+        return plan_player_cards_restore(checkpoint, candidates, true, error, hand_limit);
     }
 
     auto plan_player_trash_restore(

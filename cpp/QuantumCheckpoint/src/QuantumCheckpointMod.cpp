@@ -62,7 +62,7 @@ namespace QuantumCheckpoint
         std::atomic_bool g_draw_delay_write_probe_requested{false};
         std::atomic_bool g_move_card_probe_requested{false};
 #if defined(QUANTUM_CHECKPOINT_RUNTIME_TEST_FIXTURES)
-        std::atomic_bool g_empty_hand_fixture_requested{false};
+        std::atomic_int g_player_hand_fixture_destination{-1};
 #endif
         std::atomic_bool g_route_c_save_requested{false};
         std::atomic_bool g_route_c_load_requested{false};
@@ -201,6 +201,14 @@ namespace QuantumCheckpoint
             std::optional<std::int32_t> exact_turn_progress_observed_draw_adjustment{};
             bool semantic_fallback{};
             std::string fallback_reason{};
+            std::optional<PlayerHandStagingPlan> hand_staging_plan{};
+            std::optional<ExactPlayerFieldCheckpoint> deferred_hand_field_layout{};
+            std::vector<PendingNativeTrashMove> hand_staging_cards{};
+            std::vector<std::size_t> hand_staging_deck{}, hand_staging_hand{};
+            std::size_t hand_staging_move_index{}, native_hand_limit{};
+            bool hand_staging_move_queued{}, deferred_hand_rebased{};
+            std::chrono::steady_clock::time_point hand_staging_move_started_at{};
+            std::string hand_staging_status{"unavailable"};
         };
 
         struct PendingRouteCCapture
@@ -3623,6 +3631,11 @@ namespace QuantumCheckpoint
                    << (restore.semantic_fallback ? "semantic-fallback"
                            : restore.fallback_reason.empty() ? "requested" : "preflight-route-c") << "\""
                    << ",\n  \"fallbackReason\": \"" << json_escape(restore.fallback_reason) << "\""
+                   << ",\n  \"playerHandStagingStatus\": \"" << json_escape(restore.hand_staging_status) << "\""
+                   << ",\n  \"playerHandStagingCompletedMoves\": " << restore.hand_staging_move_index
+                   << ",\n  \"playerHandLimit\": " << restore.native_hand_limit
+                   << ",\n  \"playerHandCardDeferredForField\": "
+                   << (restore.deferred_hand_field_layout ? "true" : "false")
                    << ",\n  \"gameThreadId\": " << g_game_thread_id.load()
                    << ",\n  \"targetHealth\": " << restore.checkpoint.player_health
                    << "\n}\n";
@@ -5402,7 +5415,8 @@ namespace QuantumCheckpoint
                     planning_candidates.push_back({candidate.key, candidate.origin});
                 }
                 const auto plan = plan_player_field_restore(
-                    *restore.exact_player_field, planning_candidates, array_error);
+                    *restore.exact_player_field, planning_candidates, array_error,
+                    restore.native_hand_limit);
                 if (!plan)
                 {
                     return fail_without_write(array_error);
@@ -5641,6 +5655,203 @@ namespace QuantumCheckpoint
                 return fail_after_write("HAND to FIELD native play did not complete; "
                                         + native_queue_diagnostic(api.location.engine_state));
             }
+            return false;
+        }
+
+        auto verify_player_field_with_deferred_hand(
+            PendingRouteCRestore& restore, const RouteCBattleObjects& objects,
+            std::chrono::steady_clock::time_point now) -> bool
+        {
+            if (!restore.deferred_hand_field_layout || restore.hand_staging_status == "complete")
+                return verify_exact_player_field(restore, objects, now);
+            // Only the execution view changes. Always restore the saved payload,
+            // including on failure, so reports and fallback keep the real target.
+            auto saved = std::move(*restore.exact_player_field);
+            *restore.exact_player_field = *restore.deferred_hand_field_layout;
+            try
+            {
+                const bool ready = verify_exact_player_field(restore, objects, now);
+                *restore.exact_player_field = std::move(saved);
+                return ready;
+            }
+            catch (...)
+            {
+                *restore.exact_player_field = std::move(saved);
+                throw;
+            }
+        }
+
+        auto advance_player_hand_staging(
+            PendingRouteCRestore& restore, const RouteCBattleObjects& objects,
+            std::chrono::steady_clock::time_point now) -> bool
+        {
+            if (restore.hand_staging_status == "complete"
+                || restore.hand_staging_status == "legacy-startup") return true;
+            ExactPlayerFieldCheckpoint layout{};
+            layout.player_trash = layout.player_field = "()";
+            if (restore.exact_player_field) layout = *restore.exact_player_field;
+            else if (restore.exact_player_trash)
+            {
+                layout.schema_version = restore.exact_player_trash->schema_version;
+                layout.player_deck = restore.exact_player_trash->player_deck;
+                layout.player_hand = restore.exact_player_trash->player_hand;
+                layout.player_trash = restore.exact_player_trash->player_trash;
+            }
+            else if (restore.exact_player_zones)
+            {
+                layout.schema_version = restore.exact_player_zones->schema_version;
+                layout.player_deck = restore.exact_player_zones->player_deck;
+                layout.player_hand = restore.exact_player_zones->player_hand;
+            }
+            else return true;
+            if (layout.schema_version == 1)
+            {
+                restore.hand_staging_status = "legacy-startup";
+                return true;
+            }
+            const auto zones = find_route_c_player_zone_objects(objects.card_engine->GetWorld());
+            if (!zones.hand || !zones.deck || !zones.trash
+                || reflected_object_property(zones.hand, STR("mCardEngine")) != objects.card_engine)
+                throw std::runtime_error{"hand staging lost an active player controller"};
+            const auto limit = parse_int32(required_getter_text(zones.hand, STR("getHandLimit")));
+            if (!limit || *limit <= 0 || *limit > 16)
+                throw std::runtime_error{"native public hand capacity is unavailable"};
+            const auto api = validated_native_move_card_api(objects.card_engine);
+            if (!restore.hand_staging_plan)
+            {
+                restore.hand_staging_status = "planning";
+                if (!native_cards_at_location(objects.card_engine, api, 2).empty()
+                    || !native_cards_at_location(objects.card_engine, api, 3).empty()
+                    || !native_cards_at_location(objects.card_engine, api, 4).empty())
+                    throw std::runtime_error{"hand staging requires a clean native startup"};
+                std::vector<PlayerRestoreCandidate> candidates{};
+                std::string error{};
+                for (const auto origin : {std::uint8_t{1}, std::uint8_t{0}})
+                {
+                    for (const auto& card : read_native_player_zone_cards(objects.card_engine, origin))
+                    {
+                        const auto key = exact_card_identity_key_from_instance(
+                            required_getter_text(card.card, STR("getCardInfoInstance")), error);
+                        if (!key) throw std::runtime_error{error};
+                        (origin == 1 ? restore.hand_staging_deck : restore.hand_staging_hand)
+                            .push_back(candidates.size());
+                        candidates.push_back({*key, origin});
+                        restore.hand_staging_cards.push_back({card.card, card.state, origin});
+                    }
+                }
+                auto plan = plan_player_hand_staging(layout, candidates, *limit, error);
+                if (!plan) throw std::runtime_error{"player hand staging preflight: " + error};
+                restore.native_hand_limit = *limit;
+                restore.hand_staging_plan = std::move(*plan);
+                if (restore.hand_staging_plan->before_field_move_count
+                    < restore.hand_staging_plan->moves.size())
+                {
+                    auto hand = split_route_c_unreal_array(layout.player_hand, error);
+                    auto deck = split_route_c_unreal_array(layout.player_deck, error);
+                    if (!hand || hand->empty() || !deck || !restore.exact_player_field)
+                        throw std::runtime_error{"deferred hand plan has no full field target"};
+                    deck->push_back(hand->back());
+                    hand->pop_back();
+                    const auto array_text = [](const auto& cards) {
+                        std::string text{"("};
+                        for (const auto& card : cards)
+                        {
+                            if (text.size() > 1) text += ',';
+                            text += card;
+                        }
+                        return text + ')';
+                    };
+                    layout.player_deck = array_text(*deck);
+                    layout.player_hand = array_text(*hand);
+                    restore.deferred_hand_field_layout = std::move(layout);
+                }
+                restore.hand_staging_status = "moving";
+                append_route_c_trace_failure("restore.hand-staging.planned",
+                    "moves=" + std::to_string(restore.hand_staging_plan->moves.size())
+                        + " limit=" + std::to_string(restore.native_hand_limit));
+            }
+            if (restore.native_hand_limit != static_cast<std::size_t>(*limit))
+                throw std::runtime_error{"native hand capacity changed during staging"};
+            auto& plan = *restore.hand_staging_plan;
+            if (restore.hand_staging_move_index == plan.moves.size())
+            {
+                restore.hand_staging_status = "complete";
+                append_route_c_trace("restore.hand-staging.complete");
+                return true;
+            }
+            if (restore.hand_staging_move_index == plan.before_field_move_count
+                && !restore.deferred_hand_rebased)
+            {
+                restore.hand_staging_status = "awaiting-field";
+                if (restore.exact_player_field_status != "verified-position-health") return true;
+                if (!verify_player_field_with_deferred_hand(restore, objects, now)) return false;
+                if (restore.exact_player_field_status != "verified-position-health")
+                    throw std::runtime_error{"field changed before the final deferred hand move"};
+            }
+            const auto observed_indices = [&](std::uint8_t location) {
+                std::vector<std::size_t> result{};
+                for (const auto& live : read_native_player_zone_cards(objects.card_engine, location))
+                {
+                    const auto found = std::find_if(restore.hand_staging_cards.begin(),
+                        restore.hand_staging_cards.end(), [&](const auto& card) {
+                            return card.card == live.card && card.state == live.state;
+                        });
+                    if (found == restore.hand_staging_cards.end())
+                        throw std::runtime_error{"a foreign native card appeared during hand staging"};
+                    result.push_back(static_cast<std::size_t>(found - restore.hand_staging_cards.begin()));
+                }
+                return result;
+            };
+            const auto actual_deck = observed_indices(1), actual_hand = observed_indices(0);
+            if (restore.hand_staging_move_index == plan.before_field_move_count
+                && !restore.deferred_hand_rebased)
+            {
+                if (actual_deck.empty() || actual_hand != restore.hand_staging_hand)
+                    throw std::runtime_error{"the deferred hand slot changed while restoring FIELD"};
+                // Equal fruit copies may have exchanged runtime identities in the
+                // field plan. Its full-state verification proved the held card;
+                // bind the remaining native deck tail rather than a stale copy.
+                restore.hand_staging_deck = actual_deck;
+                plan.moves.back().candidate = actual_deck.back();
+                restore.deferred_hand_rebased = true;
+                restore.hand_staging_status = "moving";
+            }
+            const auto move = plan.moves.at(restore.hand_staging_move_index);
+            auto next_deck = restore.hand_staging_deck, next_hand = restore.hand_staging_hand;
+            auto& source = move.destination == 0 ? next_deck : next_hand;
+            auto& destination = move.destination == 0 ? next_hand : next_deck;
+            const auto found = std::find(source.begin(), source.end(), move.candidate);
+            if (found == source.end()) throw std::runtime_error{"staging target left its planned source"};
+            source.erase(found);
+            destination.push_back(move.candidate);
+            if (next_hand.size() > restore.native_hand_limit)
+                throw std::runtime_error{"hand staging would exceed native capacity"};
+            if (restore.hand_staging_move_queued)
+            {
+                if (actual_deck == next_deck && actual_hand == next_hand)
+                {
+                    restore.hand_staging_deck = std::move(next_deck);
+                    restore.hand_staging_hand = std::move(next_hand);
+                    restore.hand_staging_move_queued = false;
+                    ++restore.hand_staging_move_index;
+                    return false;
+                }
+                if (actual_deck != restore.hand_staging_deck || actual_hand != restore.hand_staging_hand)
+                    throw std::runtime_error{"native card membership or order changed during hand staging"};
+                if (now - restore.hand_staging_move_started_at > std::chrono::seconds{8})
+                    throw std::runtime_error{"native hand staging action did not complete"};
+                return false;
+            }
+            if (actual_deck != restore.hand_staging_deck || actual_hand != restore.hand_staging_hand)
+                throw std::runtime_error{"native card order changed before a hand staging action"};
+            const auto& target = restore.hand_staging_cards.at(move.candidate);
+            queue_native_move_card_action(api, {target.card, target.state}, move.destination);
+            resume_native_restore_actions(objects.card_engine);
+            restore.hand_staging_move_queued = true;
+            restore.hand_staging_move_started_at = now;
+            append_route_c_trace_failure("restore.hand-staging.queued",
+                "index=" + std::to_string(restore.hand_staging_move_index)
+                    + " destination=" + std::to_string(move.destination));
             return false;
         }
 
@@ -6110,7 +6321,15 @@ namespace QuantumCheckpoint
                     append_route_c_trace("restore.startup-open.settled");
                 }
 
-                if (!verify_exact_player_field(restore, objects, now))
+                if (!advance_player_hand_staging(restore, objects, now))
+                {
+                    return;
+                }
+                if (!verify_player_field_with_deferred_hand(restore, objects, now))
+                {
+                    return;
+                }
+                if (restore.deferred_hand_field_layout && restore.hand_staging_status != "complete")
                 {
                     return;
                 }
@@ -9691,7 +9910,7 @@ namespace QuantumCheckpoint
         // Compiled out of production. A fixture uses the same validated native
         // queue as restoration, but intentionally does not undo its test setup.
         // Inventory exports, not the queued report, prove the resulting state.
-        auto run_empty_hand_fixture() -> void
+        auto run_player_hand_fixture(std::uint8_t destination) -> void
         {
             std::string status{"queued"}, reason{}, before{};
             std::size_t queued{};
@@ -9715,19 +9934,33 @@ namespace QuantumCheckpoint
                 if (!native_cards_at_location(objects.card_engine, api, 4).empty())
                     throw std::runtime_error{"fixture requires an empty pending zone"};
                 const auto hand = read_native_player_zone_cards(objects.card_engine, 0);
-                if (hand.empty() || hand.size() > 7)
-                    throw std::runtime_error{"fixture requires between 1 and 7 hand cards"};
+                if (destination > 2 || hand.size() > 16)
+                    throw std::runtime_error{"fixture hand or destination is outside its bounds"};
+                auto selected = hand;
+                if (destination == 0)
+                {
+                    const auto zones = find_route_c_player_zone_objects(objects.card_engine->GetWorld());
+                    const auto limit = zones.hand
+                        ? parse_int32(required_getter_text(zones.hand, STR("getHandLimit"))) : std::nullopt;
+                    if (!limit || *limit <= 0 || *limit > 16 || hand.size() >= static_cast<std::size_t>(*limit))
+                        throw std::runtime_error{"fixture hand is full or its capacity is unavailable"};
+                    selected = read_native_player_zone_cards(objects.card_engine, 1);
+                    std::reverse(selected.begin(), selected.end());
+                    selected.resize(std::min(selected.size(), static_cast<std::size_t>(*limit) - hand.size()));
+                }
+                else if (destination == 1) std::reverse(selected.begin(), selected.end());
+                if (selected.empty()) throw std::runtime_error{"fixture has no eligible native cards"};
                 before = read_native_player_zone_order(objects.card_engine, 0);
                 if (!address_is_readable(objects.card_engine, 0x415)
                     || read_native_value<std::uint8_t>(objects.card_engine, 0x414) != 0)
                     throw std::runtime_error{"fixture cannot override a paused queue"};
-                for (const auto& card : hand)
+                for (const auto& card : selected)
                 {
-                    queue_native_move_card_action(api, card, 2);
+                    queue_native_move_card_action(api, card, destination);
                     ++queued;
                 }
                 resume_native_restore_actions(objects.card_engine);
-                reason = "native DEFAULT hand-to-trash actions queued; export inventory after completion";
+                reason = "native DEFAULT fixture actions queued; export inventory after completion";
             }
             catch (const std::exception& error)
             {
@@ -9739,15 +9972,16 @@ namespace QuantumCheckpoint
                 / STR("QuantumCheckpoint") / STR("Reports");
             std::filesystem::create_directories(directory);
             std::ostringstream report{};
-            report << "{\n  \"kind\": \"development-empty-hand-fixture\",\n"
+            report << "{\n  \"kind\": \"development-player-hand-fixture\",\n"
                    << "  \"capturedAtUtc\": \"" << json_escape(utc_timestamp()) << "\",\n"
                    << "  \"status\": \"" << json_escape(status) << "\",\n"
                    << "  \"reason\": \"" << json_escape(reason) << "\",\n"
                    << "  \"queuedCount\": " << queued << ",\n"
+                   << "  \"destination\": " << static_cast<int>(destination) << ",\n"
                    << "  \"sourceHand\": \"" << json_escape(before) << "\"\n}\n";
             write_file_atomically(directory / (STR("runtime-fixture-")
                 + to_wstring(filename_timestamp()) + STR(".json")), report.str());
-            append_route_c_trace_failure("development-empty-hand-fixture", status + ": " + reason);
+            append_route_c_trace_failure("development-player-hand-fixture", status + ": " + reason);
         }
 #endif
     } // namespace
@@ -9758,9 +9992,9 @@ namespace QuantumCheckpoint
         QuantumCheckpointMod()
         {
             ModName = STR("QuantumCheckpoint");
-            ModVersion = STR("0.20.0");
+            ModVersion = STR("0.21.0");
 #if defined(QUANTUM_CHECKPOINT_RUNTIME_TEST_FIXTURES)
-            ModVersion = STR("0.20.0-test-fixtures");
+            ModVersion = STR("0.21.0-test-fixtures");
 #endif
             ModDescription = STR("Route C checkpoint with optional exact-state supplements");
             ModAuthors = STR("zaofenMachine and contributors");
@@ -9847,8 +10081,14 @@ namespace QuantumCheckpoint
             UE4SSProgram::get_program().register_keydown_event(
                 Input::Key::F10,
                 {Input::ModifierKey::CONTROL, Input::ModifierKey::SHIFT},
-                []() { g_empty_hand_fixture_requested.store(true, std::memory_order_release); });
-            Output::send<LogLevel::Warning>(STR("[QuantumCheckpoint] DEVELOPMENT BUILD: Ctrl+Shift+F10 permanently moves this disposable battle's hand to trash.\n"));
+                []() { g_player_hand_fixture_destination.store(2, std::memory_order_release); });
+            UE4SSProgram::get_program().register_keydown_event(
+                Input::Key::F3, {Input::ModifierKey::CONTROL, Input::ModifierKey::SHIFT},
+                []() { g_player_hand_fixture_destination.store(1, std::memory_order_release); });
+            UE4SSProgram::get_program().register_keydown_event(
+                Input::Key::F4, {Input::ModifierKey::CONTROL, Input::ModifierKey::SHIFT},
+                []() { g_player_hand_fixture_destination.store(0, std::memory_order_release); });
+            Output::send<LogLevel::Warning>(STR("[QuantumCheckpoint] DEVELOPMENT BUILD: Ctrl+Shift+F3 returns HAND to DECK, F4 fills HAND, F10 sends HAND to TRASH in a disposable battle.\n"));
 #endif
             Output::send<LogLevel::Verbose>(
                 STR("[QuantumCheckpoint] Loaded Route C prototype; waves auto-save in supported dungeons, Ctrl+Shift+F5 saves, Ctrl+Shift+F6 restores, Ctrl+F1 exports.\n"));
@@ -10092,9 +10332,9 @@ namespace QuantumCheckpoint
                 }
 
 #if defined(QUANTUM_CHECKPOINT_RUNTIME_TEST_FIXTURES)
-                if (g_empty_hand_fixture_requested.exchange(false, std::memory_order_acq_rel)
-                    && g_unreal_ready.load(std::memory_order_acquire))
-                    run_empty_hand_fixture();
+                const auto fixture_destination = g_player_hand_fixture_destination.exchange(-1, std::memory_order_acq_rel);
+                if (fixture_destination >= 0 && g_unreal_ready.load(std::memory_order_acquire))
+                    run_player_hand_fixture(static_cast<std::uint8_t>(fixture_destination));
 #endif
                 if (g_move_card_probe_requested.exchange(false, std::memory_order_acq_rel))
                 {
