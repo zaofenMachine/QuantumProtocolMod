@@ -61,6 +61,9 @@ namespace QuantumCheckpoint
         std::atomic_bool g_battle_turn_write_probe_requested{false};
         std::atomic_bool g_draw_delay_write_probe_requested{false};
         std::atomic_bool g_move_card_probe_requested{false};
+#if defined(QUANTUM_CHECKPOINT_RUNTIME_TEST_FIXTURES)
+        std::atomic_bool g_empty_hand_fixture_requested{false};
+#endif
         std::atomic_bool g_route_c_save_requested{false};
         std::atomic_bool g_route_c_load_requested{false};
         std::atomic_bool g_unreal_ready{false};
@@ -9684,6 +9687,69 @@ namespace QuantumCheckpoint
                 }
             }
         }
+#if defined(QUANTUM_CHECKPOINT_RUNTIME_TEST_FIXTURES)
+        // Compiled out of production. A fixture uses the same validated native
+        // queue as restoration, but intentionally does not undo its test setup.
+        // Inventory exports, not the queued report, prove the resulting state.
+        auto run_empty_hand_fixture() -> void
+        {
+            std::string status{"queued"}, reason{}, before{};
+            std::size_t queued{};
+            try
+            {
+                if (g_pending_move_card_probe || g_pending_health_write_probe
+                    || g_pending_turn_write_probe || g_pending_battle_turn_write_probe
+                    || g_pending_draw_delay_write_probe || g_pending_route_c_restore
+                    || g_pending_route_c_capture)
+                    throw std::runtime_error{"another checkpoint or probe transaction is active"};
+                const auto objects = find_route_c_objects();
+                if (!objects.card_engine || !objects.bottom_bar
+                    || required_text(export_property_text(objects.card_engine,
+                            STR("currentGameState")), "game state") != "OPEN"
+                    || required_text(export_property_text(objects.card_engine,
+                            STR("mActiveCardSelectionPrompt")), "selection") != "None"
+                    || required_text(export_property_text(objects.card_engine,
+                            STR("mActiveCardPlacementPrompt")), "placement") != "None")
+                    throw std::runtime_error{"fixture requires an idle OPEN battle"};
+                const auto api = validated_native_move_card_api(objects.card_engine);
+                if (!native_cards_at_location(objects.card_engine, api, 4).empty())
+                    throw std::runtime_error{"fixture requires an empty pending zone"};
+                const auto hand = read_native_player_zone_cards(objects.card_engine, 0);
+                if (hand.empty() || hand.size() > 7)
+                    throw std::runtime_error{"fixture requires between 1 and 7 hand cards"};
+                before = read_native_player_zone_order(objects.card_engine, 0);
+                if (!address_is_readable(objects.card_engine, 0x415)
+                    || read_native_value<std::uint8_t>(objects.card_engine, 0x414) != 0)
+                    throw std::runtime_error{"fixture cannot override a paused queue"};
+                for (const auto& card : hand)
+                {
+                    queue_native_move_card_action(api, card, 2);
+                    ++queued;
+                }
+                resume_native_restore_actions(objects.card_engine);
+                reason = "native DEFAULT hand-to-trash actions queued; export inventory after completion";
+            }
+            catch (const std::exception& error)
+            {
+                status = queued ? "partially-queued" : "refused";
+                reason = error.what();
+            }
+            const auto directory = std::filesystem::path{
+                UE4SSProgram::get_program().get_mods_directory()}
+                / STR("QuantumCheckpoint") / STR("Reports");
+            std::filesystem::create_directories(directory);
+            std::ostringstream report{};
+            report << "{\n  \"kind\": \"development-empty-hand-fixture\",\n"
+                   << "  \"capturedAtUtc\": \"" << json_escape(utc_timestamp()) << "\",\n"
+                   << "  \"status\": \"" << json_escape(status) << "\",\n"
+                   << "  \"reason\": \"" << json_escape(reason) << "\",\n"
+                   << "  \"queuedCount\": " << queued << ",\n"
+                   << "  \"sourceHand\": \"" << json_escape(before) << "\"\n}\n";
+            write_file_atomically(directory / (STR("runtime-fixture-")
+                + to_wstring(filename_timestamp()) + STR(".json")), report.str());
+            append_route_c_trace_failure("development-empty-hand-fixture", status + ": " + reason);
+        }
+#endif
     } // namespace
 
     class QuantumCheckpointMod final : public CppUserModBase
@@ -9692,7 +9758,10 @@ namespace QuantumCheckpoint
         QuantumCheckpointMod()
         {
             ModName = STR("QuantumCheckpoint");
-            ModVersion = STR("0.19.0");
+            ModVersion = STR("0.20.0");
+#if defined(QUANTUM_CHECKPOINT_RUNTIME_TEST_FIXTURES)
+            ModVersion = STR("0.20.0-test-fixtures");
+#endif
             ModDescription = STR("Route C checkpoint with optional exact-state supplements");
             ModAuthors = STR("zaofenMachine and contributors");
             ModIntendedSDKVersion = STR("3.0.1");
@@ -9774,6 +9843,13 @@ namespace QuantumCheckpoint
                     g_route_c_load_requested.store(true, std::memory_order_release);
                 });
 
+#if defined(QUANTUM_CHECKPOINT_RUNTIME_TEST_FIXTURES)
+            UE4SSProgram::get_program().register_keydown_event(
+                Input::Key::F10,
+                {Input::ModifierKey::CONTROL, Input::ModifierKey::SHIFT},
+                []() { g_empty_hand_fixture_requested.store(true, std::memory_order_release); });
+            Output::send<LogLevel::Warning>(STR("[QuantumCheckpoint] DEVELOPMENT BUILD: Ctrl+Shift+F10 permanently moves this disposable battle's hand to trash.\n"));
+#endif
             Output::send<LogLevel::Verbose>(
                 STR("[QuantumCheckpoint] Loaded Route C prototype; waves auto-save in supported dungeons, Ctrl+Shift+F5 saves, Ctrl+Shift+F6 restores, Ctrl+F1 exports.\n"));
         }
@@ -10015,6 +10091,11 @@ namespace QuantumCheckpoint
                     }
                 }
 
+#if defined(QUANTUM_CHECKPOINT_RUNTIME_TEST_FIXTURES)
+                if (g_empty_hand_fixture_requested.exchange(false, std::memory_order_acq_rel)
+                    && g_unreal_ready.load(std::memory_order_acquire))
+                    run_empty_hand_fixture();
+#endif
                 if (g_move_card_probe_requested.exchange(false, std::memory_order_acq_rel))
                 {
                     append_route_c_trace("move-card-probe.dispatch");

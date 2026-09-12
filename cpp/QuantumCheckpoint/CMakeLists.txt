@@ -14,6 +14,12 @@ target_include_directories(${TARGET} PRIVATE include)
 target_compile_features(${TARGET} PRIVATE cxx_std_23)
 target_link_libraries(${TARGET} PUBLIC UE4SS bcrypt)
 
+option(QUANTUM_CHECKPOINT_RUNTIME_TEST_FIXTURES
+    "Enable destructive disposable-battle test fixtures (never for normal deployment)" OFF)
+if(QUANTUM_CHECKPOINT_RUNTIME_TEST_FIXTURES)
+    target_compile_definitions(${TARGET} PRIVATE QUANTUM_CHECKPOINT_RUNTIME_TEST_FIXTURES=1)
+endif()
+
 set_target_properties(
     ${TARGET}
     PROPERTIES

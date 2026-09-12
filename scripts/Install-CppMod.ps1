@@ -2,7 +2,8 @@
 param(
     [string]$GameRoot = 'F:\SteamLibrary\steamapps\common\Quantum Protocol',
     [string]$DllPath = (Join-Path $PSScriptRoot '..\build\cpp-vs17-14.38\Output\Game__Shipping__Win64\bin\QuantumCheckpoint.dll'),
-    [switch]$DryRun
+    [switch]$DryRun,
+    [switch]$AllowRuntimeTestFixtures
 )
 
 $ErrorActionPreference = 'Stop'
@@ -36,6 +37,11 @@ if ($runningProcesses.Count -gt 0) {
 }
 
 $sourceHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $resolvedDllPath).Hash
+$runtimeFixturesEnabled = [System.Text.Encoding]::ASCII.GetString(
+    [System.IO.File]::ReadAllBytes($resolvedDllPath)).Contains('development-empty-hand-fixture')
+if ($runtimeFixturesEnabled -and -not $AllowRuntimeTestFixtures) {
+    throw 'This DLL contains disposable-battle test fixtures. Rebuild with fixtures OFF for normal deployment, or specify -AllowRuntimeTestFixtures for a test session.'
+}
 $modsText = [System.IO.File]::ReadAllText($modsFile)
 $lineEnding = if ($modsText.Contains("`r`n")) { "`r`n" } else { "`n" }
 $lines = [System.Text.RegularExpressions.Regex]::Split($modsText, '\r?\n')
@@ -139,6 +145,7 @@ $manifest = [PSCustomObject]@{
     targetDll = $targetDll
     sourceDll = $resolvedDllPath
     installedDllSha256 = $installedDllHash
+    runtimeTestFixturesEnabled = $runtimeFixturesEnabled
     installedModsSha256 = $installedModsHash
     backupRoot = $backupRoot
     modsBackup = $modsBackup

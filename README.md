@@ -2,7 +2,7 @@
 
 《Quantum Protocol》局内检查点 Mod 的可行性研究与实验原型。
 
-当前 v0.19.0 保留路线 C“普通地牢小关语义重开”，支持受限玩家场地与墓地共存，恢复场格、生命和攻击状态。回合补充使用 schema 2，保存原生抽牌基础倒计时与修正量，由游戏自行计算可抽牌状态。恢复在游戏线程执行，精确层失败后重新加载一次纯 Route C。玩家牌区补充使用 schema 2，按原生顺序保存、恢复和验证牌库、手牌及墓地；旧排序格式保留兼容并明确标记。新格式支持苹果、柠檬、春的同名副本跨手牌、场地和墓地分配；特殊卡和复杂动态效果仍有缺口。
+当前 v0.20.0 保留路线 C“普通地牢小关语义重开”，支持受限玩家场地与墓地共存，恢复场格、生命和攻击状态。回合补充使用 schema 2，保存原生抽牌基础倒计时与修正量，由游戏自行计算可抽牌状态。恢复在游戏线程执行，精确层失败后重新加载一次纯 Route C。玩家牌区补充使用 schema 2，按原生顺序保存、恢复和验证牌库、手牌及墓地；旧排序格式保留兼容并明确标记。新格式支持苹果、柠檬、春的同名副本跨手牌、场地和墓地分配，并已验证空牌库、带场地的空手牌和全部卡牌在墓地的恢复。更广的手牌数量、特殊卡和复杂动态效果仍有缺口。
 
 ## 当前结论
 
@@ -33,7 +33,8 @@
 - [受限场地、真实抽牌与失败回退](docs/phase-15-player-field-and-draw-authority.md)
 - [玩家场地与墓地共存](docs/phase-16-player-field-and-trash.md)
 - [玩家牌区真实顺序](docs/phase-17-native-player-zone-order.md)
-- [跨玩家牌区的同名副本及当前边界](docs/phase-18-player-duplicate-zones.md)
+- [跨玩家牌区的同名副本](docs/phase-18-player-duplicate-zones.md)
+- [空牌库、空手牌与当前边界](docs/phase-19-empty-player-zones.md)
 - [文档索引](docs/README.md)
 
 ## 目录
@@ -93,7 +94,7 @@ C++ 构建前提、已验证工具链和反射结构提取方法见 [C++ 开发�
 
 安装器会把 DLL 部署为 `Mods\QuantumCheckpoint\dlls\main.dll`，在现有 `mods.txt` 中加入 `QuantumCheckpoint : 1`，并把精确回滚材料保存在被 Git 忽略的 `backups/cpp` 与 `runtime` 目录。若旧 Lua 研究探针存在，安装器会在本次 C++ 部署中将其禁用；回滚时会恢复部署前配置。
 
-v0.19.0 路线 C 与精确补充切片的热键和输出：
+v0.20.0 路线 C 与精确补充切片的热键和输出：
 
 - `Ctrl+Shift+F5`：在受支持的稳定普通小关手动保存；每次正常波次生成后也会自动保存。
 - `Ctrl+Shift+F6`：读取唯一检查点并执行语义重开。
@@ -103,7 +104,7 @@ v0.19.0 路线 C 与精确补充切片的热键和输出：
 - 初始牌区补充：`Mods\QuantumCheckpoint\Checkpoint\route-c-exact-player-zones.json`；只在所有活动玩家卡仍位于牌库/手牌且总集合完全匹配时生成。
 - 墓地补充：`Mods\QuantumCheckpoint\Checkpoint\route-c-exact-player-trash.json`；只在牌库、手牌、墓地构成完整牌组、玩家场上/待处理区为空且手牌/墓地身份无歧义时生成，恢复时通过原生 `DEFAULT` MoveCard 重建并严格复核三区顺序。
 - 角色充能补充：`Mods\QuantumCheckpoint\Checkpoint\route-c-exact-character-charge.json`；只保存低于满充阈值的值，恢复时通过公开增量 API 写回并由 Getter 复核。
-- 玩家场地补充：`Mods\QuantumCheckpoint\Checkpoint\route-c-exact-player-field.json`；限受支持水果、空 PENDING、无手/场/墓身份冲突，统一恢复墓地、场格、生命和攻击状态。保存牌库及手牌仍须非空；排序 Getter 验证不覆盖手牌屏幕排列。
+- 玩家场地补充：`Mods\QuantumCheckpoint\Checkpoint\route-c-exact-player-field.json`；限受支持水果、空 PENDING，统一恢复墓地、场格、生命和攻击状态。schema 2 按真实牌序分配普通水果同名副本，允许空牌库/手牌；完整活动牌组和原生暂存规划仍须通过验证。
 - 回合进度补充：`Mods\QuantumCheckpoint\Checkpoint\route-c-exact-turn-progress.json`；schema 2 成组保存全局回合、抽牌基础倒计时与修正量、累计威胁；同时核验游戏自行计算的抽牌缓存。旧 schema 1 只用于读取诊断，需重新保存以启用战斗补充。
 - 恢复结果：`Mods\QuantumCheckpoint\Reports\route-c-restore-*.json`。
 - 诊断轨迹：`Mods\QuantumCheckpoint\route-c-trace.log`；F5/F6 和各高风险阶段都会立即刷盘。

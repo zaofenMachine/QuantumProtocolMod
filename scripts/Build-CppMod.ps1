@@ -1,7 +1,8 @@
 param(
     [string]$UE4SSRoot = (Join-Path $PSScriptRoot '..\vendor\RE-UE4SS-v3.0.1'),
     [string]$BuildDirectory = (Join-Path $PSScriptRoot '..\build\cpp-vs17-14.38'),
-    [string]$Configuration = 'Game__Shipping__Win64'
+    [string]$Configuration = 'Game__Shipping__Win64',
+    [switch]$EnableRuntimeTestFixtures
 )
 
 $projectRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
@@ -47,12 +48,14 @@ $rustupPath = Join-Path $cargoBin 'rustup.exe'
 $rustCompiler = (& $rustupPath which --toolchain $env:RUSTUP_TOOLCHAIN rustc).Trim()
 $rustCargo = (& $rustupPath which --toolchain $env:RUSTUP_TOOLCHAIN cargo).Trim()
 $ue4ssConfigurations = 'Game__Debug__Win64;Game__Shipping__Win64;Game__Test__Win64;CasePreserving__Debug__Win64;CasePreserving__Shipping__Win64;CasePreserving__Test__Win64'
+$runtimeFixtures = if ($EnableRuntimeTestFixtures) { 'ON' } else { 'OFF' }
 
 & $cmakePath -S $projectRoot -B $resolvedBuildDirectory -G 'Visual Studio 17 2022' -A x64 -T 'v143,version=14.38' `
     "-DUE4SS_ROOT=$resolvedUE4SSRoot" `
     "-DCMAKE_CONFIGURATION_TYPES=$ue4ssConfigurations" `
     "-DRust_COMPILER=$rustCompiler" `
     "-DRust_CARGO=$rustCargo" `
+    "-DQUANTUM_CHECKPOINT_RUNTIME_TEST_FIXTURES=$runtimeFixtures" `
     '-DRust_RESOLVE_RUSTUP_TOOLCHAINS=OFF'
 if ($LASTEXITCODE -ne 0) {
     $env:Path = $previousPath

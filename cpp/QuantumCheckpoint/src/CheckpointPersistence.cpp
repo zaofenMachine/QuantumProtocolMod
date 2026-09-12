@@ -860,10 +860,10 @@ namespace QuantumCheckpoint
             error = "exact player hand is invalid: " + error;
             return std::nullopt;
         }
-        if (deck_elements->empty() || hand_elements->empty()
+        if ((deck_elements->empty() && hand_elements->empty())
             || deck_elements->size() + hand_elements->size() > 128)
         {
-            error = "exact player zones require a non-empty deck and hand with at most 128 cards";
+            error = "exact player startup requires between 1 and 128 cards";
             return std::nullopt;
         }
 
@@ -970,7 +970,7 @@ namespace QuantumCheckpoint
     {
         error.clear();
         auto deck = split_route_c_unreal_array(player_deck, error);
-        if (!deck || deck->empty())
+        if (!deck)
         {
             error = "exact player-trash deck is invalid: " + error;
             return std::nullopt;
@@ -982,7 +982,7 @@ namespace QuantumCheckpoint
             return std::nullopt;
         }
         auto hand = split_route_c_unreal_array(player_hand, error);
-        if (!hand || hand->empty() || deck->size() + hand->size() + trash->size() > 128)
+        if (!hand || deck->size() + hand->size() + trash->size() > 128)
         {
             error = "exact player-trash hand is invalid or total cards exceed 128: " + error;
             return std::nullopt;
@@ -1220,7 +1220,7 @@ namespace QuantumCheckpoint
         auto hand = split_route_c_unreal_array(player_hand, error);
         auto trash = split_route_c_unreal_array(player_trash, error);
         auto field = split_route_c_unreal_array(player_field, error);
-        if (!deck || deck->empty() || !hand || hand->empty() || !trash || !field
+        if (!deck || !hand || !trash || !field
             || field->empty()
             || deck->size() + hand->size() + trash->size() + field->size() > 128)
         {
@@ -1751,14 +1751,15 @@ namespace QuantumCheckpoint
 
         std::string array_error{};
         const auto deck = split_route_c_unreal_array(checkpoint.player_deck, array_error);
-        if (!deck || deck->empty())
+        if (!deck || (checkpoint.schema_version == 1 && deck->empty()))
         {
             error = "exact player deck is invalid: " + array_error;
             return false;
         }
         array_error.clear();
         const auto hand = split_route_c_unreal_array(checkpoint.player_hand, array_error);
-        if (!hand || hand->empty() || deck->size() + hand->size() > 128)
+        if (!hand || (checkpoint.schema_version == 1 && hand->empty())
+            || (deck->empty() && hand->empty()) || deck->size() + hand->size() > 128)
         {
             error = "exact player hand is invalid: " + array_error;
             return false;
@@ -1914,14 +1915,14 @@ namespace QuantumCheckpoint
 
         std::string array_error{};
         const auto deck = split_route_c_unreal_array(checkpoint.player_deck, array_error);
-        if (!deck || deck->empty())
+        if (!deck || (checkpoint.schema_version == 1 && deck->empty()))
         {
             error = "exact player-trash deck is invalid: " + array_error;
             return false;
         }
         array_error.clear();
         const auto hand = split_route_c_unreal_array(checkpoint.player_hand, array_error);
-        if (!hand || hand->empty())
+        if (!hand || (checkpoint.schema_version == 1 && hand->empty()))
         {
             error = "exact player-trash hand is invalid: " + array_error;
             return false;
@@ -2136,9 +2137,10 @@ namespace QuantumCheckpoint
             error = "exact player-field zones or aligned states are invalid: " + array_error;
             return false;
         }
-        if (deck->empty() || hand->empty() || field->empty())
+        if (field->empty()
+            || (checkpoint.schema_version == 1 && (deck->empty() || hand->empty())))
         {
-            error = "exact player-field capture requires non-empty deck, hand, and field";
+            error = "exact player-field capture requires a field and valid versioned deck/hand bounds";
             return false;
         }
         if (states->size() != field->size())

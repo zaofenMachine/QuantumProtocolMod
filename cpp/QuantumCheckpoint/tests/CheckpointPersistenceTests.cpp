@@ -705,6 +705,56 @@ int main()
     missing_shared_copy[4].identity = "naturalApple@1";
     require(!plan_player_field_restore(all_shared, missing_shared_copy, error),
             "a differently upgraded copy cannot satisfy a shared-identity field target");
+    auto empty_hand_layout = field;
+    empty_hand_layout.player_hand = "()";
+    empty_hand_layout.player_trash = card_array({"c", "b"});
+    const auto empty_hand_plan = plan_player_field_restore(empty_hand_layout, mixed_candidates, error);
+    require(empty_hand_plan && empty_hand_plan->trash_candidates == std::vector<std::size_t>{3, 2},
+            "an empty saved hand can move every temporary hand card to its real destination");
+    require(parse_exact_player_field_checkpoint(
+                serialize_exact_player_field_checkpoint(empty_hand_layout), error).has_value(),
+            "native field captures preserve an empty hand");
+    require(exact_player_field_startup_decklist(field_route.active_decklist,
+                empty_hand_layout.player_deck, empty_hand_layout.player_hand,
+                empty_hand_layout.player_trash, empty_hand_layout.player_field, error).has_value(),
+            "empty-hand field startup still contains the complete active card multiset");
+    empty_hand_layout.schema_version = 1;
+    require(!parse_exact_player_field_checkpoint(
+                serialize_exact_player_field_checkpoint(empty_hand_layout), error),
+            "legacy field bounds remain unchanged for an empty hand");
+
+    auto empty_deck_layout = field;
+    empty_deck_layout.player_deck = "()";
+    empty_deck_layout.player_trash = card_array({"c", "a"});
+    require(parse_exact_player_field_checkpoint(
+                serialize_exact_player_field_checkpoint(empty_deck_layout), error).has_value(),
+            "native field captures preserve an empty deck");
+    auto empty_deck_candidates = mixed_candidates;
+    const auto empty_deck_plan = plan_player_field_restore(empty_deck_layout, empty_deck_candidates, error);
+    require(empty_deck_plan && empty_deck_plan->trash_candidates == std::vector<std::size_t>{3, 1},
+            "staged deck extras are removed when no cards should remain in deck");
+    require(exact_player_field_startup_decklist(field_route.active_decklist,
+                empty_deck_layout.player_deck, empty_deck_layout.player_hand,
+                empty_deck_layout.player_trash, empty_deck_layout.player_field, error).has_value(),
+            "empty saved deck is distinct from an empty staged startup deck");
+
+    auto all_trash_layout = trash;
+    all_trash_layout.player_deck = "()";
+    all_trash_layout.player_hand = "()";
+    all_trash_layout.player_trash =
+        "((CardInfo=(Tag=\"a\")),(CardInfo=(Tag=\"a\")),(CardInfo=(Tag=\"b\"),upgradeLevel=1))";
+    require(parse_exact_player_trash_checkpoint(
+                serialize_exact_player_trash_checkpoint(all_trash_layout), error).has_value(),
+            "native trash capture may have no retained deck or hand");
+    require(exact_player_trash_startup_decklist(trash_route.active_decklist, "()", "()",
+                all_trash_layout.player_trash, error).has_value(),
+            "all-trash startup builds native cards before relocating them");
+    const auto all_trash_plan = plan_player_trash_restore(all_trash_layout,
+        {{"b@1", 0}, {"a@0", 0}, {"a@0", 1}}, error);
+    require(all_trash_plan && all_trash_plan->trash_candidates == std::vector<std::size_t>{1, 2, 0},
+            "all-trash plan assigns every card without reserving a nonexistent zone copy");
+    require(!exact_player_zones_startup_decklist(trash_route.active_decklist, "()", "()", error),
+            "a completely empty active startup is still rejected");
     ambiguous_field.schema_version = 1;
     require(!plan_player_field_restore(ambiguous_field, hand_field_overlap_candidates, error)
                 && error.find("shared hand/field/trash") != std::string::npos,
