@@ -28,5 +28,6 @@
 
 - [phase-14-player-field-primitives.md](phase-14-player-field-primitives.md)：玩家场内换格及抑制效果的出牌原语。
 - [phase-15-player-field-and-draw-authority.md](phase-15-player-field-and-draw-authority.md)：受限场地恢复、原生抽牌倒计时、游戏线程执行、补充依赖和失败重开。
+- [phase-16-player-field-and-trash.md](phase-16-player-field-and-trash.md)：当前方向、玩家场地与墓地共存、统一搬牌计划、失败回退及手牌视觉顺序缺口。
 
 维护规则：需求发生变化时先更新 `requirements.md`；技术实验产生新证据时更新 `technical-status.md` 并补充对应阶段报告；正式选定恢复路线后在 `architecture-options.md` 记录决定与理由。

@@ -1,4 +1,5 @@
 #include "CheckpointPersistence.hpp"
+#include "PlayerRestorePlan.hpp"
 
 #include <cstdlib>
 #include <iostream>
@@ -487,6 +488,72 @@ int main()
             "player-field staging accepts sorted interleaving of saved hand and extras");
 
     auto ambiguous_field = field;
+    // Actor enumeration order differs from both controller order and saved slots.
+    const std::vector<PlayerRestoreCandidate> mixed_candidates{
+        {"naturalLemon@0", 0}, {"a@0", 1}, {"b@0", 0},
+        {"c@0", 0}, {"naturalApple@0", 1},
+    };
+    const auto mixed_plan = plan_player_field_restore(field, mixed_candidates, error);
+    require(mixed_plan.has_value(), error.c_str());
+    require(mixed_plan->trash_candidates == std::vector<std::size_t>{3}
+                && mixed_plan->field_candidates == std::vector<std::size_t>{4, 0},
+            "mixed layout assigns unique native candidates in saved trash and slot order");
+
+    auto duplicate_deck_trash = field;
+    duplicate_deck_trash.player_deck = "((CardInfo=(Tag=\"c\")))";
+    auto duplicated_candidates = mixed_candidates;
+    duplicated_candidates[1].identity = "c@0";
+    const auto reserved_plan = plan_player_field_restore(
+        duplicate_deck_trash, duplicated_candidates, error);
+    require(reserved_plan && reserved_plan->trash_candidates == std::vector<std::size_t>{3},
+            "saved deck copy is reserved before selecting equivalent hand overflow for trash");
+
+    auto double_trash = field;
+    double_trash.player_trash = "((CardInfo=(Tag=\"c\")),(CardInfo=(Tag=\"c\")))";
+    auto double_candidates = mixed_candidates;
+    double_candidates.push_back({"c@0", 1});
+    const auto double_plan = plan_player_field_restore(double_trash, double_candidates, error);
+    require(double_plan && double_plan->trash_candidates == std::vector<std::size_t>{3, 5},
+            "same-identity trash copies in hand and deck each receive a distinct target");
+
+    auto trash_frees_hand = mixed_candidates;
+    trash_frees_hand[0].location = 1;
+    require(plan_player_field_restore(field, trash_frees_hand, error).has_value(),
+            "trash movement frees a staging slot even when all field targets start in deck");
+    trash_frees_hand[3].location = 1;
+    require(!plan_player_field_restore(field, trash_frees_hand, error),
+            "layout without a movable initial hand target keeps the capacity guard");
+
+    auto wrong_candidates = mixed_candidates;
+    wrong_candidates[0].identity = "naturalLemon@1";
+    require(!plan_player_field_restore(field, wrong_candidates, error),
+            "planning rejects a changed upgrade before native writes");
+    wrong_candidates = mixed_candidates;
+    wrong_candidates[1].location = 0;
+    require(!plan_player_field_restore(field, wrong_candidates, error),
+            "matching total identities do not permit a saved deck card in the wrong zone");
+    wrong_candidates = mixed_candidates;
+    wrong_candidates[3].location = 2;
+    require(!plan_player_field_restore(field, wrong_candidates, error),
+            "unexpected live trash is not a staged movement candidate");
+    wrong_candidates = mixed_candidates;
+    wrong_candidates.push_back({"extra@0", 0});
+    require(!plan_player_field_restore(field, wrong_candidates, error),
+            "extra native cards invalidate the entire movement plan");
+
+    auto overlapping_layout = field;
+    overlapping_layout.player_trash = "((CardInfo=(Tag=\"b\")))";
+    auto overlapping_candidates = mixed_candidates;
+    overlapping_candidates[3].identity = "b@0";
+    require(!plan_player_field_restore(overlapping_layout, overlapping_candidates, error)
+                && error.find("shared hand/field/trash") != std::string::npos,
+            "shared hand/trash identity is rejected before any target is used");
+    overlapping_layout.player_trash = "((CardInfo=(Tag=\"naturalApple\")))";
+    overlapping_candidates[3].identity = "naturalApple@0";
+    require(!plan_player_field_restore(overlapping_layout, overlapping_candidates, error)
+                && error.find("shared hand/field/trash") != std::string::npos,
+            "shared field/trash identity remains outside the tested slice");
+
     // Runtime regression: field slots are Apple/Lemon/Apple, but native hand
     // sorting exposes Cherry/Cherry/Apple/Lemon/Spring during five-card startup.
     const std::string retained_deck = "((CardInfo=(Tag=\"genericBattery\")),(CardInfo=(Tag=\"spDeckEdit\")))";
@@ -515,6 +582,24 @@ int main()
                 serialize_exact_player_field_checkpoint(ambiguous_field), error)
                 .has_value(),
             "equivalent hand/field card identities remain valid staging inputs");
+    auto hand_field_overlap_candidates = mixed_candidates;
+    hand_field_overlap_candidates[2].identity = "naturalApple@0";
+    require(!plan_player_field_restore(ambiguous_field, hand_field_overlap_candidates, error)
+                && error.find("shared hand/field/trash") != std::string::npos,
+            "valid persisted identities do not bypass the runtime hand/field ambiguity guard");
+
+    auto empty_trash_field = field;
+    empty_trash_field.player_trash = "()";
+    empty_trash_field.player_field =
+        "((CardInfo=(Tag=\"naturalApple\")),(CardInfo=(Tag=\"naturalLemon\")),"
+        "(CardInfo=(Tag=\"naturalApple\")))";
+    auto repeated_field_candidates = mixed_candidates;
+    repeated_field_candidates[3].identity = "naturalApple@0";
+    const auto empty_trash_plan = plan_player_field_restore(
+        empty_trash_field, repeated_field_candidates, error);
+    require(empty_trash_plan && empty_trash_plan->trash_candidates.empty()
+                && empty_trash_plan->field_candidates == std::vector<std::size_t>{3, 0, 4},
+            "existing empty-trash sample keeps two separate apples aligned with their saved slots");
 
     auto six_visible_cards = field;
     six_visible_cards.player_hand =

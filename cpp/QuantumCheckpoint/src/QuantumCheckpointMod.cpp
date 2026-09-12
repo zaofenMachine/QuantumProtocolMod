@@ -3,6 +3,7 @@
 
 #include "CheckpointSchema.hpp"
 #include "CheckpointPersistence.hpp"
+#include "PlayerRestorePlan.hpp"
 
 #include <algorithm>
 #include <array>
@@ -167,6 +168,8 @@ namespace QuantumCheckpoint
                 exact_player_trash_move_started_at{};
             std::vector<PendingNativeTrashMove> exact_player_trash_targets{};
             std::vector<PendingNativeFieldMove> exact_player_field_targets{};
+            std::vector<PendingNativeTrashMove> exact_player_field_trash_targets{};
+            std::size_t exact_player_field_trash_target_index{};
             std::size_t exact_player_field_target_index{};
             std::optional<std::chrono::steady_clock::time_point>
                 exact_player_field_move_started_at{};
@@ -3378,6 +3381,10 @@ namespace QuantumCheckpoint
                    << json_escape(restore.exact_player_field_reason) << "\",\n"
                    << "  \"exactPlayerFieldTargetCount\": "
                    << restore.exact_player_field_targets.size() << ",\n"
+                   << "  \"exactPlayerFieldTrashTargetCount\": "
+                   << restore.exact_player_field_trash_targets.size() << ",\n"
+                   << "  \"exactPlayerFieldTrashCompletedCount\": "
+                   << restore.exact_player_field_trash_target_index << ",\n"
                    << "  \"exactPlayerFieldTurnActiveMismatchCount\": "
                    << restore.exact_player_field_turn_active_mismatches << ",\n"
                    << "  \"activeDecklistRestoredAfterExactStartup\": "
@@ -4733,7 +4740,7 @@ namespace QuantumCheckpoint
             restore.exact_player_field_turn_active_mismatches = mismatches;
             restore.exact_player_field_reason =
                 "native fixed-order staging and effect-suppressed play restored exact "
-                "player-field positions, current health, and turn-active state "
+                "player deck/hand/trash, field positions, current health, and turn-active state "
                 "(mismatches=" + std::to_string(mismatches) + ")";
         }
 
@@ -4750,6 +4757,7 @@ namespace QuantumCheckpoint
                 update_exact_player_field_turn_diagnostic(restore);
             }
             if (restore.exact_player_field_status != "pending"
+                && restore.exact_player_field_status != "moving-field-trash"
                 && restore.exact_player_field_status != "moving-field-to-hand"
                 && restore.exact_player_field_status != "playing-field"
                 && restore.exact_player_field_status != "verified-position-health")
@@ -4908,7 +4916,8 @@ namespace QuantumCheckpoint
             const auto final_state_matches = [&]() {
                 if (actual_deck->value != restore.exact_player_field->player_deck
                     || actual_hand->value != restore.exact_player_field->player_hand
-                    || actual_trash->value != restore.exact_player_field->player_trash)
+                    || actual_trash->value != restore.exact_player_field->player_trash
+                    || !native_cards_at_location(objects.card_engine, api.location, 4).empty())
                 {
                     return false;
                 }
@@ -5138,6 +5147,74 @@ namespace QuantumCheckpoint
                     "restore.exact-player-field.deck-to-hand.queued");
             };
 
+            const auto queue_current_trash_target = [&]() {
+                const auto& target = restore.exact_player_field_trash_targets.at(
+                    restore.exact_player_field_trash_target_index);
+                const auto location = native_card_location(
+                    api.location.engine_state, target.state, api.location.get_card_location);
+                if (!location || *location != target.origin)
+                {
+                    throw std::runtime_error{"trash target left its staged origin before moving"};
+                }
+                queue_native_move_card_action(
+                    api.location,
+                    NativeCardReference{.card = target.card, .state = target.state}, 2);
+                resume_native_restore_actions(objects.card_engine);
+                restore.exact_player_field_status = "moving-field-trash";
+                restore.exact_player_field_move_started_at = now;
+                append_route_c_trace_failure("restore.exact-player-field.trash.queued",
+                    "index=" + std::to_string(restore.exact_player_field_trash_target_index)
+                        + " origin=" + std::to_string(target.origin));
+            };
+
+            if (restore.exact_player_field_status == "moving-field-trash")
+            {
+                const auto& target = restore.exact_player_field_trash_targets.at(
+                    restore.exact_player_field_trash_target_index);
+                const auto location = native_card_location(
+                    api.location.engine_state, target.state, api.location.get_card_location);
+                if (!location)
+                {
+                    return fail_after_write("current trash target location became unavailable");
+                }
+                if (*location != 2)
+                {
+                    if (restore.exact_player_field_move_started_at
+                        && now - *restore.exact_player_field_move_started_at > std::chrono::seconds{8})
+                    {
+                        return fail_after_write("native trash move did not complete; "
+                            + native_queue_diagnostic(api.location.engine_state));
+                    }
+                    return false;
+                }
+                // The actor location and controller sequence must both settle
+                // before the next move; maintain the saved trash insertion order.
+                const auto observed_trash = split_route_c_unreal_array(actual_trash->value, array_error);
+                const auto completed = restore.exact_player_field_trash_target_index + 1;
+                if (!observed_trash || observed_trash->size() != completed
+                    || !std::equal(observed_trash->begin(), observed_trash->end(), expected_trash->begin()))
+                {
+                    if (restore.exact_player_field_move_started_at
+                        && now - *restore.exact_player_field_move_started_at > std::chrono::seconds{2})
+                    {
+                        return fail_after_write("trash controller did not reproduce the saved prefix");
+                    }
+                    return false;
+                }
+                ++restore.exact_player_field_trash_target_index;
+                if (restore.exact_player_field_trash_target_index
+                    < restore.exact_player_field_trash_targets.size())
+                {
+                    queue_current_trash_target();
+                }
+                else
+                {
+                    append_route_c_trace("restore.exact-player-field.trash.complete");
+                    queue_current_target();
+                }
+                return false;
+            }
+
             if (restore.exact_player_field_status == "pending")
             {
                 std::string staging_error{};
@@ -5173,45 +5250,11 @@ namespace QuantumCheckpoint
                         "fixed-order startup did not reproduce field staging: "
                         + staging_error);
                 }
-                if (!expected_trash->empty())
-                {
-                    return fail_without_write(
-                        "the first exact player-field restore slice leaves non-empty trash "
-                        "to the ordinary Route C fallback");
-                }
                 if (!native_cards_at_location(
                          objects.card_engine, api.location, 3).empty())
                 {
                     return fail_without_write(
                         "native startup unexpectedly produced player FIELD cards");
-                }
-
-                std::vector<std::string> hand_keys{};
-                for (const auto& card : *expected_hand)
-                {
-                    auto key = exact_card_identity_key_from_instance(card, array_error);
-                    if (!key)
-                    {
-                        throw std::runtime_error{
-                            "saved hand identity was invalid: " + array_error};
-                    }
-                    hand_keys.push_back(std::move(*key));
-                }
-                for (const auto& card : *expected_field)
-                {
-                    auto key = exact_card_identity_key_from_instance(card, array_error);
-                    if (!key)
-                    {
-                        throw std::runtime_error{
-                            "saved field identity was invalid: " + array_error};
-                    }
-                    if (std::find(hand_keys.begin(), hand_keys.end(), *key)
-                        != hand_keys.end())
-                    {
-                        return fail_without_write(
-                            "the first exact player-field restore slice leaves a shared "
-                            "hand/field identity to the ordinary Route C fallback");
-                    }
                 }
 
                 struct Candidate
@@ -5242,135 +5285,135 @@ namespace QuantumCheckpoint
                         });
                     }
                 }
-                std::vector<bool> used(candidates.size());
+                std::vector<PlayerRestoreCandidate> planning_candidates{};
+                for (const auto& candidate : candidates)
+                {
+                    planning_candidates.push_back({candidate.key, candidate.origin});
+                }
+                const auto plan = plan_player_field_restore(
+                    *restore.exact_player_field, planning_candidates, array_error);
+                if (!plan)
+                {
+                    return fail_without_write(array_error);
+                }
+                std::vector<PendingNativeTrashMove> trash_targets{};
+                for (const auto index : plan->trash_candidates)
+                {
+                    const auto& candidate = candidates.at(index);
+                    trash_targets.push_back({candidate.reference.card,
+                                             candidate.reference.state, candidate.origin});
+                }
                 std::vector<PendingNativeFieldMove> targets{};
-                targets.reserve(expected_field->size());
-                for (std::size_t saved_index{}; saved_index < expected_field->size();
+                targets.reserve(plan->field_candidates.size());
+                for (std::size_t saved_index{}; saved_index < plan->field_candidates.size();
                      ++saved_index)
                 {
-                    auto key = exact_card_identity_key_from_instance(
-                        (*expected_field)[saved_index], array_error);
-                    bool found{};
-                    for (std::size_t candidate_index{};
-                         key && candidate_index < candidates.size();
-                         ++candidate_index)
+                    const auto& candidate = candidates.at(plan->field_candidates[saved_index]);
+                    const auto* native_card_object = read_native_value<const void*>(
+                        candidate.reference.state, CardStateSharedObjectOffset);
+                    if (!native_card_object
+                        || !address_is_readable(
+                            static_cast<const std::byte*>(native_card_object)
+                                + NativeCardEffectListPointerOffset,
+                            sizeof(void*) + sizeof(std::int32_t) * 2)
+                        || !address_is_writable(
+                            static_cast<const std::byte*>(native_card_object)
+                                + NativeCardEffectListCountOffset,
+                            sizeof(std::int32_t)))
                     {
-                        if (used[candidate_index]
-                            || candidates[candidate_index].key != *key)
-                        {
-                            continue;
-                        }
-                        const auto& candidate = candidates[candidate_index];
-                        const auto* native_card_object = read_native_value<const void*>(
-                            candidate.reference.state, CardStateSharedObjectOffset);
-                        if (!native_card_object
-                            || !address_is_readable(
-                                static_cast<const std::byte*>(native_card_object)
-                                    + NativeCardEffectListPointerOffset,
-                                sizeof(void*) + sizeof(std::int32_t) * 2)
-                            || !address_is_writable(
-                                static_cast<const std::byte*>(native_card_object)
-                                    + NativeCardEffectListCountOffset,
-                                sizeof(std::int32_t)))
-                        {
-                            throw std::runtime_error{
-                                "field target effect-list header was unavailable"};
-                        }
-                        const auto* effect_pointer = read_native_value<const void*>(
-                            native_card_object, NativeCardEffectListPointerOffset);
-                        const auto effect_count = read_native_value<std::int32_t>(
-                            native_card_object, NativeCardEffectListCountOffset);
-                        const auto effect_capacity = read_native_value<std::int32_t>(
-                            native_card_object, NativeCardEffectListCapacityOffset);
-                        if (!effect_pointer || effect_count <= 0 || effect_count > 64
-                            || effect_capacity < effect_count || effect_capacity > 256
-                            || !address_is_readable(
-                                effect_pointer,
-                                static_cast<std::size_t>(effect_count)
-                                    * sizeof(NativeSharedPointerPair)))
-                        {
-                            throw std::runtime_error{
-                                "field target effect-list layout did not pass validation"};
-                        }
-                        const auto base_health = read_native_value<std::int32_t>(
-                            candidate.reference.state, CardStateBaseHealthOffset);
-                        const auto target_health =
-                            (*expected_states)[saved_index].current_health;
-                        if (base_health <= 0 || target_health <= 0
-                            || target_health > base_health)
-                        {
-                            throw std::runtime_error{
-                                "saved field-card health exceeded the live card base health"};
-                        }
-                        auto* turn_active_getter =
-                            candidate.reference.card->GetFunctionByNameInChain(
-                                STR("isTurnActive"));
-                        const auto turn_active_text = required_getter_text(
-                            candidate.reference.card, STR("isTurnActive"));
-                        const auto native_turn_active =
-                            read_native_value<std::uint8_t>(
-                                candidate.reference.state,
-                                CardStateTurnActiveOffset);
-                        if (!turn_active_getter
-                            || reinterpret_cast<std::uintptr_t>(
-                                   turn_active_getter->GetFuncPtr())
-                                != module_base + IsTurnActiveGetterThunkRva
-                            || !address_is_writable(
-                                static_cast<const std::byte*>(
-                                    candidate.reference.state)
-                                    + CardStateTurnActiveOffset,
-                                sizeof(std::uint8_t))
-                            || native_turn_active > 1
-                            || (turn_active_text != "True"
-                                && turn_active_text != "False")
-                            || (turn_active_text == "True")
-                                != (native_turn_active != 0))
-                        {
-                            throw std::runtime_error{
-                                "field target turn-active state did not pass validation"};
-                        }
-                        used[candidate_index] = true;
-                        targets.push_back(PendingNativeFieldMove{
-                            .card = candidate.reference.card,
-                            .state = candidate.reference.state,
-                            .origin = candidate.origin,
-                            .native_card_object = native_card_object,
-                            .effect_list_pointer = effect_pointer,
-                            .effect_list_count = effect_count,
-                            .effect_list_capacity = effect_capacity,
-                            .row = (*expected_states)[saved_index].row,
-                            .index = (*expected_states)[saved_index].index,
-                            .target_health = target_health,
-                            .original_turn_active = native_turn_active != 0,
-                            .target_turn_active =
-                                (*expected_states)[saved_index].turn_active,
-                        });
-                        found = true;
-                        break;
+                        throw std::runtime_error{
+                            "field target effect-list header was unavailable"};
                     }
-                    if (!found)
+                    const auto* effect_pointer = read_native_value<const void*>(
+                        native_card_object, NativeCardEffectListPointerOffset);
+                    const auto effect_count = read_native_value<std::int32_t>(
+                        native_card_object, NativeCardEffectListCountOffset);
+                    const auto effect_capacity = read_native_value<std::int32_t>(
+                        native_card_object, NativeCardEffectListCapacityOffset);
+                    if (!effect_pointer || effect_count <= 0 || effect_count > 64
+                        || effect_capacity < effect_count || effect_capacity > 256
+                        || !address_is_readable(
+                            effect_pointer,
+                            static_cast<std::size_t>(effect_count)
+                                * sizeof(NativeSharedPointerPair)))
                     {
-                        return fail_without_write(
-                            "native deck/hand objects did not contain every saved field identity");
+                        throw std::runtime_error{
+                            "field target effect-list layout did not pass validation"};
                     }
+                    const auto base_health = read_native_value<std::int32_t>(
+                        candidate.reference.state, CardStateBaseHealthOffset);
+                    const auto target_health =
+                        (*expected_states)[saved_index].current_health;
+                    if (base_health <= 0 || target_health <= 0
+                        || target_health > base_health)
+                    {
+                        throw std::runtime_error{
+                            "saved field-card health exceeded the live card base health"};
+                    }
+                    auto* turn_active_getter =
+                        candidate.reference.card->GetFunctionByNameInChain(
+                            STR("isTurnActive"));
+                    const auto turn_active_text = required_getter_text(
+                        candidate.reference.card, STR("isTurnActive"));
+                    const auto native_turn_active =
+                        read_native_value<std::uint8_t>(
+                            candidate.reference.state,
+                            CardStateTurnActiveOffset);
+                    if (!turn_active_getter
+                        || reinterpret_cast<std::uintptr_t>(
+                               turn_active_getter->GetFuncPtr())
+                            != module_base + IsTurnActiveGetterThunkRva
+                        || !address_is_writable(
+                            static_cast<const std::byte*>(
+                                candidate.reference.state)
+                                + CardStateTurnActiveOffset,
+                            sizeof(std::uint8_t))
+                        || native_turn_active > 1
+                        || (turn_active_text != "True"
+                            && turn_active_text != "False")
+                        || (turn_active_text == "True")
+                            != (native_turn_active != 0))
+                    {
+                        throw std::runtime_error{
+                            "field target turn-active state did not pass validation"};
+                    }
+                    targets.push_back(PendingNativeFieldMove{
+                        .card = candidate.reference.card,
+                        .state = candidate.reference.state,
+                        .origin = candidate.origin,
+                        .native_card_object = native_card_object,
+                        .effect_list_pointer = effect_pointer,
+                        .effect_list_count = effect_count,
+                        .effect_list_capacity = effect_capacity,
+                        .row = (*expected_states)[saved_index].row,
+                        .index = (*expected_states)[saved_index].index,
+                        .target_health = target_health,
+                        .original_turn_active = native_turn_active != 0,
+                        .target_turn_active =
+                            (*expected_states)[saved_index].turn_active,
+                    });
                 }
                 std::stable_sort(targets.begin(), targets.end(), [](const auto& left,
                                                                     const auto& right) {
                     return left.origin < right.origin;
                 });
-                if (targets.empty() || targets.front().origin != 0)
-                {
-                    return fail_without_write(
-                        "native initial hand contained no staged field target; the guarded "
-                        "deck-to-hand sequence would exceed hand capacity");
-                }
                 restore.exact_player_field_targets = std::move(targets);
                 restore.exact_player_field_target_index = 0;
+                restore.exact_player_field_trash_targets = std::move(trash_targets);
+                restore.exact_player_field_trash_target_index = 0;
                 append_route_c_trace_failure(
                     "restore.exact-player-field.targets.prepared",
                     "count="
-                        + std::to_string(restore.exact_player_field_targets.size()));
-                queue_current_target();
+                        + std::to_string(restore.exact_player_field_targets.size())
+                        + " trash=" + std::to_string(restore.exact_player_field_trash_targets.size()));
+                if (!restore.exact_player_field_trash_targets.empty())
+                {
+                    queue_current_trash_target();
+                }
+                else
+                {
+                    queue_current_target();
+                }
                 return false;
             }
 
@@ -6154,9 +6197,9 @@ namespace QuantumCheckpoint
                     "passed",
                     restore.exact_player_field_status == "verified-position-health"
                         && restore.exact_turn_progress_status == "verified"
-                        ? "ordinary substage semantics, exact player deck, hand, field positions, field health, field turn-active state, CardEngine turn, player draw delay, and wave-alert counter were restored"
+                        ? "ordinary substage semantics, exact player deck, hand, trash, field positions, field health, field turn-active state, CardEngine turn, player draw delay, and wave-alert counter were restored"
                     : restore.exact_player_field_status == "verified-position-health"
-                        ? "ordinary substage semantics and exact player deck, hand, field positions, field health, and field turn-active state were restored"
+                        ? "ordinary substage semantics and exact player deck, hand, trash, field positions, field health, and field turn-active state were restored"
                     : restore.exact_turn_progress_status == "verified"
                         && restore.exact_player_trash_status == "verified"
                         ? "ordinary substage semantics, exact player deck, hand, trash, CardEngine turn, player draw delay, and wave-alert counter were restored"
@@ -9514,7 +9557,7 @@ namespace QuantumCheckpoint
         QuantumCheckpointMod()
         {
             ModName = STR("QuantumCheckpoint");
-            ModVersion = STR("0.16.0");
+            ModVersion = STR("0.17.0");
             ModDescription = STR("Route C checkpoint with optional exact-state supplements");
             ModAuthors = STR("zaofenMachine and contributors");
             ModIntendedSDKVersion = STR("3.0.1");

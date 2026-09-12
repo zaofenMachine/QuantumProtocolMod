@@ -7,6 +7,7 @@ add_library(
     SHARED
     src/QuantumCheckpointMod.cpp
     src/CheckpointPersistence.cpp
+    src/PlayerRestorePlan.cpp
 )
 
 target_include_directories(${TARGET} PRIVATE include)
@@ -23,6 +24,7 @@ add_executable(
     QuantumCheckpointPersistenceTests
     tests/CheckpointPersistenceTests.cpp
     src/CheckpointPersistence.cpp
+    src/PlayerRestorePlan.cpp
 )
 target_include_directories(QuantumCheckpointPersistenceTests PRIVATE include)
 target_compile_features(QuantumCheckpointPersistenceTests PRIVATE cxx_std_23)

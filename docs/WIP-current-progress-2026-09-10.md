@@ -1,5 +1,7 @@
 # QuantumCheckpoint 当前工作进度（临时续接记录）
 
+> 2026-09-13 当前续接入口：[第十六阶段](phase-16-player-field-and-trash.md)。按用户决定暂时搁置“重编程重开”和敌人精确恢复，继续“小关重开 + 玩家精确恢复”。场地与墓地共存已完成首个切片，下一项定位手牌真实排列；下面的旧调试清单继续保留为历史材料。
+
 > 2026-09-12 续接更新：下文已归档为历史调试记录，请勿继续部署文中旧隔离版。当前正式实现、方向复核和验证见 [第十五阶段](phase-15-player-field-and-draw-authority.md)。抽牌根因已确定为原生基础倒计时与显示修正量不同；旧样本不能推导这两个值，需在新版重新采集。原始样本、失败报告和新样本均保存在 `QuantumProtoclMod.runtime-evidence/20260912-draw-authority`。最终构建的每轮验收以该目录 `validation-summary.json` 为准。
 
 记录时间：2026-09-10（Asia/Shanghai）
