@@ -5,9 +5,10 @@
 
 namespace QuantumCheckpoint
 {
-    auto plan_player_field_restore(
+    static auto plan_player_cards_restore(
         const ExactPlayerFieldCheckpoint& checkpoint,
         const std::vector<PlayerRestoreCandidate>& candidates,
+        bool require_field,
         std::string& error) -> std::optional<PlayerFieldRestorePlan>
     {
         error.clear();
@@ -28,7 +29,7 @@ namespace QuantumCheckpoint
         const auto hand = keys(checkpoint.player_hand);
         const auto trash = keys(checkpoint.player_trash);
         const auto field = keys(checkpoint.player_field);
-        if (!deck || !hand || !trash || !field || field->empty())
+        if (!deck || !hand || !trash || !field || (require_field && field->empty()))
         {
             error = "invalid player-field plan arrays: " + error;
             return std::nullopt;
@@ -73,21 +74,34 @@ namespace QuantumCheckpoint
         // Reserve the cards that must stay in DECK/HAND first. Otherwise an
         // equivalent card in DECK can be moved while startup overflow is left
         // in HAND, silently changing the final zone counts.
-        for (const auto& key : *deck)
-        {
-            if (!select(key, 1))
+        const auto reserve_zone = [&](const auto& expected, std::uint8_t location) {
+            std::size_t cursor{};
+            for (const auto& key : expected)
             {
-                error = "staged deck cannot retain every saved deck identity";
-                return std::nullopt;
+                if (checkpoint.schema_version == 1)
+                {
+                    if (!select(key, location)) return false;
+                    continue;
+                }
+                // Schema 2 candidates follow each zone's native order. Reserve
+                // a subsequence, not the first equal key anywhere in the array.
+                while (cursor < candidates.size()
+                       && (used[cursor] || candidates[cursor].location != location
+                           || candidates[cursor].identity != key)) ++cursor;
+                if (cursor == candidates.size()) return false;
+                used[cursor++] = true;
             }
+            return true;
+        };
+        if (!reserve_zone(*deck, 1))
+        {
+            error = "staged deck cannot retain every saved deck identity in order";
+            return std::nullopt;
         }
-        for (const auto& key : *hand)
+        if (!reserve_zone(*hand, 0))
         {
-            if (!select(key, 0))
-            {
-                error = "staged hand cannot retain every saved hand identity";
-                return std::nullopt;
-            }
+            error = "staged hand cannot retain every saved hand identity in order";
+            return std::nullopt;
         }
         PlayerFieldRestorePlan plan{};
         const auto extras = [&](const auto& expected, auto& output) {
@@ -111,11 +125,34 @@ namespace QuantumCheckpoint
                 return candidates[index].location == 0;
             });
         };
-        if (!frees_hand_slot(plan.trash_candidates) && !frees_hand_slot(plan.field_candidates))
+        if (!field->empty()
+            && !frees_hand_slot(plan.trash_candidates) && !frees_hand_slot(plan.field_candidates))
         {
             error = "native initial hand has no movable target to free a guarded staging slot";
             return std::nullopt;
         }
         return plan;
+    }
+
+    auto plan_player_field_restore(
+        const ExactPlayerFieldCheckpoint& checkpoint,
+        const std::vector<PlayerRestoreCandidate>& candidates,
+        std::string& error) -> std::optional<PlayerFieldRestorePlan>
+    {
+        return plan_player_cards_restore(checkpoint, candidates, true, error);
+    }
+
+    auto plan_player_trash_restore(
+        const ExactPlayerTrashCheckpoint& checkpoint,
+        const std::vector<PlayerRestoreCandidate>& candidates,
+        std::string& error) -> std::optional<PlayerFieldRestorePlan>
+    {
+        ExactPlayerFieldCheckpoint layout{};
+        layout.schema_version = checkpoint.schema_version;
+        layout.player_deck = checkpoint.player_deck;
+        layout.player_hand = checkpoint.player_hand;
+        layout.player_trash = checkpoint.player_trash;
+        layout.player_field = "()";
+        return plan_player_cards_restore(layout, candidates, false, error);
     }
 }

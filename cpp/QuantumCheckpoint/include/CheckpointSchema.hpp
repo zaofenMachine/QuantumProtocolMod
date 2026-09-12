@@ -14,13 +14,13 @@ namespace QuantumCheckpoint
     inline constexpr int ExactSpawnPlanSchemaVersion = 1;
     inline constexpr std::string_view ExactSpawnPlanCheckpointKind =
         "route-c-exact-spawn-plan";
-    inline constexpr int ExactPlayerZonesSchemaVersion = 1;
+    inline constexpr int ExactPlayerZonesSchemaVersion = 2;
     inline constexpr std::string_view ExactPlayerZonesCheckpointKind =
         "route-c-exact-player-zones";
-    inline constexpr int ExactPlayerTrashSchemaVersion = 1;
+    inline constexpr int ExactPlayerTrashSchemaVersion = 2;
     inline constexpr std::string_view ExactPlayerTrashCheckpointKind =
         "route-c-exact-player-trash";
-    inline constexpr int ExactPlayerFieldSchemaVersion = 1;
+    inline constexpr int ExactPlayerFieldSchemaVersion = 2;
     inline constexpr std::string_view ExactPlayerFieldCheckpointKind =
         "route-c-exact-player-field";
     inline constexpr int ExactCharacterChargeSchemaVersion = 1;
@@ -97,6 +97,9 @@ namespace QuantumCheckpoint
         std::string payload_checksum{};
     };
 
+    // Player-zone schema 2 stores native array order: deck back is the next draw,
+    // hand is left-to-right, and trash is insertion order. Schema 1 contains only
+    // metadata-sorted controller output and cannot recover these original orders.
     struct ExactPlayerZonesCheckpoint
     {
         int schema_version{ExactPlayerZonesSchemaVersion};

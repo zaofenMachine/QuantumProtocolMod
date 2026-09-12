@@ -2,7 +2,7 @@
 
 《Quantum Protocol》局内检查点 Mod 的可行性研究与实验原型。
 
-当前 v0.17.0 保留路线 C“普通地牢小关语义重开”，支持受限玩家场地与墓地共存，恢复场格、生命和攻击状态。回合补充使用 schema 2，保存原生抽牌基础倒计时与修正量，由游戏自行计算可抽牌状态。恢复在游戏线程执行，精确层失败后重新加载一次纯 Route C。手牌视觉排列、跨手/场/墓的同身份卡和复杂效果仍有缺口。
+当前 v0.18.0 保留路线 C“普通地牢小关语义重开”，支持受限玩家场地与墓地共存，恢复场格、生命和攻击状态。回合补充使用 schema 2，保存原生抽牌基础倒计时与修正量，由游戏自行计算可抽牌状态。恢复在游戏线程执行，精确层失败后重新加载一次纯 Route C。玩家牌区补充使用 schema 2，按原生顺序保存、恢复和验证牌库、手牌及墓地；旧排序格式保留兼容并明确标记。跨手/场/墓的同身份卡和复杂效果仍有缺口。
 
 ## 当前结论
 
@@ -31,7 +31,8 @@
 - [玩家墓地精确恢复](docs/phase-12-player-trash.md)
 - [回合进度实验及后续修正](docs/phase-13-turn-progress.md)
 - [受限场地、真实抽牌与失败回退](docs/phase-15-player-field-and-draw-authority.md)
-- [玩家场地与墓地共存及当前边界](docs/phase-16-player-field-and-trash.md)
+- [玩家场地与墓地共存](docs/phase-16-player-field-and-trash.md)
+- [玩家牌区真实顺序及当前边界](docs/phase-17-native-player-zone-order.md)
 - [文档索引](docs/README.md)
 
 ## 目录
@@ -91,7 +92,7 @@ C++ 构建前提、已验证工具链和反射结构提取方法见 [C++ 开发�
 
 安装器会把 DLL 部署为 `Mods\QuantumCheckpoint\dlls\main.dll`，在现有 `mods.txt` 中加入 `QuantumCheckpoint : 1`，并把精确回滚材料保存在被 Git 忽略的 `backups/cpp` 与 `runtime` 目录。若旧 Lua 研究探针存在，安装器会在本次 C++ 部署中将其禁用；回滚时会恢复部署前配置。
 
-v0.17.0 路线 C 与精确补充切片的热键和输出：
+v0.18.0 路线 C 与精确补充切片的热键和输出：
 
 - `Ctrl+Shift+F5`：在受支持的稳定普通小关手动保存；每次正常波次生成后也会自动保存。
 - `Ctrl+Shift+F6`：读取唯一检查点并执行语义重开。

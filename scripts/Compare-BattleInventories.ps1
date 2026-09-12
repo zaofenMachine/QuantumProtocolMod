@@ -311,6 +311,8 @@ function ConvertTo-NormalizedInventory {
     }
 
     $zones = [ordered]@{}
+    $nativePlayerZones = [ordered]@{}
+    $nativePlayerZoneInstances = [ordered]@{}
     $zoneRoles = @(
         'BP_ControllerDeck_C',
         'BP_ControllerHand_C',
@@ -322,13 +324,28 @@ function ConvertTo-NormalizedInventory {
     )
     foreach ($role in $zoneRoles) {
         foreach ($controller in @($inventory.objects | Where-Object role -eq $role)) {
+            if ($controller.fullName.Contains('Default__')) { continue }
             $side = Get-SnapshotProperty $controller 'boardSide'
             $zoneName = "$role/$side"
             $zones[$zoneName] = @(
                 ConvertTo-CardArray (Get-SnapshotProperty $controller 'getter:getCardInstanceListSorted')
             )
+            if ($side -eq 'PLAYER' -and $role -in @(
+                'BP_ControllerDeck_C', 'BP_ControllerHand_C', 'BP_ControllerTrash_C')) {
+                $nativeOrder = Get-SnapshotProperty $controller 'native:cardOrder'
+                if (-not [string]::IsNullOrWhiteSpace($nativeOrder)) {
+                    $nativePlayerZones[$zoneName] = @(ConvertTo-CardArray $nativeOrder)
+                    $nativePlayerZoneInstances[$zoneName] = $nativeOrder
+                }
+            }
         }
     }
+
+    # Actor enumeration can swap PLAYER/ENEMY insertion order across a reload.
+    # Canonicalize map keys without sorting the card sequences inside each zone.
+    $canonicalZones = [ordered]@{}
+    foreach ($key in @($zones.Keys | Sort-Object)) { $canonicalZones[$key] = $zones[$key] }
+    $zones = $canonicalZones
 
     $engine = $inventory.objects | Where-Object role -eq 'BP_CardEngine_C' | Select-Object -First 1
     $bottomBar = $inventory.objects | Where-Object role -eq 'BP_BottomBar_C' | Select-Object -First 1
@@ -399,6 +416,9 @@ function ConvertTo-NormalizedInventory {
             spawnWaveHashes = $spawnWaveHashes
         }
         zones = $zones
+        nativePlayerZones = $nativePlayerZones
+        nativePlayerZoneInstances = $nativePlayerZoneInstances
+        nativePlayerZonesAvailable = $nativePlayerZones.Count -eq 3
         playerCardState = ConvertTo-CountedValues @(
             $playerCards | ForEach-Object { Get-CardStateSignature $_ }
         )
@@ -459,6 +479,13 @@ $allZoneNames = @($beforeState.zones.Keys + $afterState.zones.Keys | Sort-Object
 foreach ($zoneName in $allZoneNames) {
     Add-Difference 'player-and-enemy-zones' "zones.$zoneName" `
         $beforeState.zones[$zoneName] $afterState.zones[$zoneName]
+}
+
+if ($beforeState.nativePlayerZonesAvailable -and $afterState.nativePlayerZonesAvailable) {
+    Add-Difference 'native-player-zone-order' 'nativePlayerZones' `
+        $beforeState.nativePlayerZones $afterState.nativePlayerZones
+    Add-Difference 'native-player-zone-instances' 'nativePlayerZoneInstances' `
+        $beforeState.nativePlayerZoneInstances $afterState.nativePlayerZoneInstances
 }
 
 Add-Difference 'player-card-state' 'playerCardState' `
@@ -524,6 +551,13 @@ $report = [ordered]@{
         futureSpawnPlanEqual = Test-Equivalent `
             $beforeState.spawner.spawnWaveHashes $afterState.spawner.spawnWaveHashes
         playerZoneSequencesEqual = Test-Equivalent $beforeState.zones $afterState.zones
+        playerNativeZoneOrderAvailable = $beforeState.nativePlayerZonesAvailable -and $afterState.nativePlayerZonesAvailable
+        playerNativeZoneSequencesEqual = if ($beforeState.nativePlayerZonesAvailable -and $afterState.nativePlayerZonesAvailable) {
+            Test-Equivalent $beforeState.nativePlayerZones $afterState.nativePlayerZones
+        } else { $null }
+        playerNativeZoneInstancesEqual = if ($beforeState.nativePlayerZonesAvailable -and $afterState.nativePlayerZonesAvailable) {
+            Test-Equivalent $beforeState.nativePlayerZoneInstances $afterState.nativePlayerZoneInstances
+        } else { $null }
         playerCardStateIncludingLocationEqual = Test-Equivalent `
             $beforeState.playerCardState $afterState.playerCardState
         playerCardRuntimeStateIgnoringLocationEqual = Test-Equivalent `
@@ -538,7 +572,7 @@ $report = [ordered]@{
         beforeRuntimeCardIdCount = @($beforeState.runtimeCardIds).Count
         afterRuntimeCardIdCount = @($afterState.runtimeCardIds).Count
         sharedRuntimeCardIdCount = $sharedIds.Count
-        note = 'Runtime card GUIDs are diagnostic identity only and are excluded from semantic equality.'
+        note = 'Runtime GUIDs are excluded. playerZoneSequencesEqual compares metadata-sorted controller views, not draw/hand order. Native order is unknown (null) unless both inventories include all three player-zone arrays.'
     }
     futureSpawnPlan = [ordered]@{
         beforeWaveCount = @($beforeState.spawner.spawnWaveHashes).Count

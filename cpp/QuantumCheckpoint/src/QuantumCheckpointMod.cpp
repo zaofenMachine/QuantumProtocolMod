@@ -2565,6 +2565,127 @@ namespace QuantumCheckpoint
             };
         }
 
+        auto read_native_player_zone_cards(UObject* card_engine, std::uint8_t location)
+            -> std::vector<NativeCardReference>
+        {
+            if (location > 2)
+            {
+                throw std::runtime_error{"only player HAND, DECK, and TRASH have ordered zone arrays"};
+            }
+            const auto api = validated_native_move_card_api(card_engine);
+            const auto module_base = reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr));
+            const auto require_signature = [&](std::uintptr_t rva, const auto& signature) {
+                const auto* address = reinterpret_cast<const std::uint8_t*>(module_base + rva);
+                if (!address_is_readable(address, signature.size())
+                    || !std::equal(signature.begin(), signature.end(), address))
+                {
+                    throw std::runtime_error{"native player-zone order signature changed"};
+                }
+            };
+            // The controller's raw-group resolvers use these shared-zone getters.
+            // E21F10 copies their first TArray, preserving 16-byte shared-card pairs.
+            // Read in place on the game thread; never copy or mutate ownership counts.
+            require_signature(0xE26300, std::array<std::uint8_t, 15>{
+                0x48,0x8B,0x41,0x58,0x48,0x89,0x02,0x48,0x8B,0x41,0x60,0x48,0x89,0x42,0x08});
+            require_signature(0xE231A0, std::array<std::uint8_t, 15>{
+                0x48,0x8B,0x41,0x48,0x48,0x89,0x02,0x48,0x8B,0x41,0x50,0x48,0x89,0x42,0x08});
+            require_signature(0xE32320, std::array<std::uint8_t, 17>{
+                0x45,0x84,0xC0,0x75,0x0D,0x48,0x8B,0x41,0x68,0x48,0x89,0x02,0x48,0x8B,0x41,0x70,0xEB});
+            require_signature(0xE21F27, std::array<std::uint8_t, 9>{
+                0x8B,0x79,0x08,0x48,0x8B,0x19,0x89,0x7A,0x08});
+            require_signature(0xE21F76, std::array<std::uint8_t, 11>{
+                0x48,0x83,0xC1,0x10,0x48,0x83,0xC3,0x10,0x83,0xEF,0x01});
+            const std::array<std::size_t, 3> offsets{0x58, 0x48, 0x68};
+            const auto offset = offsets[location];
+            if (!address_is_readable(static_cast<const std::byte*>(api.engine_state) + offset,
+                                     sizeof(NativeSharedPointerPair)))
+            {
+                throw std::runtime_error{"native player zone ownership is unreadable"};
+            }
+            const auto* zone = read_native_value<const void*>(api.engine_state, offset);
+            const auto* owner = read_native_value<const void*>(api.engine_state, offset + sizeof(void*));
+            if (!zone || !owner || !address_is_readable(zone, 16)
+                || !address_is_readable(static_cast<const std::byte*>(owner) + sizeof(void*), 4)
+                || read_native_value<std::int32_t>(owner, sizeof(void*)) <= 0
+                || read_native_value<std::int32_t>(owner, sizeof(void*)) > 1'000'000)
+            {
+                throw std::runtime_error{"native player zone has invalid shared ownership"};
+            }
+            const auto* data = read_native_value<const void*>(zone, 0);
+            const auto count = read_native_value<std::int32_t>(zone, 8);
+            const auto capacity = read_native_value<std::int32_t>(zone, 12);
+            const auto cards = native_cards_at_location(card_engine, api, location);
+            if (count < 0 || count > 128 || capacity < count || capacity > 4096
+                || cards.size() != static_cast<std::size_t>(count)
+                || (count && (!data || !address_is_readable(data, count * sizeof(NativeSharedPointerPair)))))
+            {
+                throw std::runtime_error{"native player zone array disagrees with live card membership"};
+            }
+            std::vector<bool> used(cards.size());
+            std::vector<NativeCardReference> result{};
+            result.reserve(cards.size());
+            for (std::int32_t index{}; index < count; ++index)
+            {
+                const auto* native_object = read_native_value<const void*>(data, index * sizeof(NativeSharedPointerPair));
+                const auto* native_owner = read_native_value<const void*>(data, index * sizeof(NativeSharedPointerPair) + sizeof(void*));
+                bool found{};
+                for (std::size_t candidate{}; candidate < cards.size(); ++candidate)
+                {
+                    if (!used[candidate]
+                        && read_native_value<const void*>(cards[candidate].state, CardStateSharedObjectOffset) == native_object
+                        && read_native_value<const void*>(cards[candidate].state, CardStateSharedControllerOffset) == native_owner)
+                    {
+                        result.push_back(cards[candidate]);
+                        used[candidate] = true;
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) throw std::runtime_error{"native ordered card has no unique live actor in this zone"};
+            }
+            return result;
+        }
+
+        auto read_native_player_zone_order(UObject* card_engine, std::uint8_t location)
+            -> std::string
+        {
+            std::string result{"("};
+            for (const auto& card : read_native_player_zone_cards(card_engine, location))
+            {
+                const auto instance = export_zero_argument_getter(card.card, STR("getCardInfoInstance"));
+                if (!instance) throw std::runtime_error{"ordered card has no CardInfoInstance getter"};
+                if (result.size() > 1) result += ',';
+                result += instance->value;
+            }
+            result += ')';
+            return result;
+        }
+
+        auto export_player_zone_order(UObject* card_engine, UObject* controller,
+                                      std::uint8_t location, int schema_version)
+            -> std::optional<PropertySnapshot>
+        {
+            if (!controller) return std::nullopt;
+            if (schema_version == 1)
+            {
+                return export_zero_argument_getter(controller, STR("getCardInstanceListSorted"));
+            }
+            if (schema_version != 2
+                || reflected_object_property(controller, STR("mCardEngine")) != card_engine)
+            {
+                throw std::runtime_error{"ordered player controller is not anchored to the active CardEngine"};
+            }
+            return PropertySnapshot{"native:cardOrder", read_native_player_zone_order(card_engine, location)};
+        }
+
+        auto required_player_zone_order(UObject* card_engine, UObject* controller,
+                                        std::uint8_t location, int schema_version) -> std::string
+        {
+            const auto order = export_player_zone_order(card_engine, controller, location, schema_version);
+            if (!order) throw std::runtime_error{"player-zone order is unavailable"};
+            return order->value;
+        }
+
         auto append_private_card_state_diagnostics(ObjectSnapshot& snapshot, UObject* object) -> void
         {
             const auto& fingerprint = executable_fingerprint();
@@ -2873,12 +2994,12 @@ namespace QuantumCheckpoint
                 exact.source_level_name = checkpoint.source_level_name;
                 exact.wave_index = checkpoint.wave_index;
                 append_route_c_trace("capture.exact-player-zones.get-deck.begin");
-                exact.player_deck = required_getter_text(
-                    zones.deck, STR("getCardInstanceListSorted"));
+                exact.player_deck = required_player_zone_order(
+                    objects.card_engine, zones.deck, 1, exact.schema_version);
                 append_route_c_trace("capture.exact-player-zones.get-deck.complete");
                 append_route_c_trace("capture.exact-player-zones.get-hand.begin");
-                exact.player_hand = required_getter_text(
-                    zones.hand, STR("getCardInstanceListSorted"));
+                exact.player_hand = required_player_zone_order(
+                    objects.card_engine, zones.hand, 0, exact.schema_version);
                 append_route_c_trace("capture.exact-player-zones.get-hand.complete");
                 exact.payload_checksum = exact_player_zones_payload_checksum(exact);
                 std::string exact_validation_error{};
@@ -2929,12 +3050,12 @@ namespace QuantumCheckpoint
                 exact.game_executable_size = checkpoint.game_executable_size;
                 exact.source_level_name = checkpoint.source_level_name;
                 exact.wave_index = checkpoint.wave_index;
-                exact.player_deck = required_getter_text(
-                    zones.deck, STR("getCardInstanceListSorted"));
-                exact.player_hand = required_getter_text(
-                    zones.hand, STR("getCardInstanceListSorted"));
-                exact.player_trash = required_getter_text(
-                    zones.trash, STR("getCardInstanceListSorted"));
+                exact.player_deck = required_player_zone_order(
+                    objects.card_engine, zones.deck, 1, exact.schema_version);
+                exact.player_hand = required_player_zone_order(
+                    objects.card_engine, zones.hand, 0, exact.schema_version);
+                exact.player_trash = required_player_zone_order(
+                    objects.card_engine, zones.trash, 2, exact.schema_version);
                 exact.payload_checksum = exact_player_trash_payload_checksum(exact);
                 std::string exact_validation_error{};
                 if (!validate_exact_player_trash_checkpoint(exact, exact_validation_error))
@@ -3034,12 +3155,12 @@ namespace QuantumCheckpoint
                 exact.game_executable_size = checkpoint.game_executable_size;
                 exact.source_level_name = checkpoint.source_level_name;
                 exact.wave_index = checkpoint.wave_index;
-                exact.player_deck = required_getter_text(
-                    zones.deck, STR("getCardInstanceListSorted"));
-                exact.player_hand = required_getter_text(
-                    zones.hand, STR("getCardInstanceListSorted"));
-                exact.player_trash = required_getter_text(
-                    zones.trash, STR("getCardInstanceListSorted"));
+                exact.player_deck = required_player_zone_order(
+                    objects.card_engine, zones.deck, 1, exact.schema_version);
+                exact.player_hand = required_player_zone_order(
+                    objects.card_engine, zones.hand, 0, exact.schema_version);
+                exact.player_trash = required_player_zone_order(
+                    objects.card_engine, zones.trash, 2, exact.schema_version);
                 exact.player_field = "(";
                 std::ostringstream states{};
                 for (std::size_t index{}; index < captured_cards.size(); ++index)
@@ -3361,6 +3482,14 @@ namespace QuantumCheckpoint
                    << json_escape(restore.exact_spawn_plan_status) << "\",\n"
                    << "  \"exactSpawnPlanReason\": \""
                    << json_escape(restore.exact_spawn_plan_reason) << "\",\n"
+                   << "  \"playerZoneOrderBasis\": \""
+                   << (restore.exact_player_field
+                           ? (restore.exact_player_field->schema_version >= 2 ? "native-array" : "legacy-sorted-only")
+                           : restore.exact_player_trash
+                               ? (restore.exact_player_trash->schema_version >= 2 ? "native-array" : "legacy-sorted-only")
+                               : restore.exact_player_zones
+                                   ? (restore.exact_player_zones->schema_version >= 2 ? "native-array" : "legacy-sorted-only")
+                                   : "unavailable") << "\",\n"
                    << "  \"exactPlayerZonesSupplementPresent\": "
                    << (restore.exact_player_zones ? "true" : "false") << ",\n"
                    << "  \"exactPlayerZonesStatus\": \""
@@ -4337,10 +4466,10 @@ namespace QuantumCheckpoint
                 return fail_without_zone_write(
                     "player deck and hand controllers were unavailable after five seconds");
             }
-            const auto actual_deck = export_zero_argument_getter(
-                zones.deck, STR("getCardInstanceListSorted"));
-            const auto actual_hand = export_zero_argument_getter(
-                zones.hand, STR("getCardInstanceListSorted"));
+            const auto actual_deck = export_player_zone_order(
+                objects.card_engine, zones.deck, 1, restore.exact_player_zones->schema_version);
+            const auto actual_hand = export_player_zone_order(
+                objects.card_engine, zones.hand, 0, restore.exact_player_zones->schema_version);
             if (!actual_deck || !actual_hand)
             {
                 return fail_without_zone_write(
@@ -4466,12 +4595,12 @@ namespace QuantumCheckpoint
                 return fail_without_write(
                     "player deck, hand, and trash controllers were unavailable after five seconds");
             }
-            const auto actual_deck = export_zero_argument_getter(
-                zones.deck, STR("getCardInstanceListSorted"));
-            const auto actual_hand = export_zero_argument_getter(
-                zones.hand, STR("getCardInstanceListSorted"));
-            const auto actual_trash = export_zero_argument_getter(
-                zones.trash, STR("getCardInstanceListSorted"));
+            const auto actual_deck = export_player_zone_order(
+                objects.card_engine, zones.deck, 1, restore.exact_player_trash->schema_version);
+            const auto actual_hand = export_player_zone_order(
+                objects.card_engine, zones.hand, 0, restore.exact_player_trash->schema_version);
+            const auto actual_trash = export_player_zone_order(
+                objects.card_engine, zones.trash, 2, restore.exact_player_trash->schema_version);
             if (!actual_deck || !actual_hand || !actual_trash)
             {
                 return fail_without_write(
@@ -4526,7 +4655,7 @@ namespace QuantumCheckpoint
                     actual_deck->value,
                     actual_hand->value,
                     actual_trash->value,
-                    staging_error);
+                    staging_error, restore.exact_player_trash->schema_version >= 2);
                 if (!staged_match)
                 {
                     if (now - restore.started_at <= std::chrono::seconds{5})
@@ -4571,8 +4700,7 @@ namespace QuantumCheckpoint
                 std::vector<Candidate> candidates{};
                 for (const auto origin : {std::uint8_t{1}, std::uint8_t{0}})
                 {
-                    for (const auto& candidate : native_cards_at_location(
-                             objects.card_engine, api, origin))
+                    for (const auto& candidate : read_native_player_zone_cards(objects.card_engine, origin))
                     {
                         const auto instance = required_getter_text(
                             candidate.card, STR("getCardInfoInstance"));
@@ -4592,39 +4720,20 @@ namespace QuantumCheckpoint
                     }
                 }
 
-                // Queue in saved trash order. This keeps the controller's insertion order
-                // deterministic. Captures reject hand/trash identity overlap, so a matching
-                // hand object is necessarily startup overflow rather than a saved hand card.
-                std::vector<bool> used(candidates.size());
-                std::vector<PendingNativeTrashMove> targets{};
-                targets.reserve(expected_trash->size());
-                for (const auto& saved : *expected_trash)
+                std::vector<PlayerRestoreCandidate> planning_candidates{};
+                for (const auto& candidate : candidates)
                 {
-                    auto saved_key = exact_card_identity_key_from_instance(saved, array_error);
-                    if (!saved_key)
-                    {
-                        throw std::runtime_error{
-                            "saved trash card identity could not be prepared: " + array_error};
-                    }
-                    bool found{};
-                    for (std::size_t index{}; index < candidates.size(); ++index)
-                    {
-                        if (!used[index] && candidates[index].key == *saved_key)
-                        {
-                            used[index] = true;
-                            targets.push_back(PendingNativeTrashMove{
-                                .card = candidates[index].reference.card,
-                                .state = candidates[index].reference.state,
-                                .origin = candidates[index].origin,
-                            });
-                            found = true;
-                            break;
-                        }
-                    }
-                    if (!found)
-                    {
-                        break;
-                    }
+                    planning_candidates.push_back({candidate.key, candidate.origin});
+                }
+                const auto plan = plan_player_trash_restore(
+                    *restore.exact_player_trash, planning_candidates, array_error);
+                if (!plan) return fail_without_write(array_error);
+                std::vector<PendingNativeTrashMove> targets{};
+                for (const auto index : plan->trash_candidates)
+                {
+                    const auto& candidate = candidates.at(index);
+                    targets.push_back({candidate.reference.card, candidate.reference.state,
+                                       candidate.origin});
                 }
                 if (targets.size() != expected_trash->size())
                 {
@@ -4695,7 +4804,7 @@ namespace QuantumCheckpoint
                     actual_deck->value,
                     actual_hand->value,
                     actual_trash->value,
-                    rollback_staging_error))
+                    rollback_staging_error, restore.exact_player_trash->schema_version >= 2))
             {
                 rollback_active_decklist();
                 restore.exact_player_trash_status = "failed-rolled-back";
@@ -4846,12 +4955,12 @@ namespace QuantumCheckpoint
                 return fail_without_write(
                     "player deck, hand, and trash controllers were unavailable after five seconds");
             }
-            const auto actual_deck = export_zero_argument_getter(
-                zones.deck, STR("getCardInstanceListSorted"));
-            const auto actual_hand = export_zero_argument_getter(
-                zones.hand, STR("getCardInstanceListSorted"));
-            const auto actual_trash = export_zero_argument_getter(
-                zones.trash, STR("getCardInstanceListSorted"));
+            const auto actual_deck = export_player_zone_order(
+                objects.card_engine, zones.deck, 1, restore.exact_player_field->schema_version);
+            const auto actual_hand = export_player_zone_order(
+                objects.card_engine, zones.hand, 0, restore.exact_player_field->schema_version);
+            const auto actual_trash = export_player_zone_order(
+                objects.card_engine, zones.trash, 2, restore.exact_player_field->schema_version);
             if (!actual_deck || !actual_hand || !actual_trash)
             {
                 if (now - restore.started_at <= std::chrono::seconds{5})
@@ -5266,8 +5375,7 @@ namespace QuantumCheckpoint
                 std::vector<Candidate> candidates{};
                 for (const auto origin : {std::uint8_t{0}, std::uint8_t{1}})
                 {
-                    for (const auto& card : native_cards_at_location(
-                             objects.card_engine, api.location, origin))
+                    for (const auto& card : read_native_player_zone_cards(objects.card_engine, origin))
                     {
                         auto key = exact_card_identity_key_from_instance(
                             required_getter_text(
@@ -6163,8 +6271,8 @@ namespace QuantumCheckpoint
                     static_cast<const void*>(objects.card_engine->GetWorld()));
                 const auto verify_final_zones = [&](const auto& exact) {
                     if (!final_zones.deck || !final_zones.hand
-                        || required_getter_text(final_zones.deck, STR("getCardInstanceListSorted")) != exact.player_deck
-                        || required_getter_text(final_zones.hand, STR("getCardInstanceListSorted")) != exact.player_hand)
+                        || required_player_zone_order(objects.card_engine, final_zones.deck, 1, exact.schema_version) != exact.player_deck
+                        || required_player_zone_order(objects.card_engine, final_zones.hand, 0, exact.schema_version) != exact.player_hand)
                     {
                         throw std::runtime_error{"player deck/hand drifted during final stability window"};
                     }
@@ -6174,7 +6282,8 @@ namespace QuantumCheckpoint
                 {
                     verify_final_zones(*restore.exact_player_trash);
                     if (!final_zones.trash
-                        || required_getter_text(final_zones.trash, STR("getCardInstanceListSorted"))
+                        || required_player_zone_order(objects.card_engine, final_zones.trash, 2,
+                                                      restore.exact_player_trash->schema_version)
                             != restore.exact_player_trash->player_trash)
                     {
                         throw std::runtime_error{"player trash drifted during final stability window"};
@@ -6736,6 +6845,32 @@ namespace QuantumCheckpoint
                         .name = to_string(property_name),
                         .value = to_string(exported.GetCharArray()),
                     });
+                }
+
+                if ((role == "BP_ControllerHand_C" || role == "BP_ControllerDeck_C"
+                     || role == "BP_ControllerTrash_C") && !full_name.contains("Default__")
+                    && export_property_text(object, STR("boardSide")) == "PLAYER")
+                {
+                    try
+                    {
+                        const auto live = find_route_c_objects();
+                        const auto location = static_cast<std::uint8_t>(
+                            role == "BP_ControllerHand_C" ? 0 : role == "BP_ControllerDeck_C" ? 1 : 2);
+                        snapshot.properties.push_back({"native:cardOrder",
+                            required_player_zone_order(live.card_engine, object, location, 2)});
+                        const auto* vtable = read_native_value<const void*>(object, 0);
+                        if (address_is_readable(static_cast<const std::byte*>(vtable) + 0x640, sizeof(void*)))
+                        {
+                            const auto entry = read_native_value<std::uintptr_t>(vtable, 0x640);
+                            std::ostringstream rva{};
+                            rva << std::hex << (entry - reinterpret_cast<std::uintptr_t>(GetModuleHandleW(L"Quantum-Win64-Shipping.exe")));
+                            snapshot.properties.push_back({"native:groupCardsResolverRva", rva.str()});
+                        }
+                    }
+                    catch (const std::exception& error)
+                    {
+                        snapshot.properties.push_back({"native:cardOrderError", error.what()});
+                    }
                 }
 
                 if (role == "GI_Quantum_C" && full_name.contains("/Engine/Transient."))
@@ -9557,7 +9692,7 @@ namespace QuantumCheckpoint
         QuantumCheckpointMod()
         {
             ModName = STR("QuantumCheckpoint");
-            ModVersion = STR("0.17.0");
+            ModVersion = STR("0.18.0");
             ModDescription = STR("Route C checkpoint with optional exact-state supplements");
             ModAuthors = STR("zaofenMachine and contributors");
             ModIntendedSDKVersion = STR("3.0.1");

@@ -59,7 +59,8 @@ namespace QuantumCheckpoint
                                             std::string_view live_deck,
                                             std::string_view live_hand,
                                             std::string_view live_trash,
-                                            std::string& error) -> bool;
+                                            std::string& error,
+                                            bool native_order = false) -> bool;
     auto exact_player_field_payload_checksum(const ExactPlayerFieldCheckpoint& checkpoint)
         -> std::string;
     auto serialize_exact_player_field_checkpoint(ExactPlayerFieldCheckpoint checkpoint)

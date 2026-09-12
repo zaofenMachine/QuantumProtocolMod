@@ -1016,7 +1016,8 @@ namespace QuantumCheckpoint
                                             std::string_view live_deck,
                                             std::string_view live_hand,
                                             std::string_view live_trash,
-                                            std::string& error) -> bool
+                                            std::string& error,
+                                            bool native_order) -> bool
     {
         error.clear();
         auto parse = [&](std::string_view value, std::string_view label)
@@ -1105,6 +1106,25 @@ namespace QuantumCheckpoint
             return false;
         }
         const auto trash_in_deck_count = saved_trash_keys->size() - hand_overflow_count;
+
+        if (native_order)
+        {
+            // Native startup pops extras from the deck's back after drawing the
+            // saved hand. Their temporary hand suffix is therefore reversed.
+            auto expected_staged_deck = *saved_deck_keys;
+            expected_staged_deck.insert(expected_staged_deck.end(), saved_trash_keys->begin(),
+                                       saved_trash_keys->begin() + trash_in_deck_count);
+            auto expected_staged_hand = *saved_hand_keys;
+            expected_staged_hand.insert(expected_staged_hand.end(), saved_trash_keys->rbegin(),
+                                       saved_trash_keys->rbegin() + hand_overflow_count);
+            if (*staged_deck_keys != expected_staged_deck
+                || *staged_hand_keys != expected_staged_hand)
+            {
+                error = "native staging changed the saved deck/hand order or reversed extras suffix";
+                return false;
+            }
+            return true;
+        }
 
         // Controller getters expose a stable sorted view, not insertion order. The
         // overflow suffix drawn from the staged extras can therefore interleave with
@@ -1698,7 +1718,8 @@ namespace QuantumCheckpoint
     auto validate_exact_player_zones_checkpoint(const ExactPlayerZonesCheckpoint& checkpoint,
                                                 std::string& error) -> bool
     {
-        if (checkpoint.schema_version != ExactPlayerZonesSchemaVersion)
+        if (checkpoint.schema_version != 1
+            && checkpoint.schema_version != ExactPlayerZonesSchemaVersion)
         {
             error = "unsupported exact player-zones schema version";
             return false;
@@ -1783,7 +1804,8 @@ namespace QuantumCheckpoint
         do { auto value = required_integer<Type>(*values, JsonName, error); if (!value) return std::nullopt; checkpoint.Field = *value; } while (false)
 
         READ_ZONES_INTEGER(schema_version, "schemaVersion", int);
-        if (checkpoint.schema_version != ExactPlayerZonesSchemaVersion)
+        if (checkpoint.schema_version != 1
+            && checkpoint.schema_version != ExactPlayerZonesSchemaVersion)
         {
             error = "unsupported exact player-zones schema version";
             return std::nullopt;
@@ -1859,7 +1881,8 @@ namespace QuantumCheckpoint
     auto validate_exact_player_trash_checkpoint(const ExactPlayerTrashCheckpoint& checkpoint,
                                                 std::string& error) -> bool
     {
-        if (checkpoint.schema_version != ExactPlayerTrashSchemaVersion)
+        if (checkpoint.schema_version != 1
+            && checkpoint.schema_version != ExactPlayerTrashSchemaVersion)
         {
             error = "unsupported exact player-trash schema version";
             return false;
@@ -1982,7 +2005,8 @@ namespace QuantumCheckpoint
         do { auto value = required_integer<Type>(*values, JsonName, error); if (!value) return std::nullopt; checkpoint.Field = *value; } while (false)
 
         READ_TRASH_INTEGER(schema_version, "schemaVersion", int);
-        if (checkpoint.schema_version != ExactPlayerTrashSchemaVersion)
+        if (checkpoint.schema_version != 1
+            && checkpoint.schema_version != ExactPlayerTrashSchemaVersion)
         {
             error = "unsupported exact player-trash schema version";
             return std::nullopt;
@@ -2068,7 +2092,8 @@ namespace QuantumCheckpoint
     auto validate_exact_player_field_checkpoint(
         const ExactPlayerFieldCheckpoint& checkpoint, std::string& error) -> bool
     {
-        if (checkpoint.schema_version != ExactPlayerFieldSchemaVersion)
+        if (checkpoint.schema_version != 1
+            && checkpoint.schema_version != ExactPlayerFieldSchemaVersion)
         {
             error = "unsupported exact player-field schema version";
             return false;
@@ -2185,7 +2210,8 @@ namespace QuantumCheckpoint
         do { auto value = required_integer<Type>(*values, JsonName, error); if (!value) return std::nullopt; checkpoint.Field = *value; } while (false)
 
         READ_FIELD_INTEGER(schema_version, "schemaVersion", int);
-        if (checkpoint.schema_version != ExactPlayerFieldSchemaVersion)
+        if (checkpoint.schema_version != 1
+            && checkpoint.schema_version != ExactPlayerFieldSchemaVersion)
         {
             error = "unsupported exact player-field schema version";
             return std::nullopt;

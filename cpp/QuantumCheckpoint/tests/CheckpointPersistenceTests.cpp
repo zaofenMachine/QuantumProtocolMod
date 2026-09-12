@@ -273,6 +273,17 @@ int main()
     require(parsed_zones->player_hand == zones.player_hand, "exact player hand round trip");
     require(parsed_zones->payload_checksum == exact_player_zones_payload_checksum(*parsed_zones),
             "exact player-zones checksum round trip");
+    auto legacy_zones = zones;
+    legacy_zones.schema_version = 1;
+    const auto parsed_legacy_zones = parse_exact_player_zones_checkpoint(
+        serialize_exact_player_zones_checkpoint(legacy_zones), error);
+    require(parsed_zones->schema_version == 2 && parsed_legacy_zones
+                && parsed_legacy_zones->schema_version == 1,
+            "native and legacy-sorted zone formats remain distinguishable");
+    auto mislabeled_order = zones;
+    mislabeled_order.schema_version = 1;
+    require(!validate_exact_player_zones_checkpoint(mislabeled_order, error),
+            "changing an order schema without updating its checksum is rejected");
 
     error.clear();
     const auto fixed_startup = exact_player_zones_startup_decklist(
@@ -323,6 +334,51 @@ int main()
     require(parsed_trash->payload_checksum
                 == exact_player_trash_payload_checksum(*parsed_trash),
             "exact player-trash checksum round trip");
+    auto legacy_trash = trash;
+    legacy_trash.schema_version = 1;
+    const auto parsed_legacy_trash = parse_exact_player_trash_checkpoint(
+        serialize_exact_player_trash_checkpoint(legacy_trash), error);
+    require(parsed_trash->schema_version == 2 && parsed_legacy_trash
+                && parsed_legacy_trash->schema_version == 1,
+            "legacy trash is read without claiming native order");
+
+    const auto card_array = [](std::initializer_list<std::string_view> tags) {
+        std::string result{"("};
+        for (const auto tag : tags)
+        {
+            if (result.size() > 1) result += ',';
+            result += "(CardInfo=(Tag=\"" + std::string{tag} + "\"))";
+        }
+        return result + ')';
+    };
+    require(exact_player_trash_staging_matches(
+                card_array({"e", "a"}), card_array({"f", "b"}), card_array({"c", "d", "g"}),
+                card_array({"e", "a", "c"}), card_array({"f", "b", "g", "d"}), "()", error, true),
+            "native staging retains unsorted zones and reverses popped trash overflow");
+    require(!exact_player_trash_staging_matches(
+                card_array({"e", "a"}), card_array({"f", "b"}), card_array({"c", "d", "g"}),
+                card_array({"e", "a", "c"}), card_array({"f", "b", "d", "g"}), "()", error, true),
+            "native staging rejects forward-ordered overflow with the same card multiset");
+    require(!exact_player_trash_staging_matches(
+                card_array({"e", "a"}), card_array({"f", "b"}), card_array({"c", "d", "g"}),
+                card_array({"a", "e", "c"}), card_array({"f", "b", "g", "d"}), "()", error, true),
+            "native staging rejects a deck permutation that changes future draw order");
+
+    auto ordered_trash = trash;
+    ordered_trash.player_deck = card_array({"b", "a"});
+    ordered_trash.player_hand = card_array({"h"});
+    ordered_trash.player_trash = card_array({"a"});
+    const std::vector<PlayerRestoreCandidate> ordered_trash_candidates{
+        {"a@0", 1}, {"b@0", 1}, {"a@0", 1}, {"h@0", 0}};
+    const auto ordered_trash_plan = plan_player_trash_restore(
+        ordered_trash, ordered_trash_candidates, error);
+    require(ordered_trash_plan
+                && ordered_trash_plan->trash_candidates == std::vector<std::size_t>{0},
+            "trash planner retains the ordered deck subsequence across duplicate identities");
+    ordered_trash.player_deck = card_array({"a", "a", "b"});
+    ordered_trash.player_trash = "()";
+    require(!plan_player_trash_restore(ordered_trash, ordered_trash_candidates, error),
+            "native plan rejects retained order absent from the staged deck");
 
     error.clear();
     const auto trash_startup = exact_player_trash_startup_decklist(
@@ -430,6 +486,26 @@ int main()
     require(parsed_field->payload_checksum
                 == exact_player_field_payload_checksum(*parsed_field),
             "exact player-field checksum round trip");
+    auto legacy_field = field;
+    legacy_field.schema_version = 1;
+    const auto parsed_legacy_field = parse_exact_player_field_checkpoint(
+        serialize_exact_player_field_checkpoint(legacy_field), error);
+    require(parsed_field->schema_version == 2 && parsed_legacy_field
+                && parsed_legacy_field->schema_version == 1,
+            "legacy field layouts keep their sorted-order interpretation");
+    auto native_field = field;
+    native_field.player_deck = card_array({"z", "a"});
+    native_field.player_hand = card_array({"y", "b"});
+    const auto parsed_native_field = parse_exact_player_field_checkpoint(
+        serialize_exact_player_field_checkpoint(native_field), error);
+    require(parsed_native_field && parsed_native_field->player_deck == native_field.player_deck
+                && parsed_native_field->player_hand == native_field.player_hand,
+            "native order survives persistence without metadata sorting");
+    auto swapped_native_field = native_field;
+    swapped_native_field.player_deck = card_array({"a", "z"});
+    require(exact_player_field_payload_checksum(swapped_native_field)
+                != exact_player_field_payload_checksum(native_field),
+            "native deck order contributes to the integrity checksum");
 
     error.clear();
     const auto field_states = parse_exact_player_field_states(
