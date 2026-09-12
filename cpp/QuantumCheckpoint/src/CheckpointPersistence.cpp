@@ -1969,7 +1969,8 @@ namespace QuantumCheckpoint
                 error = "exact player-trash trash identity is invalid: " + array_error;
                 return false;
             }
-            if (hand_identities.contains(ordered_card_key(*card)))
+            if (hand_identities.contains(ordered_card_key(*card))
+                && (checkpoint.schema_version == 1 || !supports_plain_player_field_card(card->tag)))
             {
                 error = "exact player trash shares a card identity with the hand; "
                     "the guarded mixed-zone staging slice would be ambiguous";
@@ -2171,9 +2172,7 @@ namespace QuantumCheckpoint
                         + array_error;
                     return false;
                 }
-                if (zone == &*field
-                    && card->tag != "naturalApple" && card->tag != "naturalLemon"
-                    && card->tag != "naturalSpring")
+                if (zone == &*field && !supports_plain_player_field_card(card->tag))
                 {
                     error = "exact player field contains a card outside the first guarded "
                         "plain-fruit slice";

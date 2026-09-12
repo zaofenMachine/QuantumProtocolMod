@@ -456,6 +456,22 @@ int main()
             "a shared hand/trash identity is outside the guarded mixed-zone slice");
     require(error.find("ambiguous") != std::string::npos,
             "shared hand/trash identity reports the staging ambiguity");
+    auto native_overlap_trash = trash;
+    native_overlap_trash.player_hand = card_array({"naturalApple"});
+    native_overlap_trash.player_trash = card_array({"naturalApple"});
+    require(parse_exact_player_trash_checkpoint(
+                serialize_exact_player_trash_checkpoint(native_overlap_trash), error).has_value(),
+            "native-order trash captures allow separate plain-fruit copies in hand and trash");
+    const std::vector<PlayerRestoreCandidate> native_overlap_candidates{
+        {"naturalApple@0", 0}, {"naturalApple@0", 0}, {"a@0", 1}};
+    const auto native_overlap_plan = plan_player_trash_restore(
+        native_overlap_trash, native_overlap_candidates, error);
+    require(native_overlap_plan && native_overlap_plan->trash_candidates == std::vector<std::size_t>{1},
+            "first ordered hand copy remains in hand while overflow copy moves to trash");
+    native_overlap_trash.schema_version = 1;
+    require(!parse_exact_player_trash_checkpoint(
+                serialize_exact_player_trash_checkpoint(native_overlap_trash), error),
+            "legacy sorted trash captures retain their cross-zone guard");
 
     auto corrupt_trash = trash_json;
     const auto trash_card = corrupt_trash.find("\"playerTrash\"");
@@ -626,9 +642,16 @@ int main()
             "shared hand/trash identity is rejected before any target is used");
     overlapping_layout.player_trash = "((CardInfo=(Tag=\"naturalApple\")))";
     overlapping_candidates[3].identity = "naturalApple@0";
+    const auto field_trash_overlap_plan = plan_player_field_restore(
+        overlapping_layout, overlapping_candidates, error);
+    require(field_trash_overlap_plan
+                && field_trash_overlap_plan->trash_candidates == std::vector<std::size_t>{3}
+                && field_trash_overlap_plan->field_candidates == std::vector<std::size_t>{4, 0},
+            "native-order layout assigns distinct copies to trash and field");
+    overlapping_layout.schema_version = 1;
     require(!plan_player_field_restore(overlapping_layout, overlapping_candidates, error)
                 && error.find("shared hand/field/trash") != std::string::npos,
-            "shared field/trash identity remains outside the tested slice");
+            "legacy field/trash identity overlap remains rejected");
 
     // Runtime regression: field slots are Apple/Lemon/Apple, but native hand
     // sorting exposes Cherry/Cherry/Apple/Lemon/Spring during five-card startup.
@@ -660,9 +683,32 @@ int main()
             "equivalent hand/field card identities remain valid staging inputs");
     auto hand_field_overlap_candidates = mixed_candidates;
     hand_field_overlap_candidates[2].identity = "naturalApple@0";
+    const auto hand_field_overlap_plan = plan_player_field_restore(
+        ambiguous_field, hand_field_overlap_candidates, error);
+    require(hand_field_overlap_plan
+                && hand_field_overlap_plan->field_candidates == std::vector<std::size_t>{4, 0},
+            "native hand copy is reserved before assigning the same identity to a field slot");
+    auto all_shared = field;
+    all_shared.player_deck = card_array({"naturalApple", "z"});
+    all_shared.player_hand = card_array({"naturalApple", "b"});
+    all_shared.player_trash = card_array({"naturalApple"});
+    all_shared.player_field = card_array({"naturalApple", "naturalApple"});
+    const std::vector<PlayerRestoreCandidate> all_shared_candidates{
+        {"naturalApple@0", 0}, {"b@0", 0}, {"naturalApple@0", 0},
+        {"naturalApple@0", 0}, {"naturalApple@0", 0}, {"naturalApple@0", 1}, {"z@0", 1}};
+    const auto all_shared_plan = plan_player_field_restore(all_shared, all_shared_candidates, error);
+    require(all_shared_plan
+                && all_shared_plan->trash_candidates == std::vector<std::size_t>{2}
+                && all_shared_plan->field_candidates == std::vector<std::size_t>{3, 4},
+            "five identical copies across four zones get unique assignments without consuming retained cards");
+    auto missing_shared_copy = all_shared_candidates;
+    missing_shared_copy[4].identity = "naturalApple@1";
+    require(!plan_player_field_restore(all_shared, missing_shared_copy, error),
+            "a differently upgraded copy cannot satisfy a shared-identity field target");
+    ambiguous_field.schema_version = 1;
     require(!plan_player_field_restore(ambiguous_field, hand_field_overlap_candidates, error)
                 && error.find("shared hand/field/trash") != std::string::npos,
-            "valid persisted identities do not bypass the runtime hand/field ambiguity guard");
+            "legacy identities do not bypass the old hand/field ambiguity guard");
 
     auto empty_trash_field = field;
     empty_trash_field.player_trash = "()";

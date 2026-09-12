@@ -32,4 +32,6 @@
 
 - [phase-17-native-player-zone-order.md](phase-17-native-player-zone-order.md)：原生牌库、手牌及墓地顺序，旧排序格式兼容，有序副本分配与实际抽牌验证。
 
+- [phase-18-player-duplicate-zones.md](phase-18-player-duplicate-zones.md)：原生有序副本分配，普通水果的手/场/墓同身份组合与回归。
+
 维护规则：需求发生变化时先更新 `requirements.md`；技术实验产生新证据时更新 `technical-status.md` 并补充对应阶段报告；正式选定恢复路线后在 `architecture-options.md` 记录决定与理由。

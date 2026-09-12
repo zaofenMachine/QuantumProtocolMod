@@ -43,15 +43,20 @@ namespace QuantumCheckpoint
             error = "player-field plan has an invalid staged card count or location";
             return std::nullopt;
         }
-        const auto overlaps = [](const auto& left, const auto& right) {
+        const auto unsupported_overlap = [&](const auto& left, const auto& right) {
             return std::any_of(left.begin(), left.end(), [&](const auto& key) {
-                return std::find(right.begin(), right.end(), key) != right.end();
+                return std::find(right.begin(), right.end(), key) != right.end()
+                    && (checkpoint.schema_version == 1
+                        || !supports_plain_player_field_card(
+                            std::string_view{key}.substr(0, key.find('@'))));
             });
         };
-        // Keep the existing hand/field guard and apply it to the new trash
-        // combination. Same-identity copies within a single destination are
-        // supported; cross-destination dynamic state needs separate evidence.
-        if (overlaps(*hand, *field) || overlaps(*hand, *trash) || overlaps(*field, *trash))
+        // Native-order captures identify which copies remain in HAND/DECK.
+        // Plain field cards can then receive distinct trash/field assignments;
+        // per-slot health and turn-active state are applied after native creation.
+        // Keep the legacy sorted-view guard and special-card overlap boundary.
+        if (unsupported_overlap(*hand, *field) || unsupported_overlap(*hand, *trash)
+            || unsupported_overlap(*field, *trash))
         {
             error = "shared hand/field/trash identity is outside the guarded player layout";
             return std::nullopt;

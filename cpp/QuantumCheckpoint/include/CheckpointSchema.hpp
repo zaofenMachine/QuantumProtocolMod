@@ -32,6 +32,11 @@ namespace QuantumCheckpoint
     inline constexpr std::string_view RouteCSupportedMode = "DUNGEON";
     inline constexpr std::size_t RouteCMaximumFileBytes = 2U * 1024U * 1024U;
 
+    constexpr auto supports_plain_player_field_card(std::string_view tag) -> bool
+    {
+        return tag == "naturalApple" || tag == "naturalLemon" || tag == "naturalSpring";
+    }
+
     struct PropertySnapshot
     {
         std::string name{};
