@@ -38,4 +38,6 @@
 
 - [phase-20-player-hand-capacity.md](phase-20-player-hand-capacity.md)：原生手牌数量重建、满手牌场地暂存、最后一张同名副本重新绑定与容量门禁。
 
+- [phase-21-restore-object-filtering.md](phase-21-restore-object-filtering.md)：原生类型筛选、恢复校验间隔、满手牌场地顺序干扰和只读动态状态入口。
+
 维护规则：需求发生变化时先更新 `requirements.md`；技术实验产生新证据时更新 `technical-status.md` 并补充对应阶段报告；正式选定恢复路线后在 `architecture-options.md` 记录决定与理由。

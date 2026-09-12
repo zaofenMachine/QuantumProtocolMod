@@ -243,6 +243,10 @@ namespace QuantumCheckpoint
         UFunction* g_spawn_wave_index_function{};
         UFunction* g_spawn_next_wave_function{};
         UClass* g_spawn_controller_class{};
+        UClass* g_in_game_card_class{};
+        UClass* g_controller_card_group_class{};
+        std::array<UClass*, 5> g_route_c_object_classes{};
+        bool g_route_c_object_type_filter_ready{};
         std::optional<std::pair<int, int>> g_spawn_wave_index_hook_ids{};
         std::optional<std::pair<int, int>> g_spawn_next_wave_hook_ids{};
 
@@ -250,7 +254,7 @@ namespace QuantumCheckpoint
         auto classify(std::string_view full_name) -> std::string;
         auto object_class_name(UObject* object) -> std::string;
 
-        constexpr std::array<std::string_view, 18> RelevantClassPrefixes{
+        constexpr std::array<std::string_view, 19> RelevantClassPrefixes{
             "BP_CardEngine_C ",
             "BP_BottomBar_C ",
             "BP_ControllerCharacterCardSlot_C ",
@@ -269,6 +273,7 @@ namespace QuantumCheckpoint
             "BP_GenericCounterDisplay_C ",
             "BP_SpecialCounterDisplay_C ",
             "UMG_CardEffectDisplay_C ",
+            "BP_HUDController_C ",
         };
 
         constexpr std::array<StringViewType, 61> CandidateProperties{
@@ -400,13 +405,22 @@ namespace QuantumCheckpoint
             STR("onManualActionQueued"),
         };
 
-        constexpr std::array<StringViewType, 6> InGameCardDiagnosticFunctions{
+        constexpr std::array<StringViewType, 8> InGameCardDiagnosticFunctions{
             STR("PlayCard"),
             STR("resetCardStatus"),
             STR("Action_CreateCard_Resolve_Visuals"),
             STR("Action_PlayCardToField_Resolve_Visuals"),
             STR("Action_MoveCard_Resolve_Visuals"),
             STR("Action_ExecuteSendToTrash_Resolve_Visuals"),
+            STR("hoverChanged"),
+            STR("Action_AddStatModifier_Visuals"),
+        };
+
+        constexpr std::array<StringViewType, 1> HudControllerGetters{
+            STR("getHighlightedCardInfo"),
+        };
+        constexpr std::array<StringViewType, 1> HudControllerDiagnosticFunctions{
+            STR("setHightlightedCardInfo"),
         };
 
         constexpr std::array<StringViewType, 1> PlacementComponentGetters{
@@ -1300,6 +1314,10 @@ namespace QuantumCheckpoint
                 {
                     return LoopAction::Continue;
                 }
+                if (g_route_c_object_type_filter_ready
+                    && std::none_of(g_route_c_object_classes.begin(), g_route_c_object_classes.end(),
+                        [&](auto* type) { return object->IsA(type); }))
+                    return LoopAction::Continue;
                 const std::string full_name = to_string(object->GetFullName());
                 const std::string role = classify(full_name);
                 if (role == "GI_Quantum_C" && full_name.contains("/Engine/Transient."))
@@ -1374,6 +1392,8 @@ namespace QuantumCheckpoint
                 {
                     return LoopAction::Continue;
                 }
+                if (g_controller_card_group_class && !object->IsA(g_controller_card_group_class))
+                    return LoopAction::Continue;
                 const auto full_name = to_string(object->GetFullName());
                 const auto role = classify(full_name);
                 if ((role != "BP_ControllerDeck_C" && role != "BP_ControllerHand_C"
@@ -3636,6 +3656,9 @@ namespace QuantumCheckpoint
                    << ",\n  \"playerHandLimit\": " << restore.native_hand_limit
                    << ",\n  \"playerHandCardDeferredForField\": "
                    << (restore.deferred_hand_field_layout ? "true" : "false")
+                   << ",\n  \"nativeObjectTypeFiltersActive\": "
+                   << (g_route_c_object_type_filter_ready && g_controller_card_group_class
+                           && g_in_game_card_class ? "true" : "false")
                    << ",\n  \"gameThreadId\": " << g_game_thread_id.load()
                    << ",\n  \"targetHealth\": " << restore.checkpoint.player_health
                    << "\n}\n";
@@ -7153,6 +7176,11 @@ namespace QuantumCheckpoint
                     append_function_pointers(
                         snapshot, object, CardEngineDiagnosticFunctions);
                 }
+                else if (role == "BP_HUDController_C")
+                {
+                    append_getters(snapshot, object, HudControllerGetters);
+                    append_function_pointers(snapshot, object, HudControllerDiagnosticFunctions);
+                }
                 else if (role == "CardPlacementComponent")
                 {
                     append_getters(snapshot, object, PlacementComponentGetters);
@@ -9085,6 +9113,8 @@ namespace QuantumCheckpoint
                 {
                     return LoopAction::Continue;
                 }
+                if (g_in_game_card_class && !object->IsA(g_in_game_card_class))
+                    return LoopAction::Continue;
                 const auto full_name = to_string(object->GetFullName());
                 if (classify(full_name) != "BP_InGameCard_C"
                     || !is_live_instance(full_name, "BP_InGameCard_C")
@@ -9992,9 +10022,9 @@ namespace QuantumCheckpoint
         QuantumCheckpointMod()
         {
             ModName = STR("QuantumCheckpoint");
-            ModVersion = STR("0.21.0");
+            ModVersion = STR("0.22.0");
 #if defined(QUANTUM_CHECKPOINT_RUNTIME_TEST_FIXTURES)
-            ModVersion = STR("0.21.0-test-fixtures");
+            ModVersion = STR("0.22.0-test-fixtures");
 #endif
             ModDescription = STR("Route C checkpoint with optional exact-state supplements");
             ModAuthors = STR("zaofenMachine and contributors");
@@ -10129,6 +10159,23 @@ namespace QuantumCheckpoint
                 nullptr,
                 nullptr,
                 STR("/Script/Quantum.SpawnController"));
+            // Cache native UClass metadata, never live actors. All name, world,
+            // ownership and array membership checks still run after filtering.
+            const auto native_type = [](StringViewType path) {
+                return UObjectGlobals::StaticFindObject<UClass*>(nullptr, nullptr, path.data());
+            };
+            g_in_game_card_class = native_type(STR("/Script/Quantum.InGameCard"));
+            g_controller_card_group_class = native_type(STR("/Script/Quantum.ControllerCardGroup"));
+            g_route_c_object_classes = {
+                native_type(STR("/Script/Quantum.QuantumGameInstance")),
+                native_type(STR("/Script/Quantum.CardEngine")),
+                g_spawn_controller_class,
+                native_type(STR("/Script/Quantum.BottomBar")),
+                native_type(STR("/Script/Quantum.ControllerCharacterCardSlot")),
+            };
+            g_route_c_object_type_filter_ready = std::all_of(
+                g_route_c_object_classes.begin(), g_route_c_object_classes.end(),
+                [](const auto* type) { return type != nullptr; });
             try
             {
                 Hook::RegisterBeginPlayPreCallback(route_c_actor_begin_play_pre);
