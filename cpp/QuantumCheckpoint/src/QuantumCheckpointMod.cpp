@@ -2717,6 +2717,131 @@ namespace QuantumCheckpoint
             return order->value;
         }
 
+
+        // Read-only sparse storage traversal shared by the native stat map and
+        // each modifier's flag set. Never mutate allocation flags or hash links.
+        auto read_native_sparse_elements(const void* storage, std::size_t stride)
+            -> std::vector<const void*>
+        {
+            if (!storage || !address_is_readable(storage, 0x38))
+                throw std::runtime_error{"native sparse storage is unreadable"};
+            const auto* data = read_native_value<const void*>(storage, 0);
+            const auto slots = read_native_value<std::int32_t>(storage, 8);
+            const auto capacity = read_native_value<std::int32_t>(storage, 12);
+            const auto bits = read_native_value<std::int32_t>(storage, 0x28);
+            const auto bit_capacity = read_native_value<std::int32_t>(storage, 0x2C);
+            const auto free_count = read_native_value<std::int32_t>(storage, 0x34);
+            const auto* words = read_native_value<const void*>(storage, 0x20);
+            if (slots < 0 || slots > 128 || capacity < slots || capacity > 4096
+                || bits != slots || bit_capacity < bits || bit_capacity > 4096
+                || free_count < 0 || free_count > slots
+                || (slots && (!data || !address_is_readable(data, slots * stride))))
+                throw std::runtime_error{"native sparse storage bounds disagree"};
+            if (!words)
+            {
+                if (bits > 128) throw std::runtime_error{"inline native allocation bits overflow"};
+                words = static_cast<const std::byte*>(storage) + 0x10;
+            }
+            if (bits && !address_is_readable(words, ((bits + 31) / 32) * 4))
+                throw std::runtime_error{"native allocation bits are unreadable"};
+            std::vector<const void*> result{};
+            for (std::int32_t index{}; index < slots; ++index)
+                if (read_native_value<std::uint32_t>(words, (index / 32) * 4)
+                    & (std::uint32_t{1} << (index % 32)))
+                    result.push_back(static_cast<const std::byte*>(data) + index * stride);
+            if (result.size() != static_cast<std::size_t>(slots - free_count))
+                throw std::runtime_error{"native sparse membership disagrees with free count"};
+            return result;
+        }
+
+        auto append_native_card_statistics(ObjectSnapshot& snapshot, UObject* object) -> void
+        {
+            try
+            {
+                const auto live = find_route_c_objects();
+                const auto api = validated_native_move_card_api(live.card_engine);
+                if (object->GetWorld() != live.card_engine->GetWorld()
+                    || !address_is_readable(static_cast<const std::byte*>(static_cast<const void*>(object))
+                        + InGameCardStatePointerOffset, sizeof(void*)))
+                    throw std::runtime_error{"card statistics object is outside the active world"};
+                const auto* state = read_native_value<const void*>(object, InGameCardStatePointerOffset);
+                const auto location = native_card_location(api.engine_state, state, api.get_card_location);
+                if (!location || !address_is_readable(state, 0x1A0))
+                    throw std::runtime_error{"card statistics ownership is unverified"};
+                const auto module_base = reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr));
+                const auto require_signature = [&](std::uintptr_t rva, const auto& bytes) {
+                    const auto* address = reinterpret_cast<const std::uint8_t*>(module_base + rva);
+                    if (!address_is_readable(address, bytes.size())
+                        || !std::equal(bytes.begin(), bytes.end(), address))
+                        throw std::runtime_error{"native card statistics signature changed"};
+                };
+                require_signature(0xE1DF30, std::array<std::uint8_t, 7>{0x8B,0x81,0x24,0x01,0x00,0x00,0xC3});
+                require_signature(0xE1CA8F, std::array<std::uint8_t, 7>{0x48,0x8D,0xB1,0x40,0x01,0x00,0x00});
+                require_signature(0xE1CC27, std::array<std::uint8_t, 18>{
+                    0x48,0x6B,0xC8,0x78,0x48,0x8B,0x02,0x80,0x7C,0x01,0x08,0x01,
+                    0x75,0x04,0x03,0x5C,0x01,0x68});
+                require_signature(0xE1CC4C, std::array<std::uint8_t, 7>{0x41,0x8B,0x95,0x24,0x01,0x00,0x00});
+                const auto base = read_native_value<std::int32_t>(state, 0x124);
+                if (base < -100000 || base > 100000)
+                    throw std::runtime_error{"native base attack is outside diagnostic bounds"};
+                std::int64_t computed = base;
+                std::vector<std::string> modifiers{};
+                for (const auto* entry : read_native_sparse_elements(static_cast<const std::byte*>(state) + 0x130, 0x78))
+                {
+                    const auto stat = read_native_value<std::uint8_t>(entry, 8);
+                    const auto amount = read_native_value<std::int32_t>(entry, 0x68);
+                    const auto limit = read_native_value<std::int32_t>(entry, 0x6C);
+                    if (stat > 3 || amount < -100000 || amount > 100000 || limit < -100000 || limit > 100000)
+                        throw std::runtime_error{"native stat modifier is outside diagnostic bounds"};
+                    if (stat == 1) computed += amount;
+                    const FName key{read_native_value<std::int64_t>(entry, 0)};
+                    const FName tag{read_native_value<std::int64_t>(entry, 0x60)};
+                    std::vector<std::uint8_t> flags{};
+                    for (const auto* flag : read_native_sparse_elements(static_cast<const std::byte*>(entry) + 0x10, 12))
+                    {
+                        const auto value = read_native_value<std::uint8_t>(flag, 0);
+                        if (value > 2) throw std::runtime_error{"unknown native stat modifier flag"};
+                        flags.push_back(value);
+                    }
+                    std::sort(flags.begin(), flags.end());
+                    if (std::adjacent_find(flags.begin(), flags.end()) != flags.end())
+                        throw std::runtime_error{"duplicate native stat modifier flag"};
+                    std::string row = "key=" + to_string(key.ToString()) + ",tag=" + to_string(tag.ToString())
+                        + ",stat=" + std::to_string(stat) + ",amount=" + std::to_string(amount)
+                        + ",limit=" + std::to_string(limit) + ",flags=";
+                    for (const auto flag : flags) row += std::to_string(flag) + ',';
+                    modifiers.push_back(std::move(row));
+                }
+                computed = std::max<std::int64_t>(0, computed);
+                if (computed > 100000) throw std::runtime_error{"native current attack is outside diagnostic bounds"};
+                // E1CA60 only sums ATTACK modifiers, adds base attack, clamps at
+                // zero, and returns. Its sparse iterator changes stack locals only.
+                using GetAttack = std::int32_t (*)(const void*);
+                const auto actual = reinterpret_cast<GetAttack>(module_base + 0xE1CA60)(state);
+                if (actual != computed) throw std::runtime_error{"native attack getter disagrees with decoded modifiers"};
+                std::sort(modifiers.begin(), modifiers.end());
+                std::string rows{};
+                for (const auto& row : modifiers) { if (!rows.empty()) rows += ';'; rows += row; }
+                snapshot.properties.push_back({"nativeStats:baseAttack", std::to_string(base)});
+                snapshot.properties.push_back({"nativeStats:currentAttack", std::to_string(actual)});
+                snapshot.properties.push_back({"nativeStats:modifierCount", std::to_string(modifiers.size())});
+                snapshot.properties.push_back({"nativeStats:modifiers", rows});
+                if (auto* face = reflected_object_property(object, STR("CardFaceWidget"));
+                    face && address_is_readable(static_cast<const std::byte*>(static_cast<const void*>(face)) + 0x294, 8))
+                {
+                    snapshot.properties.push_back({"nativeStats:cardFaceCurrentAttack",
+                        std::to_string(read_native_value<std::int32_t>(face, 0x294))});
+                    snapshot.properties.push_back({"nativeStats:cardFaceBaseAttack",
+                        std::to_string(read_native_value<std::int32_t>(face, 0x298))});
+                }
+                snapshot.properties.push_back({"nativeStats:status", "verified-native-attack"});
+            }
+            catch (const std::exception& error)
+            {
+                snapshot.properties.push_back({"nativeStats:readError", error.what()});
+            }
+        }
+
         auto append_private_card_state_diagnostics(ObjectSnapshot& snapshot, UObject* object) -> void
         {
             const auto& fingerprint = executable_fingerprint();
@@ -7166,6 +7291,7 @@ namespace QuantumCheckpoint
                 else if (role == "BP_InGameCard_C")
                 {
                     append_private_card_state_diagnostics(snapshot, object);
+                    append_native_card_statistics(snapshot, object);
                     append_getters(snapshot, object, InGameCardGetters);
                     append_function_pointers(
                         snapshot, object, InGameCardDiagnosticFunctions);
@@ -10022,9 +10148,9 @@ namespace QuantumCheckpoint
         QuantumCheckpointMod()
         {
             ModName = STR("QuantumCheckpoint");
-            ModVersion = STR("0.22.0");
+            ModVersion = STR("0.23.0");
 #if defined(QUANTUM_CHECKPOINT_RUNTIME_TEST_FIXTURES)
-            ModVersion = STR("0.22.0-test-fixtures");
+            ModVersion = STR("0.23.0-test-fixtures");
 #endif
             ModDescription = STR("Route C checkpoint with optional exact-state supplements");
             ModAuthors = STR("zaofenMachine and contributors");

@@ -306,6 +306,11 @@ function ConvertTo-NormalizedInventory {
                 Get-SnapshotProperty $specialCounter 'getter:getCurrentCounters'
             } else { $null }
             modifiers = Get-SnapshotProperty $card 'cardModifiers'
+            nativeStatisticsStatus = Get-SnapshotProperty $card 'nativeStats:status'
+            nativeBaseAttack = Get-SnapshotProperty $card 'nativeStats:baseAttack'
+            nativeCurrentAttack = Get-SnapshotProperty $card 'nativeStats:currentAttack'
+            nativeModifierCount = Get-SnapshotProperty $card 'nativeStats:modifierCount'
+            nativeModifiers = Get-SnapshotProperty $card 'nativeStats:modifiers'
             effects = @($effects)
         })
     }
@@ -422,6 +427,16 @@ function ConvertTo-NormalizedInventory {
         playerCardState = ConvertTo-CountedValues @(
             $playerCards | ForEach-Object { Get-CardStateSignature $_ }
         )
+        playerNativeStatisticsAvailable = $playerCards.Count -gt 0 -and @(
+            $playerCards | Where-Object { $_.nativeStatisticsStatus -cne 'verified-native-attack' }
+        ).Count -eq 0
+        playerNativeStatistics = ConvertTo-CountedValues @(
+            $playerCards | ForEach-Object {
+                'card={0}|location={1}|field={2}|baseAttack={3}|currentAttack={4}|modifierCount={5}|modifiers={6}' -f `
+                    $_.descriptor, $_.location, $_.field, $_.nativeBaseAttack, $_.nativeCurrentAttack, `
+                    $_.nativeModifierCount, $_.nativeModifiers
+            }
+        )
         playerCardRuntimeStateIgnoringLocation = ConvertTo-CountedValues @(
             $playerCards | ForEach-Object { Get-CardStateSignature $_ -IgnoreLocation }
         )
@@ -490,6 +505,10 @@ if ($beforeState.nativePlayerZonesAvailable -and $afterState.nativePlayerZonesAv
 
 Add-Difference 'player-card-state' 'playerCardState' `
     $beforeState.playerCardState $afterState.playerCardState
+if ($beforeState.playerNativeStatisticsAvailable -and $afterState.playerNativeStatisticsAvailable) {
+    Add-Difference 'player-native-statistics' 'playerNativeStatistics' `
+        $beforeState.playerNativeStatistics $afterState.playerNativeStatistics
+}
 Add-Difference 'player-card-state' 'playerCardRuntimeStateIgnoringLocation' `
     $beforeState.playerCardRuntimeStateIgnoringLocation `
     $afterState.playerCardRuntimeStateIgnoringLocation
@@ -560,6 +579,10 @@ $report = [ordered]@{
         } else { $null }
         playerCardStateIncludingLocationEqual = Test-Equivalent `
             $beforeState.playerCardState $afterState.playerCardState
+        playerNativeStatisticsAvailable = $beforeState.playerNativeStatisticsAvailable -and $afterState.playerNativeStatisticsAvailable
+        playerNativeStatisticsEqual = if ($beforeState.playerNativeStatisticsAvailable -and $afterState.playerNativeStatisticsAvailable) {
+            Test-Equivalent $beforeState.playerNativeStatistics $afterState.playerNativeStatistics
+        } else { $null }
         playerCardRuntimeStateIgnoringLocationEqual = Test-Equivalent `
             $beforeState.playerCardRuntimeStateIgnoringLocation `
             $afterState.playerCardRuntimeStateIgnoringLocation
@@ -572,7 +595,7 @@ $report = [ordered]@{
         beforeRuntimeCardIdCount = @($beforeState.runtimeCardIds).Count
         afterRuntimeCardIdCount = @($afterState.runtimeCardIds).Count
         sharedRuntimeCardIdCount = $sharedIds.Count
-        note = 'Runtime GUIDs are excluded. playerZoneSequencesEqual compares metadata-sorted controller views, not draw/hand order. Native order is unknown (null) unless both inventories include all three player-zone arrays.'
+        note = 'Runtime GUIDs are excluded. playerZoneSequencesEqual compares metadata-sorted controller views, not draw/hand order. Native order is unknown (null) unless both inventories include all three player-zone arrays. Native attack/modifier equality is unknown (null) unless every player card in both inventories has verified native statistics; the older card-state check does not cover those fields.'
     }
     futureSpawnPlan = [ordered]@{
         beforeWaveCount = @($beforeState.spawner.spawnWaveHashes).Count
