@@ -2934,6 +2934,54 @@ namespace QuantumCheckpoint
             catch (const std::exception& error) { snapshot.properties.push_back({"nativeHealth:readError",error.what()}); }
         }
 
+        auto append_native_card_level(ObjectSnapshot& snapshot, UObject* object) -> void
+        {
+            try
+            {
+                const auto live = find_route_c_objects();
+                const auto api = validated_native_move_card_api(live.card_engine);
+                if (object->GetWorld() != live.card_engine->GetWorld())
+                    throw std::runtime_error{"card level object is outside the active world"};
+                const auto* state = read_native_value<const void*>(object,InGameCardStatePointerOffset);
+                if (!native_card_location(api.engine_state,state,api.get_card_location))
+                    throw std::runtime_error{"card level ownership is unverified"};
+                const auto module_base = reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr));
+                constexpr std::array<std::uint8_t,7> signature{0x8B,0x81,0x10,0x01,0,0,0xC3};
+                const auto* getter = reinterpret_cast<const std::uint8_t*>(module_base + 0xE27CB0);
+                if (!address_is_readable(getter,signature.size())
+                    || !std::equal(signature.begin(),signature.end(),getter))
+                    throw std::runtime_error{"native level getter signature changed"};
+                const auto level = read_native_value<std::int32_t>(state,0x110);
+                if (level < -100000 || level > 100000)
+                    throw std::runtime_error{"native level exceeds diagnostic bounds"};
+                std::int64_t sum{};
+                std::int32_t count{};
+                for (const auto* entry : read_native_sparse_elements(static_cast<const std::byte*>(state) + 0x130,0x78))
+                {
+                    const auto stat = read_native_value<std::uint8_t>(entry,8);
+                    const auto amount = read_native_value<std::int32_t>(entry,0x68);
+                    if (stat > 3 || amount < -100000 || amount > 100000)
+                        throw std::runtime_error{"native level modifier exceeds diagnostic bounds"};
+                    if (stat == 3) { sum += amount; ++count; }
+                }
+                if (sum < -100000 || sum > 100000)
+                    throw std::runtime_error{"native level modifier sum exceeds diagnostic bounds"};
+                using Getter = std::int32_t (*)(const void*);
+                // The native level getter reads +110 directly. Do not add LEVEL
+                // modifiers to it: unlike ATTACK/HEALTH, it does not sum that map.
+                const auto actual = reinterpret_cast<Getter>(module_base + 0xE27CB0)(state);
+                if (actual != level) throw std::runtime_error{"native level getter disagrees with decoded state"};
+                snapshot.properties.push_back({"nativeLevel:level",std::to_string(actual)});
+                snapshot.properties.push_back({"nativeLevel:modifierSum",std::to_string(sum)});
+                snapshot.properties.push_back({"nativeLevel:modifierCount",std::to_string(count)});
+                if (auto* face = reflected_object_property(object,STR("CardFaceWidget"));
+                    face && address_is_readable(static_cast<const std::byte*>(static_cast<const void*>(face)) + 0x2A4,4))
+                    snapshot.properties.push_back({"nativeLevel:cardFaceLevel",std::to_string(read_native_value<std::int32_t>(face,0x2A4))});
+                snapshot.properties.push_back({"nativeLevel:status","verified-native-level"});
+            }
+            catch (const std::exception& error) { snapshot.properties.push_back({"nativeLevel:readError",error.what()}); }
+        }
+
         auto append_native_card_counters(ObjectSnapshot& snapshot, UObject* object, bool include_display = true) -> void
         {
             try
@@ -4193,7 +4241,11 @@ namespace QuantumCheckpoint
                                                const PlayerAttackModifier& modifier,
                                                std::uint8_t native_stat = 1) -> void
         {
-            if (native_stat != 1 && native_stat != 2)
+            if (native_stat != 1 && native_stat != 2
+#if defined(QUANTUM_CHECKPOINT_RUNTIME_TEST_FIXTURES)
+                && native_stat != 3
+#endif
+            )
                 throw std::runtime_error{"native stat action type is outside the tested ATTACK/HEALTH pair"};
             const auto api = validated_native_move_card_api(engine);
             if (GetCurrentThreadId() != g_game_thread_id.load(std::memory_order_acquire)
@@ -4230,7 +4282,8 @@ namespace QuantumCheckpoint
             const std::array names{"NONE", "ONE_ATTACK", "DECAY"};
             for (std::size_t index{}; index < names.size(); ++index)
                 if (modifier.flags & (1u << index)) { if (!flags.empty()) flags += ','; flags += names[index]; }
-            const auto stat_name = native_stat == 1 ? std::string{"ATTACK"} : std::string{"HEALTH"};
+            const auto stat_name = native_stat == 1 ? std::string{"ATTACK"}
+                : native_stat == 2 ? std::string{"HEALTH"} : std::string{"LEVEL"};
             const auto value = to_wstring("(stat=" + stat_name + ",Tag=" + modifier.tag + ",Amount="
                 + std::to_string(modifier.amount) + ",limit=" + std::to_string(modifier.limit)
                 + ",Flags=(" + flags + "))");
@@ -8064,6 +8117,7 @@ namespace QuantumCheckpoint
                     append_private_card_state_diagnostics(snapshot, object);
                     append_native_card_statistics(snapshot, object);
                     append_native_card_health_statistics(snapshot, object);
+                    append_native_card_level(snapshot, object);
                     append_native_card_counters(snapshot, object);
                     append_getters(snapshot, object, InGameCardGetters);
                     append_function_pointers(
@@ -10969,6 +11023,11 @@ namespace QuantumCheckpoint
                     modifier = {"quantumDecay",3,-1,4};
                 else if (profile == 5 && (before == "2,2" || before == "2,4|quantumLimit,2,3,0"))
                     modifier = {"quantumLimit",2,3,0};
+                else if ((profile == 11 || profile == 12) && before == "2,2"
+                    && read_native_value<std::int32_t>(field[0].state,0x110) == 1
+                    && read_native_value<std::int32_t>(field[0].state,0x11C) == 2)
+                    modifier = {profile == 11 ? "quantumLevel" : "quantumLevelDecay",3,-1,
+                        static_cast<std::uint8_t>(profile == 11 ? 0 : 4)};
                 else if ((profile == 6 || profile == 7)
                     && (before == "2,2" || before == "2,5|quantumCheckpointProbe,3,-1,0"))
                 {
@@ -10986,7 +11045,7 @@ namespace QuantumCheckpoint
                 else throw std::runtime_error{"fixture profile refuses unexpected existing modifiers"};
                 queued = modifier.tag;
                 queue_native_player_stat_modifier(objects.card_engine, field[0], modifier,
-                    static_cast<std::uint8_t>(profile >= 6 ? 2 : 1));
+                    static_cast<std::uint8_t>(profile >= 11 ? 3 : profile >= 6 ? 2 : 1));
                 status = "queued";
                 resume_native_restore_actions(objects.card_engine);
                 reason = "native lifecycle action queued; observe its normalized result separately";
@@ -11210,9 +11269,9 @@ namespace QuantumCheckpoint
         QuantumCheckpointMod()
         {
             ModName = STR("QuantumCheckpoint");
-            ModVersion = STR("0.29.0");
+            ModVersion = STR("0.30.0");
 #if defined(QUANTUM_CHECKPOINT_RUNTIME_TEST_FIXTURES)
-            ModVersion = STR("0.29.0-test-fixtures");
+            ModVersion = STR("0.30.0-test-fixtures");
 #endif
             ModDescription = STR("Route C checkpoint with optional exact-state supplements");
             ModAuthors = STR("zaofenMachine and contributors");
@@ -11336,6 +11395,12 @@ namespace QuantumCheckpoint
             UE4SSProgram::get_program().register_keydown_event(
                 Input::Key::L, {Input::ModifierKey::CONTROL, Input::ModifierKey::SHIFT},
                 []() { g_player_stat_fixture_action.store(10, std::memory_order_release); });
+            UE4SSProgram::get_program().register_keydown_event(
+                Input::Key::M, {Input::ModifierKey::CONTROL, Input::ModifierKey::SHIFT},
+                []() { g_player_stat_fixture_action.store(11, std::memory_order_release); });
+            UE4SSProgram::get_program().register_keydown_event(
+                Input::Key::N, {Input::ModifierKey::CONTROL, Input::ModifierKey::SHIFT},
+                []() { g_player_stat_fixture_action.store(12, std::memory_order_release); });
             Output::send<LogLevel::Warning>(STR("[QuantumCheckpoint] DEVELOPMENT BUILD: Ctrl+Shift+F3 returns HAND to DECK, F4 fills HAND, F10 sends HAND to TRASH in a disposable battle.\n"));
 #endif
             Output::send<LogLevel::Verbose>(
@@ -11600,7 +11665,7 @@ namespace QuantumCheckpoint
                 const auto stat_fixture = g_player_stat_fixture_action.exchange(0, std::memory_order_acq_rel);
                 if (stat_fixture && g_unreal_ready.load(std::memory_order_acquire))
                 {
-                    if (stat_fixture >= 8) run_player_counter_fixture(stat_fixture);
+                    if (stat_fixture >= 8 && stat_fixture <= 10) run_player_counter_fixture(stat_fixture);
                     else if (stat_fixture >= 3) run_player_attack_lifecycle_fixture(stat_fixture);
                     else run_player_stat_fixture(stat_fixture == 2);
                 }

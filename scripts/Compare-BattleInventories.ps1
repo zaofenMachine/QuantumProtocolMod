@@ -311,6 +311,10 @@ function ConvertTo-NormalizedInventory {
             nativeCurrentAttack = Get-SnapshotProperty $card 'nativeStats:currentAttack'
             nativeModifierCount = Get-SnapshotProperty $card 'nativeStats:modifierCount'
             nativeModifiers = Get-SnapshotProperty $card 'nativeStats:modifiers'
+            nativeLevelStatus = Get-SnapshotProperty $card 'nativeLevel:status'
+            nativeLevel = Get-SnapshotProperty $card 'nativeLevel:level'
+            nativeLevelModifierSum = Get-SnapshotProperty $card 'nativeLevel:modifierSum'
+            nativeLevelModifierCount = Get-SnapshotProperty $card 'nativeLevel:modifierCount'
             nativeCountersStatus = Get-SnapshotProperty $card 'nativeCounters:status'
             nativeGenericCounters = Get-SnapshotProperty $card 'nativeCounters:generic'
             nativeSpecialCounterTotal = Get-SnapshotProperty $card 'nativeCounters:specialTotal'
@@ -448,6 +452,15 @@ function ConvertTo-NormalizedInventory {
                     $_.nativeModifierCount, $_.nativeModifiers
             }
         )
+        playerNativeLevelAvailable = $playerCards.Count -gt 0 -and @(
+            $playerCards | Where-Object { $_.nativeLevelStatus -cne 'verified-native-level' }
+        ).Count -eq 0
+        playerNativeLevel = ConvertTo-CountedValues @(
+            $playerCards | ForEach-Object {
+                'card={0}|location={1}|field={2}|level={3}|modifierSum={4}|modifierCount={5}' -f `
+                    $_.descriptor, $_.location, $_.field, $_.nativeLevel, $_.nativeLevelModifierSum, $_.nativeLevelModifierCount
+            }
+        )
         playerNativeCountersAvailable = $playerCards.Count -gt 0 -and @(
             $playerCards | Where-Object { $_.nativeCountersStatus -cne 'verified-native-counters' }
         ).Count -eq 0
@@ -540,6 +553,10 @@ if ($beforeState.playerNativeStatisticsAvailable -and $afterState.playerNativeSt
     Add-Difference 'player-native-statistics' 'playerNativeStatistics' `
         $beforeState.playerNativeStatistics $afterState.playerNativeStatistics
 }
+if ($beforeState.playerNativeLevelAvailable -and $afterState.playerNativeLevelAvailable) {
+    Add-Difference 'player-native-level' 'playerNativeLevel' `
+        $beforeState.playerNativeLevel $afterState.playerNativeLevel
+}
 if ($beforeState.playerNativeCountersAvailable -and $afterState.playerNativeCountersAvailable) {
     Add-Difference 'player-native-counters' 'playerNativeCounters' `
         $beforeState.playerNativeCounters $afterState.playerNativeCounters
@@ -621,6 +638,10 @@ $report = [ordered]@{
         playerNativeStatisticsAvailable = $beforeState.playerNativeStatisticsAvailable -and $afterState.playerNativeStatisticsAvailable
         playerNativeStatisticsEqual = if ($beforeState.playerNativeStatisticsAvailable -and $afterState.playerNativeStatisticsAvailable) {
             Test-Equivalent $beforeState.playerNativeStatistics $afterState.playerNativeStatistics
+        } else { $null }
+        playerNativeLevelAvailable = $beforeState.playerNativeLevelAvailable -and $afterState.playerNativeLevelAvailable
+        playerNativeLevelEqual = if ($beforeState.playerNativeLevelAvailable -and $afterState.playerNativeLevelAvailable) {
+            Test-Equivalent $beforeState.playerNativeLevel $afterState.playerNativeLevel
         } else { $null }
         playerNativeCountersAvailable = $beforeState.playerNativeCountersAvailable -and $afterState.playerNativeCountersAvailable
         playerNativeCountersEqual = if ($beforeState.playerNativeCountersAvailable -and $afterState.playerNativeCountersAvailable) {
