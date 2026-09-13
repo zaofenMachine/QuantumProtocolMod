@@ -1,4 +1,5 @@
 #include "CheckpointPersistence.hpp"
+#include "PlayerAttackState.hpp"
 
 #include <algorithm>
 #include <array>
@@ -2052,6 +2053,8 @@ namespace QuantumCheckpoint
         append_hash_bytes(hash, checkpoint.player_trash);
         append_hash_bytes(hash, checkpoint.player_field);
         append_hash_bytes(hash, checkpoint.player_field_states);
+        if (checkpoint.schema_version >= 3)
+            append_hash_bytes(hash, checkpoint.player_field_attack_states);
 
         std::ostringstream output{};
         output << std::hex << std::uppercase << std::setw(16) << std::setfill('0') << hash;
@@ -2085,8 +2088,11 @@ namespace QuantumCheckpoint
                << "  \"playerField\": \"" << json_escape(checkpoint.player_field)
                << "\",\n"
                << "  \"playerFieldStates\": \""
-               << json_escape(checkpoint.player_field_states) << "\",\n"
-               << "  \"payloadChecksum\": \"" << checkpoint.payload_checksum << "\"\n"
+               << json_escape(checkpoint.player_field_states) << "\",\n";
+        if (checkpoint.schema_version >= 3)
+            output << "  \"playerFieldAttackStates\": \""
+                   << json_escape(checkpoint.player_field_attack_states) << "\",\n";
+        output << "  \"payloadChecksum\": \"" << checkpoint.payload_checksum << "\"\n"
                << "}\n";
         return output.str();
     }
@@ -2094,7 +2100,7 @@ namespace QuantumCheckpoint
     auto validate_exact_player_field_checkpoint(
         const ExactPlayerFieldCheckpoint& checkpoint, std::string& error) -> bool
     {
-        if (checkpoint.schema_version != 1
+        if (checkpoint.schema_version != 1 && checkpoint.schema_version != 2
             && checkpoint.schema_version != ExactPlayerFieldSchemaVersion)
         {
             error = "unsupported exact player-field schema version";
@@ -2146,6 +2152,20 @@ namespace QuantumCheckpoint
         if (states->size() != field->size())
         {
             error = "exact player-field card and state counts do not match";
+            return false;
+        }
+        if (checkpoint.schema_version >= 3)
+        {
+            const auto attacks = parse_player_attack_states(checkpoint.player_field_attack_states, array_error);
+            if (!attacks || attacks->size() != field->size())
+            {
+                error = "exact player-field attack states are invalid or misaligned: " + array_error;
+                return false;
+            }
+        }
+        else if (!checkpoint.player_field_attack_states.empty())
+        {
+            error = "legacy player-field schema cannot claim attack modifier coverage";
             return false;
         }
         if (deck->size() + hand->size() + trash->size() + field->size() > 128)
@@ -2211,7 +2231,7 @@ namespace QuantumCheckpoint
         do { auto value = required_integer<Type>(*values, JsonName, error); if (!value) return std::nullopt; checkpoint.Field = *value; } while (false)
 
         READ_FIELD_INTEGER(schema_version, "schemaVersion", int);
-        if (checkpoint.schema_version != 1
+        if (checkpoint.schema_version != 1 && checkpoint.schema_version != 2
             && checkpoint.schema_version != ExactPlayerFieldSchemaVersion)
         {
             error = "unsupported exact player-field schema version";
@@ -2229,6 +2249,15 @@ namespace QuantumCheckpoint
         READ_FIELD_STRING(player_trash, "playerTrash");
         READ_FIELD_STRING(player_field, "playerField");
         READ_FIELD_STRING(player_field_states, "playerFieldStates");
+        if (checkpoint.schema_version >= 3)
+        {
+            READ_FIELD_STRING(player_field_attack_states, "playerFieldAttackStates");
+        }
+        else if (values->contains("playerFieldAttackStates"))
+        {
+            error = "legacy player-field JSON contains a newer attack record";
+            return std::nullopt;
+        }
         READ_FIELD_STRING(payload_checksum, "payloadChecksum");
 
 #undef READ_FIELD_INTEGER

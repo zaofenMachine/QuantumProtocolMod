@@ -8,6 +8,7 @@ add_library(
     src/QuantumCheckpointMod.cpp
     src/CheckpointPersistence.cpp
     src/PlayerRestorePlan.cpp
+    src/PlayerAttackState.cpp
 )
 
 target_include_directories(${TARGET} PRIVATE include)
@@ -31,9 +32,15 @@ add_executable(
     tests/CheckpointPersistenceTests.cpp
     src/CheckpointPersistence.cpp
     src/PlayerRestorePlan.cpp
+    src/PlayerAttackState.cpp
 )
 target_include_directories(QuantumCheckpointPersistenceTests PRIVATE include)
 target_compile_features(QuantumCheckpointPersistenceTests PRIVATE cxx_std_23)
 
 enable_testing()
 add_test(NAME QuantumCheckpointPersistence COMMAND QuantumCheckpointPersistenceTests)
+
+add_executable(QuantumCheckpointAttackStateTests tests/PlayerAttackStateTests.cpp src/PlayerAttackState.cpp)
+target_include_directories(QuantumCheckpointAttackStateTests PRIVATE include)
+target_compile_features(QuantumCheckpointAttackStateTests PRIVATE cxx_std_23)
+add_test(NAME QuantumCheckpointAttackState COMMAND QuantumCheckpointAttackStateTests)

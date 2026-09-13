@@ -41,5 +41,6 @@
 - [phase-21-restore-object-filtering.md](phase-21-restore-object-filtering.md)：原生类型筛选、恢复校验间隔、满手牌场地顺序干扰和只读动态状态入口。
 
 - [phase-22-native-player-statistics.md](phase-22-native-player-statistics.md)：原生攻击力、稀疏属性修正表、实际增益清除与新增比较覆盖。
+- [phase-23-player-field-attack.md](phase-23-player-field-attack.md)：场地攻击修正持久化、原生动作恢复、实际攻击消耗与失败回退。
 
 维护规则：需求发生变化时先更新 `requirements.md`；技术实验产生新证据时更新 `technical-status.md` 并补充对应阶段报告；正式选定恢复路线后在 `architecture-options.md` 记录决定与理由。

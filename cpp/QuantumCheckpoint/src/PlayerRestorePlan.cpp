@@ -27,7 +27,7 @@ namespace QuantumCheckpoint
         };
         const auto deck = keys(layout.player_deck), hand = keys(layout.player_hand);
         const auto trash = keys(layout.player_trash), field = keys(layout.player_field);
-        if (layout.schema_version != 2 || !deck || !hand || !trash || !field
+        if ((layout.schema_version != 2 && layout.schema_version != 3) || !deck || !hand || !trash || !field
             || hand_limit == 0 || hand_limit > 16 || hand->size() > hand_limit
             || candidates.empty() || candidates.size() > 128)
         {

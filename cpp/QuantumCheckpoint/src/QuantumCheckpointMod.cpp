@@ -4,6 +4,7 @@
 #include "CheckpointSchema.hpp"
 #include "CheckpointPersistence.hpp"
 #include "PlayerRestorePlan.hpp"
+#include "PlayerAttackState.hpp"
 
 #include <algorithm>
 #include <array>
@@ -63,6 +64,7 @@ namespace QuantumCheckpoint
         std::atomic_bool g_move_card_probe_requested{false};
 #if defined(QUANTUM_CHECKPOINT_RUNTIME_TEST_FIXTURES)
         std::atomic_int g_player_hand_fixture_destination{-1};
+        std::atomic_int g_player_stat_fixture_action{0};
 #endif
         std::atomic_bool g_route_c_save_requested{false};
         std::atomic_bool g_route_c_load_requested{false};
@@ -209,6 +211,11 @@ namespace QuantumCheckpoint
             bool hand_staging_move_queued{}, deferred_hand_rebased{};
             std::chrono::steady_clock::time_point hand_staging_move_started_at{};
             std::string hand_staging_status{"unavailable"};
+            std::string field_attack_status{"unavailable"};
+            std::vector<PlayerAttackState> field_attack_prefix{};
+            std::optional<std::size_t> field_attack_pending_card{};
+            PlayerAttackState field_attack_before_queue{};
+            std::chrono::steady_clock::time_point field_attack_queued_at{};
         };
 
         struct PendingRouteCCapture
@@ -2701,7 +2708,7 @@ namespace QuantumCheckpoint
             {
                 return export_zero_argument_getter(controller, STR("getCardInstanceListSorted"));
             }
-            if (schema_version != 2
+            if ((schema_version != 2 && schema_version != 3)
                 || reflected_object_property(controller, STR("mCardEngine")) != card_engine)
             {
                 throw std::runtime_error{"ordered player controller is not anchored to the active CardEngine"};
@@ -2840,6 +2847,43 @@ namespace QuantumCheckpoint
             {
                 snapshot.properties.push_back({"nativeStats:readError", error.what()});
             }
+        }
+
+        auto capture_player_attack_state(UObject* card) -> PlayerAttackState
+        {
+            ObjectSnapshot observation{};
+            append_native_card_statistics(observation, card);
+            const auto property = [&](std::string_view name) -> std::string {
+                const auto found = std::find_if(observation.properties.begin(), observation.properties.end(),
+                    [&](const auto& value) { return value.name == name; });
+                if (found == observation.properties.end())
+                    throw std::runtime_error{"native field attack observation is unavailable"};
+                return found->value;
+            };
+            if (property("nativeStats:status") != "verified-native-attack")
+                throw std::runtime_error{"native field attack observation is unverified"};
+            PlayerAttackState result{};
+            result.base_attack = std::stoi(property("nativeStats:baseAttack"));
+            result.current_attack = std::stoi(property("nativeStats:currentAttack"));
+            const auto* state = read_native_value<const void*>(card, InGameCardStatePointerOffset);
+            for (const auto* entry : read_native_sparse_elements(static_cast<const std::byte*>(state) + 0x130, 0x78))
+            {
+                if (read_native_value<std::uint8_t>(entry, 8) != 1
+                    || read_native_value<std::int64_t>(entry, 0) != read_native_value<std::int64_t>(entry, 0x60))
+                    throw std::runtime_error{"field attack supplement requires ATTACK modifiers keyed by their tag"};
+                PlayerAttackModifier modifier{};
+                modifier.tag = to_string(FName{read_native_value<std::int64_t>(entry, 0x60)}.ToString());
+                modifier.amount = read_native_value<std::int32_t>(entry, 0x68);
+                modifier.limit = read_native_value<std::int32_t>(entry, 0x6C);
+                for (const auto* flag : read_native_sparse_elements(static_cast<const std::byte*>(entry) + 0x10, 12))
+                    modifier.flags |= static_cast<std::uint8_t>(1u << read_native_value<std::uint8_t>(flag, 0));
+                result.modifiers.push_back(std::move(modifier));
+            }
+            std::sort(result.modifiers.begin(), result.modifiers.end(),
+                [](const auto& a, const auto& b) { return a.tag < b.tag; });
+            std::string error{};
+            if (!validate_player_attack_state(result, error)) throw std::runtime_error{error};
+            return result;
         }
 
         auto append_private_card_state_diagnostics(ObjectSnapshot& snapshot, UObject* object) -> void
@@ -3260,6 +3304,7 @@ namespace QuantumCheckpoint
                     std::string instance{};
                     std::int32_t health{};
                     bool turn_active{};
+                    PlayerAttackState attack{};
                 };
                 std::vector<CapturedFieldCard> captured_cards{};
                 for (const auto& card : native_cards_at_location(
@@ -3288,6 +3333,7 @@ namespace QuantumCheckpoint
                             card.card, STR("getCardInfoInstance")),
                         .health = *health,
                         .turn_active = turn_active == "True",
+                        .attack = capture_player_attack_state(card.card),
                     });
                 }
                 if (captured_cards.empty())
@@ -3319,6 +3365,7 @@ namespace QuantumCheckpoint
                     objects.card_engine, zones.trash, 2, exact.schema_version);
                 exact.player_field = "(";
                 std::ostringstream states{};
+                std::vector<PlayerAttackState> attacks{};
                 for (std::size_t index{}; index < captured_cards.size(); ++index)
                 {
                     if (index != 0)
@@ -3327,6 +3374,7 @@ namespace QuantumCheckpoint
                         states << ';';
                     }
                     const auto& card = captured_cards[index];
+                    attacks.push_back(card.attack);
                     exact.player_field += card.instance;
                     states << static_cast<std::int32_t>(card.placement.row) << ','
                            << card.placement.index << ',' << card.health << ','
@@ -3334,6 +3382,7 @@ namespace QuantumCheckpoint
                 }
                 exact.player_field += ')';
                 exact.player_field_states = states.str();
+                exact.player_field_attack_states = serialize_player_attack_states(attacks);
                 exact.payload_checksum = exact_player_field_payload_checksum(exact);
                 std::string exact_validation_error{};
                 if (!validate_exact_player_field_checkpoint(
@@ -3664,6 +3713,8 @@ namespace QuantumCheckpoint
                    << json_escape(restore.exact_player_field_status) << "\",\n"
                    << "  \"exactPlayerFieldReason\": \""
                    << json_escape(restore.exact_player_field_reason) << "\",\n"
+                   << "  \"exactPlayerFieldAttackStatus\": \""
+                   << json_escape(restore.field_attack_status) << "\",\n"
                    << "  \"exactPlayerFieldTargetCount\": "
                    << restore.exact_player_field_targets.size() << ",\n"
                    << "  \"exactPlayerFieldTrashTargetCount\": "
@@ -3839,6 +3890,75 @@ namespace QuantumCheckpoint
             // releases this temporary. A borrowed pair would steal a live reference.
             write_native_value(controller, sizeof(void*), count + 1);
             return {object, controller};
+        }
+
+        auto queue_native_player_attack_modifier(UObject* engine, const NativeCardReference& card,
+                                                 const PlayerAttackModifier& modifier) -> void
+        {
+            const auto api = validated_native_move_card_api(engine);
+            if (GetCurrentThreadId() != g_game_thread_id.load(std::memory_order_acquire)
+                || !card.card || card.card->GetWorld() != engine->GetWorld()
+                || read_native_value<const void*>(card.card, InGameCardStatePointerOffset) != card.state
+                || native_card_location(api.engine_state, card.state, api.get_card_location) != 3)
+                throw std::runtime_error{"attack modifier target is not a live player FIELD card"};
+            const auto module_base = reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr));
+            const auto signature = [&](std::uintptr_t rva, const auto& bytes) {
+                const auto* address = reinterpret_cast<const std::uint8_t*>(module_base + rva);
+                if (!address_is_readable(address, bytes.size()) || !std::equal(bytes.begin(), bytes.end(), address))
+                    throw std::runtime_error{"native attack action signature changed"};
+            };
+            signature(0xE0F640, std::array<std::uint8_t,11>{0x48,0x8B,0xC4,0x53,0x48,0x81,0xEC,0xF0,0,0,0});
+            signature(0xDF87C0, std::array<std::uint8_t,13>{0x48,0x89,0x5C,0x24,0x08,0x57,0x48,0x83,0xEC,0x20,0x0F,0xB6,0x02});
+            signature(0xE3EC93, std::array<std::uint8_t,11>{0x48,0x8B,0xD0,0x48,0x8B,0xCB,0xE8,0xE2,0x06,0xFD,0xFF});
+            const auto* shared = read_native_value<const void*>(card.state, CardStateSharedObjectOffset);
+            const auto* owner = read_native_value<const void*>(card.state, CardStateSharedControllerOffset);
+            if (!shared || !owner || !address_is_writable(static_cast<const std::byte*>(card.state) + 0x130, 0x50)
+                || !address_is_writable(static_cast<const std::byte*>(owner) + 8, 4)
+                || read_native_value<std::int32_t>(owner, 8) <= 0
+                || read_native_value<std::int32_t>(owner, 8) >= 999999)
+                throw std::runtime_error{"attack action storage or ownership is unavailable"};
+            PlayerAttackState validation{0, std::max(0, modifier.amount), {modifier}};
+            std::string error{};
+            if (!validate_player_attack_state(validation, error)) throw std::runtime_error{error};
+            auto* function = card.card->GetFunctionByNameInChain(STR("Action_AddStatModifier_Visuals"));
+            auto* argument = function ? function->GetPropertyByNameInChain(STR("modifier")) : nullptr;
+            if (!argument || function->GetParmsSize() != 0x68 || !argument->HasAnyPropertyFlags(CPF_Parm))
+                throw std::runtime_error{"native attack parameter shape is unavailable"};
+            ReflectedParameterBuffer original{function};
+            if (argument->ContainerPtrToValuePtr<void>(original.bytes.data()) != original.bytes.data())
+                throw std::runtime_error{"native attack parameter offset changed"};
+            std::string flags{};
+            const std::array names{"NONE", "ONE_ATTACK", "DECAY"};
+            for (std::size_t index{}; index < names.size(); ++index)
+                if (modifier.flags & (1u << index)) { if (!flags.empty()) flags += ','; flags += names[index]; }
+            const auto value = to_wstring("(stat=ATTACK,Tag=" + modifier.tag + ",Amount="
+                + std::to_string(modifier.amount) + ",limit=" + std::to_string(modifier.limit)
+                + ",Flags=(" + flags + "))");
+            FOutputDevice errors{};
+            if (!argument->ImportText(value.c_str(), original.bytes.data(), 0, card.card, &errors))
+                throw std::runtime_error{"native attack parameter import failed"};
+            std::uint8_t imported_flags{};
+            for (const auto* flag : read_native_sparse_elements(original.bytes.data() + 8, 12))
+            {
+                const auto enum_value = read_native_value<std::uint8_t>(flag, 0);
+                if (enum_value > 2) throw std::runtime_error{"native attack flag import changed"};
+                imported_flags |= static_cast<std::uint8_t>(1u << enum_value);
+            }
+            if (read_native_value<std::uint8_t>(original.bytes.data(), 0) != 1
+                || to_string(FName{read_native_value<std::int64_t>(original.bytes.data(), 0x58)}.ToString()) != modifier.tag
+                || read_native_value<std::int32_t>(original.bytes.data(), 0x60) != modifier.amount
+                || read_native_value<std::int32_t>(original.bytes.data(), 0x64) != modifier.limit
+                || imported_flags != modifier.flags)
+                throw std::runtime_error{"native attack parameter import did not reproduce the saved modifier"};
+            // The native queue consumes both the retained target and the separate
+            // deep copy. Reflection retains ownership of the original parameter.
+            const auto target = retain_native_card_argument(shared, owner);
+            const NativeSharedPointerPair empty{};
+            alignas(16) std::array<std::uint8_t, 0x68> owned{};
+            using Copy = void* (*)(void*, const void*);
+            using Add = void (*)(const void*, const NativeSharedPointerPair*, const NativeSharedPointerPair*, void*);
+            reinterpret_cast<Copy>(module_base + 0xDF87C0)(owned.data(), original.bytes.data());
+            reinterpret_cast<Add>(module_base + 0xE0F640)(api.engine_state, &empty, &target, owned.data());
         }
 
         auto restore_field_card_effects(PendingNativeFieldMove& target) -> bool
@@ -4990,6 +5110,99 @@ namespace QuantumCheckpoint
             return false;
         }
 
+        auto verify_exact_player_field_attack(PendingRouteCRestore& restore,
+                                               const RouteCBattleObjects& objects,
+                                               std::chrono::steady_clock::time_point now) -> bool
+        {
+            if (restore.exact_player_field->schema_version < 3)
+            {
+                restore.field_attack_status = "legacy-unavailable";
+                return true;
+            }
+            try
+            {
+                std::string error{};
+                const auto desired = parse_player_attack_states(
+                    restore.exact_player_field->player_field_attack_states, error);
+                const auto placements = parse_exact_player_field_states(
+                    restore.exact_player_field->player_field_states, error);
+                if (!desired || !placements || desired->size() != placements->size())
+                    throw std::runtime_error{"saved FIELD attack records are invalid: " + error};
+                std::vector<NativeCardReference> cards{};
+                std::vector<PlayerAttackState> observed{};
+                for (const auto& placement : *placements)
+                {
+                    const auto target = std::find_if(restore.exact_player_field_targets.begin(),
+                        restore.exact_player_field_targets.end(), [&](const auto& value) {
+                            return value.row == placement.row && value.index == placement.index;
+                        });
+                    if (target == restore.exact_player_field_targets.end()
+                        || read_native_value<const void*>(target->card, InGameCardStatePointerOffset) != target->state)
+                        throw std::runtime_error{"field attack target changed after placement"};
+                    cards.push_back({target->card, target->state});
+                    observed.push_back(capture_player_attack_state(target->card));
+                }
+                if (restore.field_attack_prefix.empty())
+                {
+                    // Check every field target before the first attack write. A
+                    // reconstructed card must have its saved base and no modifiers.
+                    for (std::size_t index{}; index < desired->size(); ++index)
+                        if (observed[index].base_attack != (*desired)[index].base_attack
+                            || !observed[index].modifiers.empty())
+                            throw std::runtime_error{"fresh FIELD attack base or modifiers differ from the supported starting state"};
+                    restore.field_attack_prefix = observed;
+                    restore.field_attack_status = "applying";
+                }
+                bool waiting{};
+                for (std::size_t index{}; index < observed.size(); ++index)
+                {
+                    if (observed[index] == restore.field_attack_prefix.at(index)) continue;
+                    if (restore.field_attack_pending_card == index
+                        && observed[index] == restore.field_attack_before_queue
+                        && now - restore.field_attack_queued_at <= std::chrono::seconds{8})
+                        waiting = true;
+                    else throw std::runtime_error{"native FIELD attack changed or a queued modifier did not verify"};
+                }
+                if (waiting) return false;
+                restore.field_attack_pending_card.reset();
+                for (std::size_t index{}; index < desired->size(); ++index)
+                {
+                    auto& prefix = restore.field_attack_prefix[index];
+                    const auto& saved = (*desired)[index];
+                    if (prefix.modifiers.size() == saved.modifiers.size())
+                    {
+                        if (prefix != saved) throw std::runtime_error{"restored FIELD attack does not equal the saved state"};
+                        continue;
+                    }
+                    if (restore.field_attack_status == "verified-native-attack"
+                        || prefix.modifiers.size() > saved.modifiers.size())
+                        throw std::runtime_error{"FIELD attack modifier count changed after verification"};
+                    const auto& modifier = saved.modifiers.at(prefix.modifiers.size());
+                    restore.field_attack_before_queue = prefix;
+                    queue_native_player_attack_modifier(objects.card_engine, cards[index], modifier);
+                    prefix.modifiers.push_back(modifier);
+                    std::int64_t current = prefix.base_attack;
+                    for (const auto& item : prefix.modifiers) current += item.amount;
+                    prefix.current_attack = static_cast<std::int32_t>(std::max<std::int64_t>(0, current));
+                    restore.field_attack_pending_card = index;
+                    restore.field_attack_queued_at = now;
+                    append_route_c_trace_failure("restore.exact-player-field.attack.queued",
+                        "card=" + std::to_string(index) + " tag=" + modifier.tag);
+                    resume_native_restore_actions(objects.card_engine);
+                    return false;
+                }
+                if (restore.field_attack_status != "verified-native-attack")
+                    append_route_c_trace("restore.exact-player-field.attack.verified-native-attack");
+                restore.field_attack_status = "verified-native-attack";
+                return true;
+            }
+            catch (...)
+            {
+                restore.field_attack_status = "failed";
+                throw;
+            }
+        }
+
         auto update_exact_player_field_turn_diagnostic(PendingRouteCRestore& restore)
             -> void
         {
@@ -5262,6 +5475,7 @@ namespace QuantumCheckpoint
                 && !restore.exact_player_field_targets.empty()
                 && final_state_matches())
             {
+                if (!verify_exact_player_field_attack(restore, objects, now)) return false;
                 rollback_active_decklist();
                 restore.exact_player_field_status = "verified-position-health";
                 append_route_c_trace(
@@ -5789,6 +6003,7 @@ namespace QuantumCheckpoint
                 {
                     return false;
                 }
+                if (!verify_exact_player_field_attack(restore, objects, now)) return false;
                 rollback_active_decklist();
                 restore.exact_player_field_status = "verified-position-health";
                 append_route_c_trace(
@@ -10066,6 +10281,128 @@ namespace QuantumCheckpoint
         // Compiled out of production. A fixture uses the same validated native
         // queue as restoration, but intentionally does not undo its test setup.
         // Inventory exports, not the queued report, prove the resulting state.
+
+        auto run_player_stat_fixture(bool clear) -> void
+        {
+            std::string status{"refused"}, reason{}, card_id{}, before{}, tag{};
+            try
+            {
+                const auto objects = find_route_c_objects();
+                // A bounded negative test may clear only our probe modifiers
+                // during the final observation window. Normal fixture injection
+                // remains unavailable while any restore is running.
+                const bool stability_clear = clear && g_pending_route_c_restore
+                    && g_pending_route_c_restore->phase == RouteCRestorePhase::AwaitingPostRestoreStability
+                    && g_pending_route_c_restore->field_attack_status == "verified-native-attack";
+                if ((g_pending_route_c_restore && !stability_clear) || g_pending_route_c_capture
+                    || g_pending_route_c_fallback || g_pending_move_card_probe
+                    || g_pending_health_write_probe || g_pending_turn_write_probe
+                    || g_pending_battle_turn_write_probe || g_pending_draw_delay_write_probe
+                    || required_text(export_property_text(objects.card_engine, STR("currentGameState")), "state") != "OPEN"
+                    || required_text(export_property_text(objects.card_engine, STR("mActiveCardPlacementPrompt")), "prompt") != "None"
+                    || required_text(export_property_text(objects.card_engine, STR("mActiveCardSelectionPrompt")), "selection") != "None"
+                    || !address_is_readable(objects.card_engine, 0x415)
+                    || read_native_value<std::uint8_t>(objects.card_engine, 0x414) != 0)
+                    throw std::runtime_error{"stat fixture requires an idle OPEN battle without probes"};
+                const auto api = validated_native_move_card_api(objects.card_engine);
+                if (!native_cards_at_location(objects.card_engine, api, 4).empty())
+                    throw std::runtime_error{"stat fixture requires an empty PENDING zone"};
+                std::vector<NativeCardReference> apples{};
+                for (const auto& card : native_cards_at_location(objects.card_engine, api, 3))
+                    if (required_getter_text(card.card, STR("getTag")) == "naturalApple") apples.push_back(card);
+                if (apples.size() != 1) throw std::runtime_error{"stat fixture requires exactly one field apple"};
+                const auto card = apples.front();
+                ObjectSnapshot observation{};
+                append_native_card_statistics(observation, card.card);
+                const auto property = [&](std::string_view name) {
+                    const auto found = std::find_if(observation.properties.begin(), observation.properties.end(),
+                        [&](const auto& value) { return value.name == name; });
+                    if (found == observation.properties.end()) throw std::runtime_error{"fixture statistics are unavailable"};
+                    return found->value;
+                };
+                if (property("nativeStats:status") != "verified-native-attack"
+                    || property("nativeStats:baseAttack") != "2")
+                    throw std::runtime_error{"fixture requires an observed base-2 apple"};
+                before = property("nativeStats:modifiers");
+                const std::string first = "key=quantumCheckpointProbe,tag=quantumCheckpointProbe,stat=1,amount=3,limit=-1,flags=";
+                const std::string second = "key=quantumCheckpointProbeFlags,tag=quantumCheckpointProbeFlags,stat=1,amount=2,limit=-1,flags=1,2,";
+                if ((!clear && !before.empty() && before != first)
+                    || (clear && before != first && before != first + ';' + second))
+                    throw std::runtime_error{"fixture refuses existing non-probe modifiers or an unexpected probe state"};
+                const auto module_base = reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr));
+                const auto signature = [&](std::uintptr_t rva, const auto& bytes) {
+                    const auto* address = reinterpret_cast<const std::uint8_t*>(module_base + rva);
+                    if (!address_is_readable(address, bytes.size()) || !std::equal(bytes.begin(), bytes.end(), address))
+                        throw std::runtime_error{"native stat fixture signature changed"};
+                };
+                signature(0xE0F640, std::array<std::uint8_t,11>{0x48,0x8B,0xC4,0x53,0x48,0x81,0xEC,0xF0,0,0,0});
+                signature(0xE13F30, std::array<std::uint8_t,8>{0x48,0x8B,0xC4,0x53,0x48,0x83,0xEC,0x60});
+                signature(0xDF87C0, std::array<std::uint8_t,13>{0x48,0x89,0x5C,0x24,0x08,0x57,0x48,0x83,0xEC,0x20,0x0F,0xB6,0x02});
+                signature(0xE3FE96, std::array<std::uint8_t,7>{0x48,0x8D,0x8B,0x30,0x01,0,0});
+                signature(0xE3EC93, std::array<std::uint8_t,11>{0x48,0x8B,0xD0,0x48,0x8B,0xCB,0xE8,0xE2,0x06,0xFD,0xFF});
+                const auto* shared = read_native_value<const void*>(card.state, CardStateSharedObjectOffset);
+                const auto* owner = read_native_value<const void*>(card.state, CardStateSharedControllerOffset);
+                if (!address_is_writable(static_cast<const std::byte*>(card.state) + 0x130, 0x50)
+                    || !address_is_writable(static_cast<const std::byte*>(owner) + 8, 4)
+                    || read_native_value<std::int32_t>(owner, 8) >= 999999)
+                    throw std::runtime_error{"stat fixture target storage or ownership is not writable"};
+                card_id = required_getter_text(card.card, STR("getId"));
+                const NativeSharedPointerPair empty{};
+                if (clear)
+                {
+                    using Clear = void (*)(const void*, const NativeSharedPointerPair*, const NativeSharedPointerPair*);
+                    const auto target = retain_native_card_argument(shared, owner);
+                    reinterpret_cast<Clear>(module_base + 0xE13F30)(api.engine_state, &empty, &target);
+                }
+                else
+                {
+                    auto* function = card.card->GetFunctionByNameInChain(STR("Action_AddStatModifier_Visuals"));
+                    auto* argument = function ? function->GetPropertyByNameInChain(STR("modifier")) : nullptr;
+                    if (!argument || function->GetParmsSize() != 0x68 || !argument->HasAnyPropertyFlags(CPF_Parm))
+                        throw std::runtime_error{"native stat parameter shape is unavailable"};
+                    ReflectedParameterBuffer original{function};
+                    if (argument->ContainerPtrToValuePtr<void>(original.bytes.data()) != original.bytes.data())
+                        throw std::runtime_error{"native stat parameter offset changed"};
+                    tag = before.empty() ? "quantumCheckpointProbe" : "quantumCheckpointProbeFlags";
+                    const auto value = to_wstring("(stat=ATTACK,Tag=" + tag + ",Amount="
+                        + (before.empty() ? "3" : "2") + ",limit=-1"
+                        + (before.empty() ? ")" : ",Flags=(ONE_ATTACK,DECAY))"));
+                    FOutputDevice errors{};
+                    if (!argument->ImportText(value.c_str(), original.bytes.data(), 0, card.card, &errors))
+                        throw std::runtime_error{"native stat parameter import failed"};
+                    const auto flags = read_native_sparse_elements(original.bytes.data() + 8, 12);
+                    if (read_native_value<std::uint8_t>(original.bytes.data(), 0) != 1
+                        || flags.size() != (before.empty() ? 0 : 2))
+                        throw std::runtime_error{"native stat parameter import did not produce requested flags"};
+                    // Build a separate owning copy with the game's constructor.
+                    // E0F640 destroys this by-value copy; reflection owns original.
+                    alignas(16) std::array<std::uint8_t, 0x68> owned{};
+                    using Copy = void* (*)(void*, const void*);
+                    reinterpret_cast<Copy>(module_base + 0xDF87C0)(owned.data(), original.bytes.data());
+                    using Add = void (*)(const void*, const NativeSharedPointerPair*, const NativeSharedPointerPair*, void*);
+                    const auto target = retain_native_card_argument(shared, owner);
+                    reinterpret_cast<Add>(module_base + 0xE0F640)(api.engine_state, &empty, &target, owned.data());
+                }
+                status = "queued";
+                resume_native_restore_actions(objects.card_engine);
+                reason = "native stat action queued; inventory and later clear must independently verify completion";
+            }
+            catch (const std::exception& error) { reason = error.what(); }
+            const auto directory = std::filesystem::path{UE4SSProgram::get_program().get_mods_directory()}
+                / STR("QuantumCheckpoint") / STR("Reports");
+            std::filesystem::create_directories(directory);
+            std::ostringstream output{};
+            output << "{\n  \"kind\": \"development-player-stat-fixture\",\n"
+                   << "  \"capturedAtUtc\": \"" << json_escape(utc_timestamp()) << "\",\n"
+                   << "  \"status\": \"" << json_escape(status) << "\",\n"
+                   << "  \"reason\": \"" << json_escape(reason) << "\",\n"
+                   << "  \"clear\": " << (clear ? "true" : "false") << ",\n"
+                   << "  \"cardId\": \"" << json_escape(card_id) << "\",\n"
+                   << "  \"beforeModifiers\": \"" << json_escape(before) << "\",\n"
+                   << "  \"queuedTag\": \"" << json_escape(tag) << "\"\n}\n";
+            write_file_atomically(directory / (STR("stat-fixture-") + to_wstring(filename_timestamp()) + STR(".json")), output.str());
+        }
+
         auto run_player_hand_fixture(std::uint8_t destination) -> void
         {
             std::string status{"queued"}, reason{}, before{};
@@ -10148,9 +10485,9 @@ namespace QuantumCheckpoint
         QuantumCheckpointMod()
         {
             ModName = STR("QuantumCheckpoint");
-            ModVersion = STR("0.23.0");
+            ModVersion = STR("0.24.0");
 #if defined(QUANTUM_CHECKPOINT_RUNTIME_TEST_FIXTURES)
-            ModVersion = STR("0.23.0-test-fixtures");
+            ModVersion = STR("0.24.0-test-fixtures");
 #endif
             ModDescription = STR("Route C checkpoint with optional exact-state supplements");
             ModAuthors = STR("zaofenMachine and contributors");
@@ -10244,6 +10581,12 @@ namespace QuantumCheckpoint
             UE4SSProgram::get_program().register_keydown_event(
                 Input::Key::F4, {Input::ModifierKey::CONTROL, Input::ModifierKey::SHIFT},
                 []() { g_player_hand_fixture_destination.store(0, std::memory_order_release); });
+            UE4SSProgram::get_program().register_keydown_event(
+                Input::Key::INS, {Input::ModifierKey::CONTROL, Input::ModifierKey::SHIFT},
+                []() { g_player_stat_fixture_action.store(1, std::memory_order_release); });
+            UE4SSProgram::get_program().register_keydown_event(
+                Input::Key::F2, {Input::ModifierKey::CONTROL, Input::ModifierKey::SHIFT},
+                []() { g_player_stat_fixture_action.store(2, std::memory_order_release); });
             Output::send<LogLevel::Warning>(STR("[QuantumCheckpoint] DEVELOPMENT BUILD: Ctrl+Shift+F3 returns HAND to DECK, F4 fills HAND, F10 sends HAND to TRASH in a disposable battle.\n"));
 #endif
             Output::send<LogLevel::Verbose>(
@@ -10505,6 +10848,9 @@ namespace QuantumCheckpoint
                 }
 
 #if defined(QUANTUM_CHECKPOINT_RUNTIME_TEST_FIXTURES)
+                const auto stat_fixture = g_player_stat_fixture_action.exchange(0, std::memory_order_acq_rel);
+                if (stat_fixture && g_unreal_ready.load(std::memory_order_acquire))
+                    run_player_stat_fixture(stat_fixture == 2);
                 const auto fixture_destination = g_player_hand_fixture_destination.exchange(-1, std::memory_order_acq_rel);
                 if (fixture_destination >= 0 && g_unreal_ready.load(std::memory_order_acquire))
                     run_player_hand_fixture(static_cast<std::uint8_t>(fixture_destination));

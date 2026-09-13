@@ -94,6 +94,7 @@ namespace
         -> QuantumCheckpoint::ExactPlayerFieldCheckpoint
     {
         return {
+            .schema_version = 2,
             .captured_at_utc = route_c.captured_at_utc,
             .route_c_payload_checksum = route_c.payload_checksum,
             .game_executable_sha256 = route_c.game_executable_sha256,
@@ -1024,6 +1025,39 @@ int main()
     require(!parse_exact_turn_progress_checkpoint(
                 serialize_exact_turn_progress_checkpoint(excessive_wave_alert), error),
             "excessive wave-alert counter is rejected");
+
+    auto attack_source = sample_checkpoint();
+    attack_source.payload_checksum = route_c_payload_checksum(attack_source);
+    auto field_with_attacks = sample_exact_player_field(attack_source);
+    field_with_attacks.schema_version = 3;
+    field_with_attacks.player_field_attack_states = "2,5|springBuff,3,-1,0;1,3|once,2,-1,2";
+    const auto field_attack_json = serialize_exact_player_field_checkpoint(field_with_attacks);
+    const auto parsed_field_attacks = parse_exact_player_field_checkpoint(field_attack_json, error);
+    require(parsed_field_attacks && parsed_field_attacks->schema_version == 3
+                && parsed_field_attacks->player_field_attack_states == field_with_attacks.player_field_attack_states,
+            "schema-3 field attack modifiers round trip aligned with saved field cards");
+    auto missing_attack_record = field_with_attacks;
+    missing_attack_record.player_field_attack_states = "2,5|springBuff,3,-1,0";
+    require(!parse_exact_player_field_checkpoint(serialize_exact_player_field_checkpoint(missing_attack_record), error),
+            "field attack record count must match field cards");
+    auto incorrect_attack_value = field_with_attacks;
+    incorrect_attack_value.player_field_attack_states = "2,8|springBuff,3,-1,0;1,3|once,2,-1,2";
+    require(!parse_exact_player_field_checkpoint(serialize_exact_player_field_checkpoint(incorrect_attack_value), error),
+            "a valid checksum cannot authorize an inconsistent attack value");
+    auto attack_tampering = field_attack_json;
+    attack_tampering.replace(attack_tampering.find("springBuff"), 10, "springBoff");
+    require(!parse_exact_player_field_checkpoint(attack_tampering, error), "field modifier tag is covered by checksum");
+    auto missing_attack_property = field_attack_json;
+    const auto property_begin = missing_attack_property.find("  \"playerFieldAttackStates\"");
+    missing_attack_property.erase(property_begin, missing_attack_property.find('\n', property_begin) - property_begin + 1);
+    require(!parse_exact_player_field_checkpoint(missing_attack_property, error), "schema-3 field requires attack property");
+    const auto field_v2_json = serialize_exact_player_field_checkpoint(sample_exact_player_field(attack_source));
+    require(field_v2_json.find("playerFieldAttackStates") == std::string::npos
+                && parse_exact_player_field_checkpoint(field_v2_json, error)->schema_version == 2,
+            "schema-2 field remains readable without newer attack claims");
+    auto disguised_attack_property = field_v2_json;
+    disguised_attack_property.insert(disguised_attack_property.rfind('}'), ",\"playerFieldAttackStates\":\"2,2;1,1\"");
+    require(!parse_exact_player_field_checkpoint(disguised_attack_property, error), "legacy field cannot carry unchecked attack records");
 
     std::cout << "Route C checkpoint persistence tests passed\n";
     return 0;
