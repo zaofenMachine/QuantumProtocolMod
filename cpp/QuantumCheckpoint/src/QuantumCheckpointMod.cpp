@@ -5161,7 +5161,9 @@ namespace QuantumCheckpoint
                         && observed[index] == restore.field_attack_before_queue
                         && now - restore.field_attack_queued_at <= std::chrono::seconds{8})
                         waiting = true;
-                    else throw std::runtime_error{"native FIELD attack changed or a queued modifier did not verify"};
+                    else throw std::runtime_error{"native FIELD attack changed or a queued modifier did not verify: card="
+                        + std::to_string(index) + " expected=" + serialize_player_attack_states({restore.field_attack_prefix.at(index)})
+                        + " observed=" + serialize_player_attack_states({observed[index]})};
                 }
                 if (waiting) return false;
                 restore.field_attack_pending_card.reset();
@@ -5177,10 +5179,13 @@ namespace QuantumCheckpoint
                     if (restore.field_attack_status == "verified-native-attack"
                         || prefix.modifiers.size() > saved.modifiers.size())
                         throw std::runtime_error{"FIELD attack modifier count changed after verification"};
-                    const auto& modifier = saved.modifiers.at(prefix.modifiers.size());
+                    const auto order = player_attack_restore_order(saved);
+                    const auto& modifier = saved.modifiers.at(order.at(prefix.modifiers.size()));
                     restore.field_attack_before_queue = prefix;
                     queue_native_player_attack_modifier(objects.card_engine, cards[index], modifier);
                     prefix.modifiers.push_back(modifier);
+                    std::sort(prefix.modifiers.begin(), prefix.modifiers.end(),
+                        [](const auto& a, const auto& b) { return a.tag < b.tag; });
                     std::int64_t current = prefix.base_attack;
                     for (const auto& item : prefix.modifiers) current += item.amount;
                     prefix.current_attack = static_cast<std::int32_t>(std::max<std::int64_t>(0, current));
@@ -10282,6 +10287,63 @@ namespace QuantumCheckpoint
         // queue as restoration, but intentionally does not undo its test setup.
         // Inventory exports, not the queued report, prove the resulting state.
 
+        auto run_player_attack_lifecycle_fixture(int profile) -> void
+        {
+            std::string status{"refused"}, reason{}, before{}, queued{};
+            try
+            {
+                const auto objects = find_route_c_objects();
+                if (g_pending_route_c_restore || g_pending_route_c_capture || g_pending_route_c_fallback
+                    || g_pending_move_card_probe || g_pending_health_write_probe || g_pending_turn_write_probe
+                    || g_pending_battle_turn_write_probe || g_pending_draw_delay_write_probe
+                    || required_text(export_property_text(objects.card_engine, STR("currentGameState")), "state") != "OPEN"
+                    || required_text(export_property_text(objects.card_engine, STR("mActiveCardPlacementPrompt")), "prompt") != "None"
+                    || required_text(export_property_text(objects.card_engine, STR("mActiveCardSelectionPrompt")), "selection") != "None"
+                    || !address_is_readable(objects.card_engine, 0x415)
+                    || read_native_value<std::uint8_t>(objects.card_engine, 0x414) != 0)
+                    throw std::runtime_error{"attack lifecycle fixture requires an idle OPEN battle"};
+                const auto api = validated_native_move_card_api(objects.card_engine);
+                const auto field = native_cards_at_location(objects.card_engine, api, 3);
+                if (field.size() != 1 || required_getter_text(field[0].card, STR("getTag")) != "naturalApple"
+                    || !native_cards_at_location(objects.card_engine, api, 4).empty())
+                    throw std::runtime_error{"attack lifecycle fixture requires a sole field apple and empty PENDING"};
+                const auto observed = capture_player_attack_state(field[0].card);
+                before = serialize_player_attack_states({observed});
+                if (observed.base_attack != 2) throw std::runtime_error{"fixture apple base attack differs"};
+                PlayerAttackModifier modifier{};
+                if (profile == 3 && before == "2,2")
+                    modifier = {"zQuantumPositive",3,-1,0};
+                else if (profile == 3 && before == "2,5|zQuantumPositive,3,-1,0")
+                    modifier = {"aQuantumNegative",-4,-1,0};
+                else if (profile == 3 && before == "2,1|aQuantumNegative,-4,-1,0|zQuantumPositive,3,-1,0")
+                    modifier = {"aQuantumNegative",-2,-1,0};
+                else if (profile == 4 && before == "2,2")
+                    modifier = {"quantumDecay",3,-1,4};
+                else if (profile == 5 && (before == "2,2" || before == "2,4|quantumLimit,2,3,0"))
+                    modifier = {"quantumLimit",2,3,0};
+                else throw std::runtime_error{"fixture profile refuses unexpected existing modifiers"};
+                queued = modifier.tag;
+                queue_native_player_attack_modifier(objects.card_engine, field[0], modifier);
+                status = "queued";
+                resume_native_restore_actions(objects.card_engine);
+                reason = "native lifecycle action queued; observe its normalized result separately";
+            }
+            catch (const std::exception& error) { reason = error.what(); }
+            const auto directory = std::filesystem::path{UE4SSProgram::get_program().get_mods_directory()}
+                / STR("QuantumCheckpoint") / STR("Reports");
+            std::filesystem::create_directories(directory);
+            std::ostringstream report{};
+            report << "{\n  \"kind\": \"development-player-attack-lifecycle-fixture\",\n"
+                   << "  \"capturedAtUtc\": \"" << json_escape(utc_timestamp()) << "\",\n"
+                   << "  \"status\": \"" << json_escape(status) << "\",\n"
+                   << "  \"reason\": \"" << json_escape(reason) << "\",\n"
+                   << "  \"profile\": " << profile << ",\n"
+                   << "  \"before\": \"" << json_escape(before) << "\",\n"
+                   << "  \"queuedTag\": \"" << json_escape(queued) << "\"\n}\n";
+            write_file_atomically(directory / (STR("attack-lifecycle-fixture-")
+                + to_wstring(filename_timestamp()) + STR(".json")), report.str());
+        }
+
         auto run_player_stat_fixture(bool clear) -> void
         {
             std::string status{"refused"}, reason{}, card_id{}, before{}, tag{};
@@ -10485,7 +10547,7 @@ namespace QuantumCheckpoint
         QuantumCheckpointMod()
         {
             ModName = STR("QuantumCheckpoint");
-            ModVersion = STR("0.24.0");
+            ModVersion = STR("0.25.0");
 #if defined(QUANTUM_CHECKPOINT_RUNTIME_TEST_FIXTURES)
             ModVersion = STR("0.24.0-test-fixtures");
 #endif
@@ -10587,6 +10649,15 @@ namespace QuantumCheckpoint
             UE4SSProgram::get_program().register_keydown_event(
                 Input::Key::F2, {Input::ModifierKey::CONTROL, Input::ModifierKey::SHIFT},
                 []() { g_player_stat_fixture_action.store(2, std::memory_order_release); });
+            UE4SSProgram::get_program().register_keydown_event(
+                static_cast<Input::Key>(36), {Input::ModifierKey::CONTROL, Input::ModifierKey::SHIFT},
+                []() { g_player_stat_fixture_action.store(3, std::memory_order_release); });
+            UE4SSProgram::get_program().register_keydown_event(
+                static_cast<Input::Key>(35), {Input::ModifierKey::CONTROL, Input::ModifierKey::SHIFT},
+                []() { g_player_stat_fixture_action.store(4, std::memory_order_release); });
+            UE4SSProgram::get_program().register_keydown_event(
+                static_cast<Input::Key>(33), {Input::ModifierKey::CONTROL, Input::ModifierKey::SHIFT},
+                []() { g_player_stat_fixture_action.store(5, std::memory_order_release); });
             Output::send<LogLevel::Warning>(STR("[QuantumCheckpoint] DEVELOPMENT BUILD: Ctrl+Shift+F3 returns HAND to DECK, F4 fills HAND, F10 sends HAND to TRASH in a disposable battle.\n"));
 #endif
             Output::send<LogLevel::Verbose>(
@@ -10850,7 +10921,10 @@ namespace QuantumCheckpoint
 #if defined(QUANTUM_CHECKPOINT_RUNTIME_TEST_FIXTURES)
                 const auto stat_fixture = g_player_stat_fixture_action.exchange(0, std::memory_order_acq_rel);
                 if (stat_fixture && g_unreal_ready.load(std::memory_order_acquire))
-                    run_player_stat_fixture(stat_fixture == 2);
+                {
+                    if (stat_fixture >= 3) run_player_attack_lifecycle_fixture(stat_fixture);
+                    else run_player_stat_fixture(stat_fixture == 2);
+                }
                 const auto fixture_destination = g_player_hand_fixture_destination.exchange(-1, std::memory_order_acq_rel);
                 if (fixture_destination >= 0 && g_unreal_ready.load(std::memory_order_acquire))
                     run_player_hand_fixture(static_cast<std::uint8_t>(fixture_destination));

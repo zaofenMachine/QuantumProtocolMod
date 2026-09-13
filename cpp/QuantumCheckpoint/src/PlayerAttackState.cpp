@@ -74,6 +74,16 @@ namespace QuantumCheckpoint
         return true;
     }
 
+    auto player_attack_restore_order(const PlayerAttackState& state) -> std::vector<std::size_t>
+    {
+        std::vector<std::size_t> order{};
+        for (std::size_t index{}; index < state.modifiers.size(); ++index) order.push_back(index);
+        std::stable_sort(order.begin(), order.end(), [&](auto a, auto b) {
+            return (state.modifiers[a].amount < 0) < (state.modifiers[b].amount < 0);
+        });
+        return order;
+    }
+
     auto serialize_player_attack_states(const std::vector<PlayerAttackState>& states) -> std::string
     {
         std::string result{};

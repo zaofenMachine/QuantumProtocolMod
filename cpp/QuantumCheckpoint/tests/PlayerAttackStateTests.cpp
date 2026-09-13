@@ -1,4 +1,5 @@
 #include "PlayerAttackState.hpp"
+#include <algorithm>
 #include <cstdlib>
 #include <iostream>
 
@@ -26,5 +27,20 @@ int main()
     std::vector<PlayerAttackState> too_many(11, PlayerAttackState{2,2,{}});
     require(!parse_player_attack_states(serialize_player_attack_states(too_many), error), "more than ten field slots rejected");
     require(!parse_player_attack_states(std::string(65537, '0'), error), "oversized attack record rejected");
+    const auto mixed = parse_player_attack_states("2,1|aNegative,-4,-1,0|zPositive,3,-1,0", error);
+    require(mixed.has_value(), "captured positive/negative combination is valid");
+    const auto order = player_attack_restore_order(mixed->front());
+    require(order == std::vector<std::size_t>{1,0}, "positive replay precedes lexically earlier negative tag");
+    const auto replay = [&](const auto& indices) {
+        auto current = mixed->front().base_attack;
+        for (const auto index : indices) current = std::max(0, current + mixed->front().modifiers[index].amount);
+        return current;
+    };
+    require(replay(std::vector<std::size_t>{0,1}) == 3 && replay(order) == 1,
+            "replay prevents per-action zero clamping from destroying a saved negative modifier");
+    const PlayerAttackState several{2,3,{{"a",-2,-1,0},{"b",0,-1,0},{"c",4,-1,0},{"d",-1,-1,0}}};
+    require(player_attack_restore_order(several) == std::vector<std::size_t>{1,2,0,3},
+            "mixed replay preserves deterministic order within sign groups");
+    require(player_attack_restore_order(PlayerAttackState{2,2,{}}).empty(), "empty attack table needs no actions");
     std::cout << "Player attack state tests passed\n";
 }

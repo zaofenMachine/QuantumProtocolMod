@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <cstddef>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -27,6 +28,9 @@ namespace QuantumCheckpoint
     };
 
     auto validate_player_attack_state(const PlayerAttackState& state, std::string& error) -> bool;
+    // Native add normalizes negative modifiers immediately. Replay non-negative
+    // entries first so a valid later buff cannot arrive after a debuff was clipped.
+    auto player_attack_restore_order(const PlayerAttackState& state) -> std::vector<std::size_t>;
     // Field cards remain aligned with the existing row/index ordered field list.
     // Each record: base,current|tag,amount,limit,flagMask[|...];next card.
     auto serialize_player_attack_states(const std::vector<PlayerAttackState>& states) -> std::string;
