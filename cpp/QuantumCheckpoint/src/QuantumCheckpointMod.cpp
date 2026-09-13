@@ -5,6 +5,7 @@
 #include "CheckpointPersistence.hpp"
 #include "PlayerRestorePlan.hpp"
 #include "PlayerAttackState.hpp"
+#include "PlayerHealthState.hpp"
 
 #include <algorithm>
 #include <array>
@@ -216,6 +217,14 @@ namespace QuantumCheckpoint
             std::optional<std::size_t> field_attack_pending_card{};
             PlayerAttackState field_attack_before_queue{};
             std::chrono::steady_clock::time_point field_attack_queued_at{};
+            std::string field_health_status{"unavailable"};
+            std::vector<PlayerHealthState> field_health_prefix{};
+            std::vector<std::int32_t> field_health_expected_current{};
+            std::optional<std::size_t> field_health_pending_card{};
+            PlayerHealthState field_health_before_queue{};
+            std::int32_t field_health_current_before_queue{};
+            std::chrono::steady_clock::time_point field_health_queued_at{};
+            bool field_health_values_written{};
         };
 
         struct PendingRouteCCapture
@@ -2708,7 +2717,7 @@ namespace QuantumCheckpoint
             {
                 return export_zero_argument_getter(controller, STR("getCardInstanceListSorted"));
             }
-            if ((schema_version != 2 && schema_version != 3)
+            if ((schema_version < 2 || schema_version > ExactPlayerFieldSchemaVersion)
                 || reflected_object_property(controller, STR("mCardEngine")) != card_engine)
             {
                 throw std::runtime_error{"ordered player controller is not anchored to the active CardEngine"};
@@ -2918,7 +2927,37 @@ namespace QuantumCheckpoint
             catch (const std::exception& error) { snapshot.properties.push_back({"nativeHealth:readError",error.what()}); }
         }
 
-        auto capture_player_attack_state(UObject* card) -> PlayerAttackState
+        // Call only after a native observer has validated the state owner and layout.
+        auto decode_player_stat_modifiers(const void* state, std::uint8_t wanted, bool allow_health)
+            -> std::vector<PlayerStatModifier>
+        {
+            std::vector<PlayerStatModifier> all{}, selected{};
+            for (const auto* entry : read_native_sparse_elements(static_cast<const std::byte*>(state) + 0x130, 0x78))
+            {
+                const auto stat = read_native_value<std::uint8_t>(entry, 8);
+                if ((stat != 1 && !(allow_health && stat == 2))
+                    || read_native_value<std::int64_t>(entry, 0) != read_native_value<std::int64_t>(entry, 0x60))
+                    throw std::runtime_error{"field stat table contains an unsupported stat or a key/tag mismatch"};
+                PlayerStatModifier modifier{};
+                modifier.tag = to_string(FName{read_native_value<std::int64_t>(entry, 0x60)}.ToString());
+                modifier.amount = read_native_value<std::int32_t>(entry, 0x68);
+                modifier.limit = read_native_value<std::int32_t>(entry, 0x6C);
+                for (const auto* flag : read_native_sparse_elements(static_cast<const std::byte*>(entry) + 0x10, 12))
+                {
+                    const auto value = read_native_value<std::uint8_t>(flag, 0);
+                    if (value > 2) throw std::runtime_error{"field stat flag is outside the supported enum"};
+                    modifier.flags |= static_cast<std::uint8_t>(1u << value);
+                }
+                all.push_back(modifier);
+                if (stat == wanted) selected.push_back(std::move(modifier));
+            }
+            std::string error{};
+            if (!validate_player_stat_modifiers(all,error)) throw std::runtime_error{error};
+            std::sort(selected.begin(),selected.end(),[](const auto& a,const auto& b) { return a.tag < b.tag; });
+            return selected;
+        }
+
+        auto capture_player_attack_state(UObject* card, bool allow_health = false) -> PlayerAttackState
         {
             ObjectSnapshot observation{};
             append_native_card_statistics(observation, card);
@@ -2935,23 +2974,32 @@ namespace QuantumCheckpoint
             result.base_attack = std::stoi(property("nativeStats:baseAttack"));
             result.current_attack = std::stoi(property("nativeStats:currentAttack"));
             const auto* state = read_native_value<const void*>(card, InGameCardStatePointerOffset);
-            for (const auto* entry : read_native_sparse_elements(static_cast<const std::byte*>(state) + 0x130, 0x78))
-            {
-                if (read_native_value<std::uint8_t>(entry, 8) != 1
-                    || read_native_value<std::int64_t>(entry, 0) != read_native_value<std::int64_t>(entry, 0x60))
-                    throw std::runtime_error{"field attack supplement requires ATTACK modifiers keyed by their tag"};
-                PlayerAttackModifier modifier{};
-                modifier.tag = to_string(FName{read_native_value<std::int64_t>(entry, 0x60)}.ToString());
-                modifier.amount = read_native_value<std::int32_t>(entry, 0x68);
-                modifier.limit = read_native_value<std::int32_t>(entry, 0x6C);
-                for (const auto* flag : read_native_sparse_elements(static_cast<const std::byte*>(entry) + 0x10, 12))
-                    modifier.flags |= static_cast<std::uint8_t>(1u << read_native_value<std::uint8_t>(flag, 0));
-                result.modifiers.push_back(std::move(modifier));
-            }
-            std::sort(result.modifiers.begin(), result.modifiers.end(),
-                [](const auto& a, const auto& b) { return a.tag < b.tag; });
+            result.modifiers = decode_player_stat_modifiers(state,1,allow_health);
             std::string error{};
             if (!validate_player_attack_state(result, error)) throw std::runtime_error{error};
+            return result;
+        }
+
+        auto capture_player_health_state(UObject* card) -> PlayerHealthState
+        {
+            ObjectSnapshot observation{};
+            append_native_card_health_statistics(observation,card);
+            const auto property = [&](std::string_view name) -> std::string {
+                const auto found = std::find_if(observation.properties.begin(),observation.properties.end(),
+                    [&](const auto& value) { return value.name == name; });
+                if (found == observation.properties.end()) throw std::runtime_error{"native field health observation is unavailable"};
+                return found->value;
+            };
+            if (property("nativeHealth:status") != "verified-native-health"
+                || property("nativeHealth:maxHealthAdjustment") != "0")
+                throw std::runtime_error{"field health requires verified native getters and zero independent adjustment"};
+            PlayerHealthState result{};
+            result.base_health = std::stoi(property("nativeHealth:baseHealth"));
+            result.max_health = std::stoi(property("nativeHealth:maxHealth"));
+            const auto* state = read_native_value<const void*>(card,InGameCardStatePointerOffset);
+            result.modifiers = decode_player_stat_modifiers(state,2,true);
+            std::string error{};
+            if (!validate_player_health_state(result,error)) throw std::runtime_error{error};
             return result;
         }
 
@@ -3374,6 +3422,7 @@ namespace QuantumCheckpoint
                     std::int32_t health{};
                     bool turn_active{};
                     PlayerAttackState attack{};
+                    PlayerHealthState health_state{};
                 };
                 std::vector<CapturedFieldCard> captured_cards{};
                 for (const auto& card : native_cards_at_location(
@@ -3402,7 +3451,8 @@ namespace QuantumCheckpoint
                             card.card, STR("getCardInfoInstance")),
                         .health = *health,
                         .turn_active = turn_active == "True",
-                        .attack = capture_player_attack_state(card.card),
+                        .attack = capture_player_attack_state(card.card,true),
+                        .health_state = capture_player_health_state(card.card),
                     });
                 }
                 if (captured_cards.empty())
@@ -3435,6 +3485,7 @@ namespace QuantumCheckpoint
                 exact.player_field = "(";
                 std::ostringstream states{};
                 std::vector<PlayerAttackState> attacks{};
+                std::vector<PlayerHealthState> health_states{};
                 for (std::size_t index{}; index < captured_cards.size(); ++index)
                 {
                     if (index != 0)
@@ -3444,6 +3495,7 @@ namespace QuantumCheckpoint
                     }
                     const auto& card = captured_cards[index];
                     attacks.push_back(card.attack);
+                    health_states.push_back(card.health_state);
                     exact.player_field += card.instance;
                     states << static_cast<std::int32_t>(card.placement.row) << ','
                            << card.placement.index << ',' << card.health << ','
@@ -3452,6 +3504,7 @@ namespace QuantumCheckpoint
                 exact.player_field += ')';
                 exact.player_field_states = states.str();
                 exact.player_field_attack_states = serialize_player_attack_states(attacks);
+                exact.player_field_health_states = serialize_player_health_states(health_states);
                 exact.payload_checksum = exact_player_field_payload_checksum(exact);
                 std::string exact_validation_error{};
                 if (!validate_exact_player_field_checkpoint(
@@ -3784,6 +3837,8 @@ namespace QuantumCheckpoint
                    << json_escape(restore.exact_player_field_reason) << "\",\n"
                    << "  \"exactPlayerFieldAttackStatus\": \""
                    << json_escape(restore.field_attack_status) << "\",\n"
+                   << "  \"exactPlayerFieldHealthStatus\": \""
+                   << json_escape(restore.field_health_status) << "\",\n"
                    << "  \"exactPlayerFieldTargetCount\": "
                    << restore.exact_player_field_targets.size() << ",\n"
                    << "  \"exactPlayerFieldTrashTargetCount\": "
@@ -3989,9 +4044,8 @@ namespace QuantumCheckpoint
                 || read_native_value<std::int32_t>(owner, 8) <= 0
                 || read_native_value<std::int32_t>(owner, 8) >= 999999)
                 throw std::runtime_error{"attack action storage or ownership is unavailable"};
-            PlayerAttackState validation{0, std::max(0, modifier.amount), {modifier}};
             std::string error{};
-            if (!validate_player_attack_state(validation, error)) throw std::runtime_error{error};
+            if (!validate_player_stat_modifiers({modifier}, error)) throw std::runtime_error{error};
             auto* function = card.card->GetFunctionByNameInChain(STR("Action_AddStatModifier_Visuals"));
             auto* argument = function ? function->GetPropertyByNameInChain(STR("modifier")) : nullptr;
             if (!argument || function->GetParmsSize() != 0x68 || !argument->HasAnyPropertyFlags(CPF_Parm))
@@ -5213,7 +5267,7 @@ namespace QuantumCheckpoint
                         || read_native_value<const void*>(target->card, InGameCardStatePointerOffset) != target->state)
                         throw std::runtime_error{"field attack target changed after placement"};
                     cards.push_back({target->card, target->state});
-                    observed.push_back(capture_player_attack_state(target->card));
+                    observed.push_back(capture_player_attack_state(target->card,restore.exact_player_field->schema_version >= 4));
                 }
                 if (restore.field_attack_prefix.empty())
                 {
@@ -5277,6 +5331,141 @@ namespace QuantumCheckpoint
             catch (...)
             {
                 restore.field_attack_status = "failed";
+                throw;
+            }
+        }
+
+        auto verify_exact_player_field_health(PendingRouteCRestore& restore,
+                                               const RouteCBattleObjects& objects,
+                                               std::chrono::steady_clock::time_point now) -> bool
+        {
+            if (restore.exact_player_field->schema_version < 4)
+            {
+                restore.field_health_status = "legacy-unavailable";
+                return true;
+            }
+            try
+            {
+                std::string error{};
+                const auto desired = parse_player_health_states(
+                    restore.exact_player_field->player_field_health_states, error);
+                const auto placements = parse_exact_player_field_states(
+                    restore.exact_player_field->player_field_states, error);
+                if (!desired || !placements || desired->size() != placements->size())
+                    throw std::runtime_error{"saved FIELD health records are invalid: " + error};
+                std::vector<NativeCardReference> cards{};
+                std::vector<PlayerHealthState> observed{};
+                std::vector<std::int32_t> current{};
+                for (const auto& placement : *placements)
+                {
+                    const auto target = std::find_if(restore.exact_player_field_targets.begin(),
+                        restore.exact_player_field_targets.end(), [&](const auto& value) {
+                            return value.row == placement.row && value.index == placement.index;
+                        });
+                    if (target == restore.exact_player_field_targets.end()
+                        || read_native_value<const void*>(target->card, InGameCardStatePointerOffset) != target->state)
+                        throw std::runtime_error{"field health target changed after placement"};
+                    cards.push_back({target->card, target->state});
+                    observed.push_back(capture_player_health_state(target->card));
+                    const auto value = read_native_value<std::int32_t>(target->state, CardStateCurrentHealthOffset);
+                    const auto public_value = parse_int32(required_getter_text(target->card, STR("getCurrentHealth")));
+                    if (value <= 0 || value > 100000 || !public_value || value != *public_value
+                        || !address_is_writable(static_cast<const std::byte*>(target->state)
+                            + CardStateCurrentHealthOffset, sizeof(std::int32_t)))
+                        throw std::runtime_error{"field current health did not pass native getter/write validation"};
+                    current.push_back(value);
+                }
+                if (restore.field_health_prefix.empty())
+                {
+                    // Preflight all HEALTH targets after ATTACK has verified, before
+                    // adding any health modifier. Independent max-health adjustments
+                    // are rejected by capture_player_health_state.
+                    for (std::size_t index{}; index < desired->size(); ++index)
+                        if (observed[index].base_health != (*desired)[index].base_health
+                            || observed[index].max_health != observed[index].base_health
+                            || !observed[index].modifiers.empty())
+                            throw std::runtime_error{"fresh FIELD health base or modifiers differ from the supported starting state"};
+                    restore.field_health_prefix = observed;
+                    restore.field_health_expected_current = current;
+                    restore.field_health_status = "applying";
+                }
+                bool waiting{};
+                for (std::size_t index{}; index < observed.size(); ++index)
+                {
+                    if (observed[index] == restore.field_health_prefix.at(index)
+                        && current[index] == restore.field_health_expected_current.at(index)) continue;
+                    if (restore.field_health_pending_card == index
+                        && observed[index] == restore.field_health_before_queue
+                        && current[index] == restore.field_health_current_before_queue
+                        && now - restore.field_health_queued_at <= std::chrono::seconds{8})
+                        waiting = true;
+                    else throw std::runtime_error{"native FIELD health changed or a queued modifier did not verify: card="
+                        + std::to_string(index) + " expected=" + serialize_player_health_states({restore.field_health_prefix.at(index)})
+                        + " observed=" + serialize_player_health_states({observed[index]})
+                        + " expectedCurrent=" + std::to_string(restore.field_health_expected_current.at(index))
+                        + " observedCurrent=" + std::to_string(current[index])};
+                }
+                if (waiting) return false;
+                restore.field_health_pending_card.reset();
+                for (std::size_t index{}; index < desired->size(); ++index)
+                {
+                    auto& prefix = restore.field_health_prefix[index];
+                    const auto& saved = (*desired)[index];
+                    if (prefix.modifiers.size() == saved.modifiers.size())
+                    {
+                        if (prefix != saved) throw std::runtime_error{"restored FIELD health does not equal the saved state"};
+                        continue;
+                    }
+                    if (restore.field_health_values_written || prefix.modifiers.size() > saved.modifiers.size())
+                        throw std::runtime_error{"FIELD health modifier count changed after verification"};
+                    const auto order = player_stat_restore_order(saved.modifiers);
+                    const auto& modifier = saved.modifiers.at(order.at(prefix.modifiers.size()));
+                    restore.field_health_before_queue = prefix;
+                    restore.field_health_current_before_queue = current[index];
+                    queue_native_player_stat_modifier(objects.card_engine, cards[index], modifier, 2);
+                    prefix.modifiers.push_back(modifier);
+                    std::sort(prefix.modifiers.begin(), prefix.modifiers.end(),
+                        [](const auto& a, const auto& b) { return a.tag < b.tag; });
+                    std::int64_t maximum = prefix.base_health;
+                    for (const auto& item : prefix.modifiers) maximum += item.amount;
+                    prefix.max_health = static_cast<std::int32_t>(maximum);
+                    // Native positive HEALTH additions raise current health and cap
+                    // it at the new maximum. Negative additions leave it unchanged.
+                    if (modifier.amount > 0)
+                        restore.field_health_expected_current[index] = static_cast<std::int32_t>(
+                            std::min<std::int64_t>(current[index] + static_cast<std::int64_t>(modifier.amount), maximum));
+                    restore.field_health_pending_card = index;
+                    restore.field_health_queued_at = now;
+                    append_route_c_trace_failure("restore.exact-player-field.health.queued",
+                        "card=" + std::to_string(index) + " tag=" + modifier.tag);
+                    resume_native_restore_actions(objects.card_engine);
+                    return false;
+                }
+                if (!restore.field_health_values_written)
+                {
+                    // The caller has verified this setter's executable signature.
+                    const auto module_base = reinterpret_cast<std::uintptr_t>(GetModuleHandleW(L"Quantum-Win64-Shipping.exe"));
+                    const auto setter = reinterpret_cast<SetCurrentHealthFunction>(module_base + SetCurrentHealthRva);
+                    for (std::size_t index{}; index < cards.size(); ++index)
+                    {
+                        const auto health = (*placements)[index].current_health;
+                        setter(cards[index].state, health);
+                        const auto public_value = parse_int32(required_getter_text(cards[index].card, STR("getCurrentHealth")));
+                        if (!public_value || *public_value != health
+                            || read_native_value<std::int32_t>(cards[index].state, CardStateCurrentHealthOffset) != health)
+                            throw std::runtime_error{"final FIELD current health did not verify after native setter"};
+                        restore.field_health_expected_current[index] = health;
+                    }
+                    restore.field_health_values_written = true;
+                }
+                if (restore.field_health_status != "verified-native-health")
+                    append_route_c_trace("restore.exact-player-field.health.verified-native-health");
+                restore.field_health_status = "verified-native-health";
+                return true;
+            }
+            catch (...)
+            {
+                restore.field_health_status = "failed";
                 throw;
             }
         }
@@ -5537,8 +5726,8 @@ namespace QuantumCheckpoint
                             != (*expected_states)[index].row
                         || observed[index].placement.index
                             != (*expected_states)[index].index
-                        || observed[index].health
-                            != (*expected_states)[index].current_health
+                        || ((restore.exact_player_field->schema_version < 4 || restore.field_health_values_written)
+                            && observed[index].health != (*expected_states)[index].current_health)
                         || observed[index].turn_active
                             != (*expected_states)[index].turn_active)
                     {
@@ -5554,6 +5743,7 @@ namespace QuantumCheckpoint
                 && final_state_matches())
             {
                 if (!verify_exact_player_field_attack(restore, objects, now)) return false;
+                if (!verify_exact_player_field_health(restore, objects, now)) return false;
                 rollback_active_decklist();
                 restore.exact_player_field_status = "verified-position-health";
                 append_route_c_trace(
@@ -5910,7 +6100,7 @@ namespace QuantumCheckpoint
                     const auto target_health =
                         (*expected_states)[saved_index].current_health;
                     if (base_health <= 0 || target_health <= 0
-                        || target_health > base_health)
+                        || (restore.exact_player_field->schema_version < 3 && target_health > base_health))
                     {
                         throw std::runtime_error{
                             "saved field-card health exceeded the live card base health"};
@@ -6028,16 +6218,19 @@ namespace QuantumCheckpoint
                     return fail_after_write(
                         "card effect list could not be restored after native play");
                 }
-                set_current_health(target.state, target.target_health);
-                const auto private_health = read_native_value<std::int32_t>(
-                    target.state, CardStateCurrentHealthOffset);
-                const auto public_health = parse_int32(required_getter_text(
-                    target.card, STR("getCurrentHealth")));
-                if (private_health != target.target_health || !public_health
-                    || *public_health != target.target_health)
+                if (restore.exact_player_field->schema_version < 4)
                 {
-                    return fail_after_write(
-                        "field-card current health did not verify after native setter");
+                    set_current_health(target.state, target.target_health);
+                    const auto private_health = read_native_value<std::int32_t>(
+                        target.state, CardStateCurrentHealthOffset);
+                    const auto public_health = parse_int32(required_getter_text(
+                        target.card, STR("getCurrentHealth")));
+                    if (private_health != target.target_health || !public_health
+                        || *public_health != target.target_health)
+                    {
+                        return fail_after_write(
+                            "field-card current health did not verify after native setter");
+                    }
                 }
                 const auto desired_turn_active = static_cast<std::uint8_t>(
                     target.target_turn_active ? 1 : 0);
@@ -6082,6 +6275,7 @@ namespace QuantumCheckpoint
                     return false;
                 }
                 if (!verify_exact_player_field_attack(restore, objects, now)) return false;
+                if (!verify_exact_player_field_health(restore, objects, now)) return false;
                 rollback_active_decklist();
                 restore.exact_player_field_status = "verified-position-health";
                 append_route_c_trace(
@@ -10367,7 +10561,12 @@ namespace QuantumCheckpoint
             try
             {
                 const auto objects = find_route_c_objects();
-                if (g_pending_route_c_restore || g_pending_route_c_capture || g_pending_route_c_fallback
+                // In development builds, profile 6 may perturb only the known
+                // health fixture during final stability, exercising health-only drift.
+                const bool stability_health = profile == 6 && g_pending_route_c_restore
+                    && g_pending_route_c_restore->phase == RouteCRestorePhase::AwaitingPostRestoreStability
+                    && g_pending_route_c_restore->field_health_status == "verified-native-health";
+                if ((g_pending_route_c_restore && !stability_health) || g_pending_route_c_capture || g_pending_route_c_fallback
                     || g_pending_move_card_probe || g_pending_health_write_probe || g_pending_turn_write_probe
                     || g_pending_battle_turn_write_probe || g_pending_draw_delay_write_probe
                     || required_text(export_property_text(objects.card_engine, STR("currentGameState")), "state") != "OPEN"
@@ -10381,7 +10580,7 @@ namespace QuantumCheckpoint
                 if (field.size() != 1 || required_getter_text(field[0].card, STR("getTag")) != "naturalApple"
                     || !native_cards_at_location(objects.card_engine, api, 4).empty())
                     throw std::runtime_error{"attack lifecycle fixture requires a sole field apple and empty PENDING"};
-                const auto observed = capture_player_attack_state(field[0].card);
+                const auto observed = capture_player_attack_state(field[0].card, profile >= 6);
                 before = serialize_player_attack_states({observed});
                 if (observed.base_attack != 2) throw std::runtime_error{"fixture apple base attack differs"};
                 PlayerAttackModifier modifier{};
@@ -10395,14 +10594,19 @@ namespace QuantumCheckpoint
                     modifier = {"quantumDecay",3,-1,4};
                 else if (profile == 5 && (before == "2,2" || before == "2,4|quantumLimit,2,3,0"))
                     modifier = {"quantumLimit",2,3,0};
-                else if ((profile == 6 || profile == 7) && before == "2,2")
+                else if ((profile == 6 || profile == 7)
+                    && (before == "2,2" || before == "2,5|quantumCheckpointProbe,3,-1,0"))
                 {
-                    if (read_native_value<std::int32_t>(field[0].state, 0x118) != 2
-                        || read_native_value<std::int32_t>(field[0].state, 0x11C) != 2
-                        || read_native_value<std::int32_t>(field[0].state, 0x120) != 0)
-                        throw std::runtime_error{"health fixture requires an unmodified full-health apple"};
-                    modifier = {profile == 6 ? "quantumHealth" : "quantumHealthDecay",3,-1,
-                        static_cast<std::uint8_t>(profile == 6 ? 0 : 4)};
+                    const auto health = capture_player_health_state(field[0].card);
+                    const auto serialized = serialize_player_health_states({health});
+                    if (serialized == "2,2"
+                        && read_native_value<std::int32_t>(field[0].state, 0x11C) == 2)
+                        modifier = {profile == 6 ? "quantumHealth" : "quantumHealthDecay",3,-1,
+                            static_cast<std::uint8_t>(profile == 6 ? 0 : 4)};
+                    else if (profile == 6 && serialized == "2,5|quantumHealth,3,-1,0"
+                        && read_native_value<std::int32_t>(field[0].state, 0x11C) == 5)
+                        modifier = {"aQuantumHealthNegative",-4,-1,0};
+                    else throw std::runtime_error{"health fixture refuses unexpected health state"};
                 }
                 else throw std::runtime_error{"fixture profile refuses unexpected existing modifiers"};
                 queued = modifier.tag;
@@ -10631,7 +10835,7 @@ namespace QuantumCheckpoint
         QuantumCheckpointMod()
         {
             ModName = STR("QuantumCheckpoint");
-            ModVersion = STR("0.26.0");
+            ModVersion = STR("0.27.0");
 #if defined(QUANTUM_CHECKPOINT_RUNTIME_TEST_FIXTURES)
             ModVersion = STR("0.24.0-test-fixtures");
 #endif

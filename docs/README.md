@@ -46,3 +46,5 @@
 - [phase-25-native-player-health.md](phase-25-native-player-health.md)：有效生命上限、独立比较与生命修正衰减后保留超额当前生命。
 
 维护规则：需求发生变化时先更新 `requirements.md`；技术实验产生新证据时更新 `technical-status.md` 并补充对应阶段报告；正式选定恢复路线后在 `architecture-options.md` 记录决定与理由。
+
+- [phase-26-player-field-health.md](phase-26-player-field-health.md)：场地生命修正、攻击与生命联合恢复、衰减及高于上限的当前生命。

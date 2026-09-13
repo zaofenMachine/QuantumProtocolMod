@@ -43,29 +43,41 @@ namespace QuantumCheckpoint
         }
     }
 
-    auto validate_player_attack_state(const PlayerAttackState& state, std::string& error) -> bool
+    auto validate_player_stat_modifiers(const std::vector<PlayerStatModifier>& modifiers, std::string& error) -> bool
     {
         error.clear();
-        if (state.base_attack < 0 || state.base_attack > 100000
-            || state.current_attack < 0 || state.current_attack > 100000 || state.modifiers.size() > 32)
+        if (modifiers.size() > 32)
         {
-            error = "player attack state exceeds supported scalar or modifier bounds";
+            error = "player stat table exceeds 32 modifiers";
             return false;
         }
         std::set<std::string> keys{};
-        std::int64_t computed = state.base_attack;
-        for (const auto& modifier : state.modifiers)
+        for (const auto& modifier : modifiers)
         {
             const auto key = ascii_key(modifier.tag);
             if (!key || !keys.insert(*key).second || modifier.amount < -100000 || modifier.amount > 100000
                 || modifier.limit < -1 || modifier.limit > 100000 || modifier.flags > 7
                 || (modifier.limit > 0 && modifier.amount > modifier.limit))
             {
-                error = "player attack modifier has an invalid tag, duplicate FName, amount, limit, or flags";
+                error = "player stat modifier has an invalid tag, duplicate FName, amount, limit, or flags";
                 return false;
             }
-            computed += modifier.amount;
         }
+        return true;
+    }
+
+    auto validate_player_attack_state(const PlayerAttackState& state, std::string& error) -> bool
+    {
+        error.clear();
+        if (state.base_attack < 0 || state.base_attack > 100000
+            || state.current_attack < 0 || state.current_attack > 100000)
+        {
+            error = "player attack state exceeds supported scalar bounds";
+            return false;
+        }
+        if (!validate_player_stat_modifiers(state.modifiers, error)) return false;
+        std::int64_t computed = state.base_attack;
+        for (const auto& modifier : state.modifiers) computed += modifier.amount;
         if (std::max<std::int64_t>(0, computed) != state.current_attack)
         {
             error = "player attack value disagrees with base and saved modifiers";
@@ -76,10 +88,15 @@ namespace QuantumCheckpoint
 
     auto player_attack_restore_order(const PlayerAttackState& state) -> std::vector<std::size_t>
     {
+        return player_stat_restore_order(state.modifiers);
+    }
+
+    auto player_stat_restore_order(const std::vector<PlayerStatModifier>& modifiers) -> std::vector<std::size_t>
+    {
         std::vector<std::size_t> order{};
-        for (std::size_t index{}; index < state.modifiers.size(); ++index) order.push_back(index);
+        for (std::size_t index{}; index < modifiers.size(); ++index) order.push_back(index);
         std::stable_sort(order.begin(), order.end(), [&](auto a, auto b) {
-            return (state.modifiers[a].amount < 0) < (state.modifiers[b].amount < 0);
+            return (modifiers[a].amount < 0) < (modifiers[b].amount < 0);
         });
         return order;
     }

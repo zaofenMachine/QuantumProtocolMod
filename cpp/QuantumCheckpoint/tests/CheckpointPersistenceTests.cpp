@@ -1059,6 +1059,35 @@ int main()
     disguised_attack_property.insert(disguised_attack_property.rfind('}'), ",\"playerFieldAttackStates\":\"2,2;1,1\"");
     require(!parse_exact_player_field_checkpoint(disguised_attack_property, error), "legacy field cannot carry unchecked attack records");
 
+    auto field_with_health = field_with_attacks;
+    field_with_health.schema_version = 4;
+    field_with_health.player_field_health_states = "2,5|health,3,-1,4;2,2";
+    const auto health_json = serialize_exact_player_field_checkpoint(field_with_health);
+    const auto parsed_health = parse_exact_player_field_checkpoint(health_json,error);
+    require(parsed_health && parsed_health->schema_version == 4
+                && parsed_health->player_field_health_states == field_with_health.player_field_health_states,
+            "schema-4 health modifiers round trip beside attack modifiers");
+    field_with_health.player_field_states = "0,0,5,0;1,3,2,1";
+    field_with_health.player_field_health_states = "2,2;2,2";
+    require(parse_exact_player_field_checkpoint(serialize_exact_player_field_checkpoint(field_with_health),error).has_value(),
+            "native current card health above effective maximum remains representable");
+    field_with_health.player_field_health_states = "2,5|SPRINGBUFF,3,-1,0;2,2";
+    require(!parse_exact_player_field_checkpoint(serialize_exact_player_field_checkpoint(field_with_health),error),
+            "attack and health modifiers cannot collide in the same FName table");
+    field_with_health.player_field_health_states = "2,2";
+    require(!parse_exact_player_field_checkpoint(serialize_exact_player_field_checkpoint(field_with_health),error),
+            "health records must align with all field slots");
+    auto health_tampering = health_json;
+    health_tampering.replace(health_tampering.find("health,3"),8,"health,2");
+    require(!parse_exact_player_field_checkpoint(health_tampering,error),"health modifier data is integrity checked");
+    auto missing_health_property = health_json;
+    const auto health_begin = missing_health_property.find("  \"playerFieldHealthStates\"");
+    missing_health_property.erase(health_begin,missing_health_property.find('\n',health_begin)-health_begin+1);
+    require(!parse_exact_player_field_checkpoint(missing_health_property,error),"schema-4 health record is mandatory");
+    auto disguised_health_property = field_attack_json;
+    disguised_health_property.insert(disguised_health_property.rfind('}'),",\"playerFieldHealthStates\":\"2,2;2,2\"");
+    require(!parse_exact_player_field_checkpoint(disguised_health_property,error),"schema-3 cannot carry unchecked health records");
+
     std::cout << "Route C checkpoint persistence tests passed\n";
     return 0;
 }

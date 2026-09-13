@@ -1,5 +1,6 @@
 #include "CheckpointPersistence.hpp"
 #include "PlayerAttackState.hpp"
+#include "PlayerHealthState.hpp"
 
 #include <algorithm>
 #include <array>
@@ -2055,6 +2056,8 @@ namespace QuantumCheckpoint
         append_hash_bytes(hash, checkpoint.player_field_states);
         if (checkpoint.schema_version >= 3)
             append_hash_bytes(hash, checkpoint.player_field_attack_states);
+        if (checkpoint.schema_version >= 4)
+            append_hash_bytes(hash, checkpoint.player_field_health_states);
 
         std::ostringstream output{};
         output << std::hex << std::uppercase << std::setw(16) << std::setfill('0') << hash;
@@ -2092,6 +2095,9 @@ namespace QuantumCheckpoint
         if (checkpoint.schema_version >= 3)
             output << "  \"playerFieldAttackStates\": \""
                    << json_escape(checkpoint.player_field_attack_states) << "\",\n";
+        if (checkpoint.schema_version >= 4)
+            output << "  \"playerFieldHealthStates\": \""
+                   << json_escape(checkpoint.player_field_health_states) << "\",\n";
         output << "  \"payloadChecksum\": \"" << checkpoint.payload_checksum << "\"\n"
                << "}\n";
         return output.str();
@@ -2100,7 +2106,7 @@ namespace QuantumCheckpoint
     auto validate_exact_player_field_checkpoint(
         const ExactPlayerFieldCheckpoint& checkpoint, std::string& error) -> bool
     {
-        if (checkpoint.schema_version != 1 && checkpoint.schema_version != 2
+        if (checkpoint.schema_version != 1 && checkpoint.schema_version != 2 && checkpoint.schema_version != 3
             && checkpoint.schema_version != ExactPlayerFieldSchemaVersion)
         {
             error = "unsupported exact player-field schema version";
@@ -2168,6 +2174,27 @@ namespace QuantumCheckpoint
             error = "legacy player-field schema cannot claim attack modifier coverage";
             return false;
         }
+        if (checkpoint.schema_version >= 4)
+        {
+            const auto health = parse_player_health_states(checkpoint.player_field_health_states, array_error);
+            const auto attack = parse_player_attack_states(checkpoint.player_field_attack_states, array_error);
+            if (!health || !attack || health->size() != field->size())
+            {
+                error = "exact player-field health states are invalid or misaligned: " + array_error;
+                return false;
+            }
+            for (std::size_t index{}; index < health->size(); ++index)
+            {
+                auto all_modifiers = (*attack)[index].modifiers;
+                all_modifiers.insert(all_modifiers.end(),(*health)[index].modifiers.begin(),(*health)[index].modifiers.end());
+                if (!validate_player_stat_modifiers(all_modifiers, error)) return false;
+            }
+        }
+        else if (!checkpoint.player_field_health_states.empty())
+        {
+            error = "legacy player-field schema cannot claim health modifier coverage";
+            return false;
+        }
         if (deck->size() + hand->size() + trash->size() + field->size() > 128)
         {
             error = "exact player-field capture exceeds 128 cards";
@@ -2231,7 +2258,7 @@ namespace QuantumCheckpoint
         do { auto value = required_integer<Type>(*values, JsonName, error); if (!value) return std::nullopt; checkpoint.Field = *value; } while (false)
 
         READ_FIELD_INTEGER(schema_version, "schemaVersion", int);
-        if (checkpoint.schema_version != 1 && checkpoint.schema_version != 2
+        if (checkpoint.schema_version != 1 && checkpoint.schema_version != 2 && checkpoint.schema_version != 3
             && checkpoint.schema_version != ExactPlayerFieldSchemaVersion)
         {
             error = "unsupported exact player-field schema version";
@@ -2256,6 +2283,15 @@ namespace QuantumCheckpoint
         else if (values->contains("playerFieldAttackStates"))
         {
             error = "legacy player-field JSON contains a newer attack record";
+            return std::nullopt;
+        }
+        if (checkpoint.schema_version >= 4)
+        {
+            READ_FIELD_STRING(player_field_health_states, "playerFieldHealthStates");
+        }
+        else if (values->contains("playerFieldHealthStates"))
+        {
+            error = "legacy player-field JSON contains a newer health record";
             return std::nullopt;
         }
         READ_FIELD_STRING(payload_checksum, "payloadChecksum");
