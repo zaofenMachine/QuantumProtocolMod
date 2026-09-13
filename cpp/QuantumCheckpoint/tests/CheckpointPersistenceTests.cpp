@@ -340,9 +340,18 @@ int main()
     legacy_trash.schema_version = 1;
     const auto parsed_legacy_trash = parse_exact_player_trash_checkpoint(
         serialize_exact_player_trash_checkpoint(legacy_trash), error);
-    require(parsed_trash->schema_version == 2 && parsed_legacy_trash
+    require(parsed_trash->schema_version == 3 && parsed_legacy_trash
                 && parsed_legacy_trash->schema_version == 1,
             "legacy trash is read without claiming native order");
+    auto native_v2_trash = trash;
+    native_v2_trash.schema_version = 2;
+    const auto parsed_v2_trash = parse_exact_player_trash_checkpoint(
+        serialize_exact_player_trash_checkpoint(native_v2_trash),error);
+    require(parsed_v2_trash && parsed_v2_trash->schema_version == 2
+                && parsed_v2_trash->player_trash == trash.player_trash,
+            "schema-2 native trash remains readable with its original collection policy");
+    require(exact_player_trash_payload_checksum(native_v2_trash) != exact_player_trash_payload_checksum(trash),
+            "schema-3 generated-card collection policy changes the trash checksum");
 
     const auto card_array = [](std::initializer_list<std::string_view> tags) {
         std::string result{"("};
@@ -583,6 +592,17 @@ int main()
                 generated_trash,generated_field,error,true,&additional_card_count).has_value(),
             "schema-6 also retains the ordinary complete active multiset");
     require(additional_card_count == 0,"ordinary startup requires no extra-card normalization");
+    const auto generated_all_trash = card_array({"naturalApple","naturalApple","naturalSpring"});
+    require(!exact_player_trash_startup_decklist(generated_active,"()",generated_hand,
+                generated_all_trash,error),"legacy trash startup refuses an additional Apple");
+    require(exact_player_trash_startup_decklist(generated_active,"()",generated_hand,
+                generated_all_trash,error,true,&additional_card_count).has_value() && additional_card_count == 1,
+            "schema-3 trash can restore one generated Apple after FIELD is empty");
+    require(exact_player_trash_startup_decklist(generated_active,card_array({"genericBattery"}),"()",
+                card_array({"naturalApple","naturalApple","naturalApple","naturalSpring"}),error,true,&additional_card_count).has_value()
+                && additional_card_count == 1,"generated trash retains empty-hand support and exact native order");
+    require(!exact_player_trash_startup_decklist(generated_active,"()",generated_hand,"()",error,true,&additional_card_count)
+                && additional_card_count == 0,"invalid empty trash clears the previous generated-card count");
     require(field_startup->find("cardName=\"naturalApple\"")
                 < field_startup->find("cardName=\"naturalLemon\""),
             "player-field startup preserves placement order below the saved hand");

@@ -3274,6 +3274,23 @@ namespace QuantumCheckpoint
             return std::move(value->value);
         }
 
+        auto validate_generated_off_field_statistics(UObject* engine,const NativeMoveCardApi& api) -> void
+        {
+            // Generated-card schemas persist dynamic stats only for FIELD.
+            for (const auto location : {0,1,2})
+                for (const auto& card : native_cards_at_location(engine,api,location))
+                {
+                    const auto attack = capture_player_attack_state(card.card,true);
+                    const auto health = capture_player_health_state(card.card);
+                    const auto counters = capture_player_counter_state(card.card);
+                    if (!attack.modifiers.empty() || attack.current_attack != attack.base_attack
+                        || !health.modifiers.empty() || health.max_health != health.base_health
+                        || parse_int32(required_getter_text(card.card,STR("getCurrentHealth"))) != health.base_health
+                        || counters.generic != 0 || !counters.special.empty())
+                        throw std::runtime_error{"generated-card restore requires default off-field player statistics"};
+                }
+        }
+
         auto capture_route_c_checkpoint(std::optional<PendingRouteCCapture> expected = std::nullopt)
             -> std::filesystem::path
         {
@@ -3535,15 +3552,17 @@ namespace QuantumCheckpoint
                 {
                     throw std::runtime_error{exact_validation_error};
                 }
+                std::size_t generated_count{};
                 if (!exact_player_trash_startup_decklist(
                         checkpoint.active_decklist,
                         exact.player_deck,
                         exact.player_hand,
                         exact.player_trash,
-                        exact_validation_error))
+                        exact_validation_error,exact.schema_version >= 3,&generated_count))
                 {
                     throw std::runtime_error{exact_validation_error};
                 }
+                if (generated_count != 0) validate_generated_off_field_statistics(objects.card_engine,api);
                 exact_player_trash = std::move(exact);
                 append_route_c_trace("capture.exact-player-trash.prepare.complete");
             }
@@ -3686,21 +3705,7 @@ namespace QuantumCheckpoint
                 }
                 if (generated_count != 0)
                 {
-                    // This schema stores dynamic stats only for FIELD. A copied
-                    // card that retains buffs in another zone cannot be inferred
-                    // from its CardInfoInstance alone.
-                    for (const auto location : {0,1,2})
-                        for (const auto& card : native_cards_at_location(objects.card_engine,api.location,location))
-                        {
-                            const auto attack = capture_player_attack_state(card.card,true);
-                            const auto health_state = capture_player_health_state(card.card);
-                            const auto counters = capture_player_counter_state(card.card);
-                            if (!attack.modifiers.empty() || attack.current_attack != attack.base_attack
-                                || !health_state.modifiers.empty() || health_state.max_health != health_state.base_health
-                                || parse_int32(required_getter_text(card.card,STR("getCurrentHealth"))) != health_state.base_health
-                                || counters.generic != 0 || !counters.special.empty())
-                                throw std::runtime_error{"generated-card restore requires default off-field player statistics"};
-                        }
+                    validate_generated_off_field_statistics(objects.card_engine,api.location);
                 }
                 exact_player_field = std::move(exact);
                 append_route_c_trace("capture.exact-player-field.prepare.complete");
@@ -4676,7 +4681,7 @@ namespace QuantumCheckpoint
                     exact_player_trash->player_deck,
                     exact_player_trash->player_hand,
                     exact_player_trash->player_trash,
-                    fixed_order_error);
+                    fixed_order_error,exact_player_trash->schema_version >= 3,&generated_player_card_count);
                 if (fixed_order)
                 {
                     startup_decklist = std::move(*fixed_order);
@@ -4831,7 +4836,7 @@ namespace QuantumCheckpoint
                 .exact_turn_progress_status = exact_turn_progress_available
                     ? "pending" : "unavailable",
                 .exact_turn_progress_reason = std::move(exact_turn_progress_reason),
-                .generated_player_card_count = exact_player_field_available ? generated_player_card_count : 0,
+                .generated_player_card_count = (exact_player_field_available || exact_player_trash_available) ? generated_player_card_count : 0,
                 .semantic_fallback = semantic_only,
                 .fallback_reason = std::move(fallback_reason),
             });
@@ -4860,9 +4865,11 @@ namespace QuantumCheckpoint
                                                     std::int32_t maximum) -> void
         {
             const auto desired = restore.checkpoint.player_max_health;
-            if (restore.generated_player_card_count != 1 || !restore.exact_player_field
-                || restore.exact_player_field->schema_version < 6
-                || restore.exact_player_field_status != "verified-position-health"
+            const bool field_ready = restore.exact_player_field && restore.exact_player_field->schema_version >= 6
+                && restore.exact_player_field_status == "verified-position-health";
+            const bool trash_ready = !restore.exact_player_field && restore.exact_player_trash
+                && restore.exact_player_trash->schema_version >= 3 && restore.exact_player_trash_status == "verified";
+            if (restore.generated_player_card_count != 1 || (!field_ready && !trash_ready)
                 || !restore.active_decklist_restored_after_exact_startup
                 || restore.generated_startup_max_health_normalized
                 || maximum != desired + 1 || current < 1 || current > maximum)
@@ -4907,8 +4914,14 @@ namespace QuantumCheckpoint
                 throw std::runtime_error{"generated startup maximum-health normalization failed its native preflight"};
             std::size_t total_cards{};
             std::string array_error;
-            for (const auto* zone : {&restore.exact_player_field->player_deck,&restore.exact_player_field->player_hand,
-                                    &restore.exact_player_field->player_trash,&restore.exact_player_field->player_field})
+            std::vector<const std::string*> source_zones;
+            if (field_ready)
+                source_zones = {&restore.exact_player_field->player_deck,&restore.exact_player_field->player_hand,
+                                &restore.exact_player_field->player_trash,&restore.exact_player_field->player_field};
+            else
+                source_zones = {&restore.exact_player_trash->player_deck,&restore.exact_player_trash->player_hand,
+                                &restore.exact_player_trash->player_trash};
+            for (const auto* zone : source_zones)
             {
                 const auto cards = split_route_c_unreal_array(*zone,array_error);
                 if (!cards) throw std::runtime_error{array_error};
@@ -11401,9 +11414,9 @@ namespace QuantumCheckpoint
         QuantumCheckpointMod()
         {
             ModName = STR("QuantumCheckpoint");
-            ModVersion = STR("0.31.0");
+            ModVersion = STR("0.32.0");
 #if defined(QUANTUM_CHECKPOINT_RUNTIME_TEST_FIXTURES)
-            ModVersion = STR("0.31.0-test-fixtures");
+            ModVersion = STR("0.32.0-test-fixtures");
 #endif
             ModDescription = STR("Route C checkpoint with optional exact-state supplements");
             ModAuthors = STR("zaofenMachine and contributors");

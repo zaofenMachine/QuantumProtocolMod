@@ -17,7 +17,7 @@ namespace QuantumCheckpoint
     inline constexpr int ExactPlayerZonesSchemaVersion = 2;
     inline constexpr std::string_view ExactPlayerZonesCheckpointKind =
         "route-c-exact-player-zones";
-    inline constexpr int ExactPlayerTrashSchemaVersion = 2;
+    inline constexpr int ExactPlayerTrashSchemaVersion = 3;
     inline constexpr std::string_view ExactPlayerTrashCheckpointKind =
         "route-c-exact-player-trash";
     inline constexpr int ExactPlayerFieldSchemaVersion = 6;

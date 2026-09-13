@@ -985,10 +985,13 @@ namespace QuantumCheckpoint
                                              std::string_view player_deck,
                                              std::string_view player_hand,
                                              std::string_view player_trash,
-                                             std::string& error)
+                                             std::string& error,
+                                             bool allow_single_generated_apple,
+                                             std::size_t* additional_card_count)
         -> std::optional<std::string>
     {
         error.clear();
+        if (additional_card_count) *additional_card_count = 0;
         auto deck = split_route_c_unreal_array(player_deck, error);
         if (!deck)
         {
@@ -1027,7 +1030,7 @@ namespace QuantumCheckpoint
         }
         staged_deck += ')';
         return exact_player_zones_startup_decklist(
-            active_decklist, staged_deck, player_hand, error);
+            active_decklist, staged_deck, player_hand, error, allow_single_generated_apple, additional_card_count);
     }
 
     auto exact_player_trash_staging_matches(std::string_view expected_deck,
@@ -1906,6 +1909,7 @@ namespace QuantumCheckpoint
                                                 std::string& error) -> bool
     {
         if (checkpoint.schema_version != 1
+            && checkpoint.schema_version != 2
             && checkpoint.schema_version != ExactPlayerTrashSchemaVersion)
         {
             error = "unsupported exact player-trash schema version";
@@ -2031,6 +2035,7 @@ namespace QuantumCheckpoint
 
         READ_TRASH_INTEGER(schema_version, "schemaVersion", int);
         if (checkpoint.schema_version != 1
+            && checkpoint.schema_version != 2
             && checkpoint.schema_version != ExactPlayerTrashSchemaVersion)
         {
             error = "unsupported exact player-trash schema version";

@@ -52,3 +52,5 @@
 - [phase-27-native-player-counters.md](phase-27-native-player-counters.md)：原生计数器来源、逐标签观测、同总量差异和零／负值样本。
 
 - [phase-30-generated-player-card.md](phase-30-generated-player-card.md)：一张额外苹果、临时启动数值归一化、永久牌组保留及动作显示历史边界。
+
+- [phase-31-generated-empty-field.md](phase-31-generated-empty-field.md)：生成卡退场后的空场、墓地 schema 3、原生操作对照及暂停交接。
