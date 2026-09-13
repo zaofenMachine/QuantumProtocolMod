@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
     [string]$Before,
@@ -311,6 +311,11 @@ function ConvertTo-NormalizedInventory {
             nativeCurrentAttack = Get-SnapshotProperty $card 'nativeStats:currentAttack'
             nativeModifierCount = Get-SnapshotProperty $card 'nativeStats:modifierCount'
             nativeModifiers = Get-SnapshotProperty $card 'nativeStats:modifiers'
+            nativeCountersStatus = Get-SnapshotProperty $card 'nativeCounters:status'
+            nativeGenericCounters = Get-SnapshotProperty $card 'nativeCounters:generic'
+            nativeSpecialCounterTotal = Get-SnapshotProperty $card 'nativeCounters:specialTotal'
+            nativeSpecialCounterEntries = Get-SnapshotProperty $card 'nativeCounters:specialEntryCount'
+            nativeSpecialCounters = Get-SnapshotProperty $card 'nativeCounters:specialCounters'
             nativeHealthStatus = Get-SnapshotProperty $card 'nativeHealth:status'
             nativeBaseHealth = Get-SnapshotProperty $card 'nativeHealth:baseHealth'
             nativeCurrentHealth = Get-SnapshotProperty $card 'nativeHealth:currentHealth'
@@ -443,6 +448,16 @@ function ConvertTo-NormalizedInventory {
                     $_.nativeModifierCount, $_.nativeModifiers
             }
         )
+        playerNativeCountersAvailable = $playerCards.Count -gt 0 -and @(
+            $playerCards | Where-Object { $_.nativeCountersStatus -cne 'verified-native-counters' }
+        ).Count -eq 0
+        playerNativeCounters = ConvertTo-CountedValues @(
+            $playerCards | ForEach-Object {
+                'card={0}|location={1}|field={2}|generic={3}|specialTotal={4}|specialEntries={5}|special={6}' -f `
+                    $_.descriptor, $_.location, $_.field, $_.nativeGenericCounters, $_.nativeSpecialCounterTotal, `
+                    $_.nativeSpecialCounterEntries, $_.nativeSpecialCounters
+            }
+        )
         playerNativeHealthAvailable = $playerCards.Count -gt 0 -and @(
             $playerCards | Where-Object { $_.nativeHealthStatus -cne 'verified-native-health' }
         ).Count -eq 0
@@ -525,6 +540,10 @@ if ($beforeState.playerNativeStatisticsAvailable -and $afterState.playerNativeSt
     Add-Difference 'player-native-statistics' 'playerNativeStatistics' `
         $beforeState.playerNativeStatistics $afterState.playerNativeStatistics
 }
+if ($beforeState.playerNativeCountersAvailable -and $afterState.playerNativeCountersAvailable) {
+    Add-Difference 'player-native-counters' 'playerNativeCounters' `
+        $beforeState.playerNativeCounters $afterState.playerNativeCounters
+}
 if ($beforeState.playerNativeHealthAvailable -and $afterState.playerNativeHealthAvailable) {
     Add-Difference 'player-native-health' 'playerNativeHealth' `
         $beforeState.playerNativeHealth $afterState.playerNativeHealth
@@ -602,6 +621,10 @@ $report = [ordered]@{
         playerNativeStatisticsAvailable = $beforeState.playerNativeStatisticsAvailable -and $afterState.playerNativeStatisticsAvailable
         playerNativeStatisticsEqual = if ($beforeState.playerNativeStatisticsAvailable -and $afterState.playerNativeStatisticsAvailable) {
             Test-Equivalent $beforeState.playerNativeStatistics $afterState.playerNativeStatistics
+        } else { $null }
+        playerNativeCountersAvailable = $beforeState.playerNativeCountersAvailable -and $afterState.playerNativeCountersAvailable
+        playerNativeCountersEqual = if ($beforeState.playerNativeCountersAvailable -and $afterState.playerNativeCountersAvailable) {
+            Test-Equivalent $beforeState.playerNativeCounters $afterState.playerNativeCounters
         } else { $null }
         playerNativeHealthAvailable = $beforeState.playerNativeHealthAvailable -and $afterState.playerNativeHealthAvailable
         playerNativeHealthEqual = if ($beforeState.playerNativeHealthAvailable -and $afterState.playerNativeHealthAvailable) {
