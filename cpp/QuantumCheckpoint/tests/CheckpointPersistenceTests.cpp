@@ -1088,6 +1088,31 @@ int main()
     disguised_health_property.insert(disguised_health_property.rfind('}'),",\"playerFieldHealthStates\":\"2,2;2,2\"");
     require(!parse_exact_player_field_checkpoint(disguised_health_property,error),"schema-3 cannot carry unchecked health records");
 
+    auto field_with_counters = *parsed_health;
+    field_with_counters.schema_version = 5;
+    field_with_counters.player_field_counter_states = "3|springBuff,0;0|counterA,-1|counterB,2";
+    const auto counter_json = serialize_exact_player_field_checkpoint(field_with_counters);
+    const auto parsed_counters = parse_exact_player_field_checkpoint(counter_json,error);
+    require(parsed_counters && parsed_counters->schema_version == 5
+        && parsed_counters->player_field_counter_states == field_with_counters.player_field_counter_states,
+        "schema-5 counters round trip with zero and negative entries and independent stat tags");
+    field_with_counters.player_field_counter_states = "3";
+    require(!parse_exact_player_field_checkpoint(serialize_exact_player_field_checkpoint(field_with_counters),error),
+        "counter records must align with every field card");
+    field_with_counters.player_field_counter_states = "257;0";
+    require(!parse_exact_player_field_checkpoint(serialize_exact_player_field_checkpoint(field_with_counters),error),
+        "a valid checksum cannot authorize unbounded counter replay");
+    auto counter_tampering = counter_json;
+    counter_tampering.replace(counter_tampering.find("counterA,-1"),11,"counterA,-2");
+    require(!parse_exact_player_field_checkpoint(counter_tampering,error),"counter values are integrity checked");
+    auto missing_counter_property = counter_json;
+    const auto counter_begin = missing_counter_property.find("  \"playerFieldCounterStates\"");
+    missing_counter_property.erase(counter_begin,missing_counter_property.find('\n',counter_begin)-counter_begin+1);
+    require(!parse_exact_player_field_checkpoint(missing_counter_property,error),"schema-5 counter record is mandatory");
+    auto disguised_counter_property = health_json;
+    disguised_counter_property.insert(disguised_counter_property.rfind('}'),",\"playerFieldCounterStates\":\"0;0\"");
+    require(!parse_exact_player_field_checkpoint(disguised_counter_property,error),"schema-4 cannot carry unchecked counter records");
+
     std::cout << "Route C checkpoint persistence tests passed\n";
     return 0;
 }

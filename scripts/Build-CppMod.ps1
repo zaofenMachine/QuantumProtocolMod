@@ -1,4 +1,4 @@
-param(
+﻿param(
     [string]$UE4SSRoot = (Join-Path $PSScriptRoot '..\vendor\RE-UE4SS-v3.0.1'),
     [string]$BuildDirectory = (Join-Path $PSScriptRoot '..\build\cpp-vs17-14.38'),
     [string]$Configuration = 'Game__Shipping__Win64',
@@ -66,7 +66,7 @@ if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE
 }
 
-& $cmakePath --build $resolvedBuildDirectory --config $Configuration --target QuantumCheckpointPersistenceTests QuantumCheckpointAttackStateTests QuantumCheckpointHealthStateTests QuantumCheckpoint
+& $cmakePath --build $resolvedBuildDirectory --config $Configuration --target QuantumCheckpointPersistenceTests QuantumCheckpointAttackStateTests QuantumCheckpointHealthStateTests QuantumCheckpointCounterStateTests QuantumCheckpoint
 $buildExitCode = $LASTEXITCODE
 if ($buildExitCode -eq 0) {
     & $cmakePath --build $resolvedBuildDirectory --config $Configuration --target RUN_TESTS

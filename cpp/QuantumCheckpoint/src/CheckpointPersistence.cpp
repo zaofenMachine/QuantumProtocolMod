@@ -1,6 +1,7 @@
 #include "CheckpointPersistence.hpp"
 #include "PlayerAttackState.hpp"
 #include "PlayerHealthState.hpp"
+#include "PlayerCounterState.hpp"
 
 #include <algorithm>
 #include <array>
@@ -2058,6 +2059,8 @@ namespace QuantumCheckpoint
             append_hash_bytes(hash, checkpoint.player_field_attack_states);
         if (checkpoint.schema_version >= 4)
             append_hash_bytes(hash, checkpoint.player_field_health_states);
+        if (checkpoint.schema_version >= 5)
+            append_hash_bytes(hash, checkpoint.player_field_counter_states);
 
         std::ostringstream output{};
         output << std::hex << std::uppercase << std::setw(16) << std::setfill('0') << hash;
@@ -2098,6 +2101,9 @@ namespace QuantumCheckpoint
         if (checkpoint.schema_version >= 4)
             output << "  \"playerFieldHealthStates\": \""
                    << json_escape(checkpoint.player_field_health_states) << "\",\n";
+        if (checkpoint.schema_version >= 5)
+            output << "  \"playerFieldCounterStates\": \""
+                   << json_escape(checkpoint.player_field_counter_states) << "\",\n";
         output << "  \"payloadChecksum\": \"" << checkpoint.payload_checksum << "\"\n"
                << "}\n";
         return output.str();
@@ -2106,8 +2112,7 @@ namespace QuantumCheckpoint
     auto validate_exact_player_field_checkpoint(
         const ExactPlayerFieldCheckpoint& checkpoint, std::string& error) -> bool
     {
-        if (checkpoint.schema_version != 1 && checkpoint.schema_version != 2 && checkpoint.schema_version != 3
-            && checkpoint.schema_version != ExactPlayerFieldSchemaVersion)
+        if (checkpoint.schema_version < 1 || checkpoint.schema_version > ExactPlayerFieldSchemaVersion)
         {
             error = "unsupported exact player-field schema version";
             return false;
@@ -2195,6 +2200,20 @@ namespace QuantumCheckpoint
             error = "legacy player-field schema cannot claim health modifier coverage";
             return false;
         }
+        if (checkpoint.schema_version >= 5)
+        {
+            const auto counters = parse_player_counter_states(checkpoint.player_field_counter_states,array_error);
+            if (!counters || counters->size() != field->size())
+            {
+                error = "exact player-field counters are invalid or misaligned: " + array_error;
+                return false;
+            }
+        }
+        else if (!checkpoint.player_field_counter_states.empty())
+        {
+            error = "legacy player-field schema cannot claim counter coverage";
+            return false;
+        }
         if (deck->size() + hand->size() + trash->size() + field->size() > 128)
         {
             error = "exact player-field capture exceeds 128 cards";
@@ -2258,8 +2277,7 @@ namespace QuantumCheckpoint
         do { auto value = required_integer<Type>(*values, JsonName, error); if (!value) return std::nullopt; checkpoint.Field = *value; } while (false)
 
         READ_FIELD_INTEGER(schema_version, "schemaVersion", int);
-        if (checkpoint.schema_version != 1 && checkpoint.schema_version != 2 && checkpoint.schema_version != 3
-            && checkpoint.schema_version != ExactPlayerFieldSchemaVersion)
+        if (checkpoint.schema_version < 1 || checkpoint.schema_version > ExactPlayerFieldSchemaVersion)
         {
             error = "unsupported exact player-field schema version";
             return std::nullopt;
@@ -2292,6 +2310,15 @@ namespace QuantumCheckpoint
         else if (values->contains("playerFieldHealthStates"))
         {
             error = "legacy player-field JSON contains a newer health record";
+            return std::nullopt;
+        }
+        if (checkpoint.schema_version >= 5)
+        {
+            READ_FIELD_STRING(player_field_counter_states, "playerFieldCounterStates");
+        }
+        else if (values->contains("playerFieldCounterStates"))
+        {
+            error = "legacy player-field JSON contains a newer counter record";
             return std::nullopt;
         }
         READ_FIELD_STRING(payload_checksum, "payloadChecksum");

@@ -6,6 +6,7 @@
 #include "PlayerRestorePlan.hpp"
 #include "PlayerAttackState.hpp"
 #include "PlayerHealthState.hpp"
+#include "PlayerCounterState.hpp"
 
 #include <algorithm>
 #include <array>
@@ -226,6 +227,11 @@ namespace QuantumCheckpoint
             std::int32_t field_health_current_before_queue{};
             std::chrono::steady_clock::time_point field_health_queued_at{};
             bool field_health_values_written{};
+            std::string field_counter_status{"unavailable"};
+            std::vector<PlayerCounterState> field_counter_prefix{};
+            std::optional<std::size_t> field_counter_pending_card{};
+            PlayerCounterState field_counter_before_queue{};
+            std::chrono::steady_clock::time_point field_counter_queued_at{};
         };
 
         struct PendingRouteCCapture
@@ -2928,7 +2934,7 @@ namespace QuantumCheckpoint
             catch (const std::exception& error) { snapshot.properties.push_back({"nativeHealth:readError",error.what()}); }
         }
 
-        auto append_native_card_counters(ObjectSnapshot& snapshot, UObject* object) -> void
+        auto append_native_card_counters(ObjectSnapshot& snapshot, UObject* object, bool include_display = true) -> void
         {
             try
             {
@@ -2988,12 +2994,15 @@ namespace QuantumCheckpoint
                 snapshot.properties.push_back({"nativeCounters:specialTotal",std::to_string(sum)});
                 snapshot.properties.push_back({"nativeCounters:specialEntryCount",std::to_string(special.size())});
                 snapshot.properties.push_back({"nativeCounters:specialCounters",records});
-                for (const auto& [name,property] : {
-                    std::pair{STR("cardOverlayGenericCounters"),"nativeCounters:displayGeneric"},
-                    std::pair{STR("cardOverlaySpecialCounters"),"nativeCounters:displaySpecial"}})
-                    if (auto* display = reflected_object_property(object, name))
-                        if (const auto value = export_zero_argument_getter(display, STR("getCurrentCounters")))
-                            snapshot.properties.push_back({property,value->value});
+                if (include_display)
+                {
+                    for (const auto& [name,property] : {
+                        std::pair{STR("cardOverlayGenericCounters"),"nativeCounters:displayGeneric"},
+                        std::pair{STR("cardOverlaySpecialCounters"),"nativeCounters:displaySpecial"}})
+                        if (auto* display = reflected_object_property(object, name))
+                            if (const auto value = export_zero_argument_getter(display, STR("getCurrentCounters")))
+                                snapshot.properties.push_back({property,value->value});
+                }
                 snapshot.properties.push_back({"nativeCounters:status","verified-native-counters"});
             }
             catch (const std::exception& error) { snapshot.properties.push_back({"nativeCounters:readError",error.what()}); }
@@ -3072,6 +3081,30 @@ namespace QuantumCheckpoint
             result.modifiers = decode_player_stat_modifiers(state,2,true);
             std::string error{};
             if (!validate_player_health_state(result,error)) throw std::runtime_error{error};
+            return result;
+        }
+
+        auto capture_player_counter_state(UObject* card) -> PlayerCounterState
+        {
+            ObjectSnapshot observation{};
+            append_native_card_counters(observation,card,false);
+            const auto property = [&](std::string_view name) -> std::string {
+                const auto found = std::find_if(observation.properties.begin(),observation.properties.end(),
+                    [&](const auto& value) { return value.name == name; });
+                if (found == observation.properties.end()) throw std::runtime_error{"native field counter observation unavailable"};
+                return found->value;
+            };
+            if (property("nativeCounters:status") != "verified-native-counters")
+                throw std::runtime_error{"native field counter observation is unverified"};
+            PlayerCounterState result{};
+            result.generic = std::stoi(property("nativeCounters:generic"));
+            const auto* state = read_native_value<const void*>(card,InGameCardStatePointerOffset);
+            for (const auto* entry : read_native_sparse_elements(static_cast<const std::byte*>(state) + 0x1D8,20))
+                result.special.push_back({to_string(FName{read_native_value<std::int64_t>(entry,0)}.ToString()),
+                    read_native_value<std::int32_t>(entry,8)});
+            std::sort(result.special.begin(),result.special.end(),[](const auto& a,const auto& b) { return a.tag < b.tag; });
+            std::string error{};
+            if (!validate_player_counter_state(result,error)) throw std::runtime_error{error};
             return result;
         }
 
@@ -3495,6 +3528,7 @@ namespace QuantumCheckpoint
                     bool turn_active{};
                     PlayerAttackState attack{};
                     PlayerHealthState health_state{};
+                    PlayerCounterState counter_state{};
                 };
                 std::vector<CapturedFieldCard> captured_cards{};
                 for (const auto& card : native_cards_at_location(
@@ -3525,6 +3559,7 @@ namespace QuantumCheckpoint
                         .turn_active = turn_active == "True",
                         .attack = capture_player_attack_state(card.card,true),
                         .health_state = capture_player_health_state(card.card),
+                        .counter_state = capture_player_counter_state(card.card),
                     });
                 }
                 if (captured_cards.empty())
@@ -3558,6 +3593,7 @@ namespace QuantumCheckpoint
                 std::ostringstream states{};
                 std::vector<PlayerAttackState> attacks{};
                 std::vector<PlayerHealthState> health_states{};
+                std::vector<PlayerCounterState> counter_states{};
                 for (std::size_t index{}; index < captured_cards.size(); ++index)
                 {
                     if (index != 0)
@@ -3568,6 +3604,7 @@ namespace QuantumCheckpoint
                     const auto& card = captured_cards[index];
                     attacks.push_back(card.attack);
                     health_states.push_back(card.health_state);
+                    counter_states.push_back(card.counter_state);
                     exact.player_field += card.instance;
                     states << static_cast<std::int32_t>(card.placement.row) << ','
                            << card.placement.index << ',' << card.health << ','
@@ -3577,6 +3614,7 @@ namespace QuantumCheckpoint
                 exact.player_field_states = states.str();
                 exact.player_field_attack_states = serialize_player_attack_states(attacks);
                 exact.player_field_health_states = serialize_player_health_states(health_states);
+                exact.player_field_counter_states = serialize_player_counter_states(counter_states);
                 exact.payload_checksum = exact_player_field_payload_checksum(exact);
                 std::string exact_validation_error{};
                 if (!validate_exact_player_field_checkpoint(
@@ -3911,6 +3949,8 @@ namespace QuantumCheckpoint
                    << json_escape(restore.field_attack_status) << "\",\n"
                    << "  \"exactPlayerFieldHealthStatus\": \""
                    << json_escape(restore.field_health_status) << "\",\n"
+                   << "  \"exactPlayerFieldCounterStatus\": \""
+                   << json_escape(restore.field_counter_status) << "\",\n"
                    << "  \"exactPlayerFieldTargetCount\": "
                    << restore.exact_player_field_targets.size() << ",\n"
                    << "  \"exactPlayerFieldTrashTargetCount\": "
@@ -4086,6 +4126,67 @@ namespace QuantumCheckpoint
             // releases this temporary. A borrowed pair would steal a live reference.
             write_native_value(controller, sizeof(void*), count + 1);
             return {object, controller};
+        }
+
+        auto queue_native_player_counter(UObject* engine, const NativeCardReference& card,
+                                          std::string_view tag, std::int32_t amount, std::int32_t limit) -> void
+        {
+            const auto api = validated_native_move_card_api(engine);
+            if (GetCurrentThreadId() != g_game_thread_id.load(std::memory_order_acquire)
+                || !card.card || card.card->GetWorld() != engine->GetWorld()
+                || read_native_value<const void*>(card.card,InGameCardStatePointerOffset) != card.state
+                || native_card_location(api.engine_state,card.state,api.get_card_location) != 3)
+                throw std::runtime_error{"player counter target is not a live player FIELD card"};
+            const auto module_base = reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr));
+            const auto signature = [&](std::uintptr_t rva, const auto& bytes) {
+                const auto* address = reinterpret_cast<const std::uint8_t*>(module_base + rva);
+                if (!address_is_readable(address, bytes.size()) || !std::equal(bytes.begin(), bytes.end(), address))
+                    throw std::runtime_error{"native player counter signature changed"};
+            };
+            signature(0xE0E710,std::array<std::uint8_t,8>{0x48,0x8B,0xC4,0x53,0x48,0x83,0xEC,0x60});
+            signature(0xE0F100,std::array<std::uint8_t,8>{0x48,0x8B,0xC4,0x53,0x48,0x83,0xEC,0x60});
+            signature(0xE3F8F7,std::array<std::uint8_t,7>{0x44,0x89,0x82,0x28,0x01,0,0});
+            signature(0xE3FDD5,std::array<std::uint8_t,7>{0x48,0x8D,0x8F,0xD8,0x01,0,0});
+            std::string error{};
+            if (amount < -PlayerCounterRestoreMaximum || amount > PlayerCounterRestoreMaximum
+                || limit < -1 || limit > PlayerCounterRestoreMaximum
+                || (!tag.empty() && !validate_player_stat_modifiers({{std::string{tag},amount,-1,0}},error)))
+                throw std::runtime_error{"player counter parameters are outside the bounded restore slice: " + error};
+            std::int64_t native_tag{};
+            if (!tag.empty())
+            {
+                auto* function = card.card->GetFunctionByNameInChain(STR("Action_AddSpecialCounters_Visuals"));
+                auto* argument = function ? function->GetPropertyByNameInChain(STR("Tag")) : nullptr;
+                if (!argument || function->GetParmsSize() < 12 || function->GetParmsSize() > 16
+                    || !argument->HasAnyPropertyFlags(CPF_Parm))
+                    throw std::runtime_error{"special counter tag parameter shape is unavailable"};
+                ReflectedParameterBuffer parameters{function};
+                if (argument->ContainerPtrToValuePtr<void>(parameters.bytes.data()) != parameters.bytes.data())
+                    throw std::runtime_error{"special counter tag parameter offset changed"};
+                FOutputDevice errors{};
+                const auto text = to_wstring(std::string{tag});
+                if (!argument->ImportText(text.c_str(),parameters.bytes.data(),0,card.card,&errors))
+                    throw std::runtime_error{"special counter tag import failed"};
+                native_tag = read_native_value<std::int64_t>(parameters.bytes.data(),0);
+                if (to_string(FName{native_tag}.ToString()) != tag)
+                    throw std::runtime_error{"special counter tag did not verify"};
+            }
+            const auto* shared = read_native_value<const void*>(card.state,CardStateSharedObjectOffset);
+            const auto* owner = read_native_value<const void*>(card.state,CardStateSharedControllerOffset);
+            if (!address_is_writable(static_cast<const std::byte*>(card.state) + (tag.empty() ? 0x128 : 0x1D8),tag.empty() ? 4 : 0x50))
+                throw std::runtime_error{"player counter target storage is unavailable"};
+            const auto target = retain_native_card_argument(shared,owner);
+            const NativeSharedPointerPair empty{};
+            if (tag.empty())
+            {
+                using Add = void (*)(const void*,const NativeSharedPointerPair*,const NativeSharedPointerPair*,std::int32_t,std::int32_t);
+                reinterpret_cast<Add>(module_base + 0xE0E710)(api.engine_state,&empty,&target,amount,limit);
+            }
+            else
+            {
+                using Add = void (*)(const void*,const NativeSharedPointerPair*,const NativeSharedPointerPair*,std::int64_t,std::int32_t,std::int32_t);
+                reinterpret_cast<Add>(module_base + 0xE0F100)(api.engine_state,&empty,&target,native_tag,amount,limit);
+            }
         }
 
         auto queue_native_player_stat_modifier(UObject* engine, const NativeCardReference& card,
@@ -5542,6 +5643,115 @@ namespace QuantumCheckpoint
             }
         }
 
+        auto verify_exact_player_field_counters(PendingRouteCRestore& restore,
+                                                const RouteCBattleObjects& objects,
+                                                std::chrono::steady_clock::time_point now) -> bool
+        {
+            if (restore.exact_player_field->schema_version < 5)
+            {
+                restore.field_counter_status = "legacy-unavailable";
+                return true;
+            }
+            try
+            {
+                std::string error{};
+                const auto desired = parse_player_counter_states(
+                    restore.exact_player_field->player_field_counter_states,error);
+                const auto placements = parse_exact_player_field_states(
+                    restore.exact_player_field->player_field_states,error);
+                if (!desired || !placements || desired->size() != placements->size())
+                    throw std::runtime_error{"saved FIELD counters are invalid: " + error};
+                std::vector<NativeCardReference> cards{};
+                std::vector<PlayerCounterState> observed{};
+                for (const auto& placement : *placements)
+                {
+                    const auto target = std::find_if(restore.exact_player_field_targets.begin(),
+                        restore.exact_player_field_targets.end(),[&](const auto& value) {
+                            return value.row == placement.row && value.index == placement.index;
+                        });
+                    if (target == restore.exact_player_field_targets.end()
+                        || read_native_value<const void*>(target->card,InGameCardStatePointerOffset) != target->state)
+                        throw std::runtime_error{"field counter target changed after placement"};
+                    cards.push_back({target->card,target->state});
+                    observed.push_back(capture_player_counter_state(target->card));
+                }
+                if (restore.field_counter_prefix.empty())
+                {
+                    for (const auto& state : observed)
+                        if (state.generic != 0 || !state.special.empty())
+                            throw std::runtime_error{"fresh FIELD counters differ from the supported empty starting state"};
+                    restore.field_counter_prefix = observed;
+                    restore.field_counter_status = "applying";
+                }
+                bool waiting{};
+                for (std::size_t index{}; index < observed.size(); ++index)
+                {
+                    if (observed[index] == restore.field_counter_prefix.at(index)) continue;
+                    if (restore.field_counter_pending_card == index
+                        && observed[index] == restore.field_counter_before_queue
+                        && now - restore.field_counter_queued_at <= std::chrono::seconds{8})
+                        waiting = true;
+                    else throw std::runtime_error{"native FIELD counters changed or a queued counter did not verify: card="
+                        + std::to_string(index) + " expected=" + serialize_player_counter_states({restore.field_counter_prefix.at(index)})
+                        + " observed=" + serialize_player_counter_states({observed[index]})};
+                }
+                if (waiting) return false;
+                restore.field_counter_pending_card.reset();
+                for (std::size_t index{}; index < desired->size(); ++index)
+                {
+                    auto& prefix = restore.field_counter_prefix[index];
+                    const auto& saved = (*desired)[index];
+                    if (prefix == saved) continue;
+                    if (restore.field_counter_status == "verified-native-counters"
+                        || prefix.special.size() > saved.special.size())
+                        throw std::runtime_error{"FIELD counters changed after verification"};
+                    restore.field_counter_before_queue = prefix;
+                    std::string tag{};
+                    std::int32_t amount{};
+                    if (prefix.generic != saved.generic)
+                    {
+                        if (prefix.generic != 0)
+                            throw std::runtime_error{"FIELD generic counter changed before replay"};
+                        amount = saved.generic;
+                    }
+                    else
+                    {
+                        if (prefix.special.size() == saved.special.size())
+                            throw std::runtime_error{"restored FIELD special counters differ from the saved state"};
+                        const auto order = player_counter_restore_order(saved);
+                        const auto& counter = saved.special.at(order.at(prefix.special.size()));
+                        tag = counter.tag;
+                        amount = counter.count;
+                    }
+                    queue_native_player_counter(objects.card_engine,cards[index],tag,amount,-1);
+                    if (tag.empty()) prefix.generic = amount;
+                    else
+                    {
+                        // Add zero too: an explicit zero tag is part of the map.
+                        prefix.special.push_back({tag,amount});
+                        std::sort(prefix.special.begin(),prefix.special.end(),
+                            [](const auto& a,const auto& b) { return a.tag < b.tag; });
+                    }
+                    restore.field_counter_pending_card = index;
+                    restore.field_counter_queued_at = now;
+                    append_route_c_trace_failure("restore.exact-player-field.counter.queued",
+                        "card=" + std::to_string(index) + " tag=" + (tag.empty() ? "<generic>" : tag)
+                        + " amount=" + std::to_string(amount));
+                    resume_native_restore_actions(objects.card_engine);
+                    return false;
+                }
+                if (restore.field_counter_status != "verified-native-counters")
+                    append_route_c_trace("restore.exact-player-field.counter.verified-native-counters");
+                restore.field_counter_status = "verified-native-counters";
+                return true;
+            }
+            catch (...)
+            {
+                restore.field_counter_status = "failed";
+                throw;
+            }
+        }
+
         auto update_exact_player_field_turn_diagnostic(PendingRouteCRestore& restore)
             -> void
         {
@@ -5816,6 +6026,7 @@ namespace QuantumCheckpoint
             {
                 if (!verify_exact_player_field_attack(restore, objects, now)) return false;
                 if (!verify_exact_player_field_health(restore, objects, now)) return false;
+                if (!verify_exact_player_field_counters(restore, objects, now)) return false;
                 rollback_active_decklist();
                 restore.exact_player_field_status = "verified-position-health";
                 append_route_c_trace(
@@ -6348,6 +6559,7 @@ namespace QuantumCheckpoint
                 }
                 if (!verify_exact_player_field_attack(restore, objects, now)) return false;
                 if (!verify_exact_player_field_health(restore, objects, now)) return false;
+                if (!verify_exact_player_field_counters(restore, objects, now)) return false;
                 rollback_active_decklist();
                 restore.exact_player_field_status = "verified-position-health";
                 append_route_c_trace(
@@ -10628,68 +10840,16 @@ namespace QuantumCheckpoint
         // queue as restoration, but intentionally does not undo its test setup.
         // Inventory exports, not the queued report, prove the resulting state.
 
-        auto queue_native_counter_fixture(UObject* engine, const NativeCardReference& card,
-                                          std::string_view tag, std::int32_t amount, std::int32_t limit) -> void
-        {
-            const auto api = validated_native_move_card_api(engine);
-            if (!native_card_location(api.engine_state,card.state,api.get_card_location))
-                throw std::runtime_error{"counter fixture target ownership is unavailable"};
-            const auto module_base = reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr));
-            const auto signature = [&](std::uintptr_t rva, const auto& bytes) {
-                const auto* address = reinterpret_cast<const std::uint8_t*>(module_base + rva);
-                if (!address_is_readable(address, bytes.size()) || !std::equal(bytes.begin(), bytes.end(), address))
-                    throw std::runtime_error{"native counter fixture signature changed"};
-            };
-            signature(0xE0E710,std::array<std::uint8_t,8>{0x48,0x8B,0xC4,0x53,0x48,0x83,0xEC,0x60});
-            signature(0xE0F100,std::array<std::uint8_t,8>{0x48,0x8B,0xC4,0x53,0x48,0x83,0xEC,0x60});
-            signature(0xE3F8F7,std::array<std::uint8_t,7>{0x44,0x89,0x82,0x28,0x01,0,0});
-            signature(0xE3FDD5,std::array<std::uint8_t,7>{0x48,0x8D,0x8F,0xD8,0x01,0,0});
-            if (amount < -10 || amount > 3 || (limit != -1 && limit != 4)
-                || (!tag.empty() && tag != "quantumCounterA" && tag != "quantumCounterB"))
-                throw std::runtime_error{"counter fixture parameters are outside its bounded profile"};
-            std::int64_t native_tag{};
-            if (!tag.empty())
-            {
-                auto* function = card.card->GetFunctionByNameInChain(STR("Action_AddSpecialCounters_Visuals"));
-                auto* argument = function ? function->GetPropertyByNameInChain(STR("Tag")) : nullptr;
-                if (!argument || function->GetParmsSize() < 12 || function->GetParmsSize() > 16)
-                    throw std::runtime_error{"special counter tag parameter shape is unavailable"};
-                ReflectedParameterBuffer parameters{function};
-                if (argument->ContainerPtrToValuePtr<void>(parameters.bytes.data()) != parameters.bytes.data())
-                    throw std::runtime_error{"special counter tag parameter offset changed"};
-                FOutputDevice errors{};
-                const auto text = to_wstring(std::string{tag});
-                if (!argument->ImportText(text.c_str(),parameters.bytes.data(),0,card.card,&errors))
-                    throw std::runtime_error{"special counter tag import failed"};
-                native_tag = read_native_value<std::int64_t>(parameters.bytes.data(),0);
-                if (to_string(FName{native_tag}.ToString()) != tag)
-                    throw std::runtime_error{"special counter tag did not verify"};
-            }
-            const auto* shared = read_native_value<const void*>(card.state,CardStateSharedObjectOffset);
-            const auto* owner = read_native_value<const void*>(card.state,CardStateSharedControllerOffset);
-            if (!address_is_writable(static_cast<const std::byte*>(card.state) + (tag.empty() ? 0x128 : 0x1D8),tag.empty() ? 4 : 0x50))
-                throw std::runtime_error{"counter fixture target storage is unavailable"};
-            const auto target = retain_native_card_argument(shared,owner);
-            const NativeSharedPointerPair empty{};
-            if (tag.empty())
-            {
-                using Add = void (*)(const void*,const NativeSharedPointerPair*,const NativeSharedPointerPair*,std::int32_t,std::int32_t);
-                reinterpret_cast<Add>(module_base + 0xE0E710)(api.engine_state,&empty,&target,amount,limit);
-            }
-            else
-            {
-                using Add = void (*)(const void*,const NativeSharedPointerPair*,const NativeSharedPointerPair*,std::int64_t,std::int32_t,std::int32_t);
-                reinterpret_cast<Add>(module_base + 0xE0F100)(api.engine_state,&empty,&target,native_tag,amount,limit);
-            }
-        }
-
         auto run_player_counter_fixture(int profile) -> void
         {
             std::string status{"refused"},reason{},before{},queued{};
             try
             {
                 const auto objects = find_route_c_objects();
-                if (g_pending_route_c_restore || g_pending_route_c_capture || g_pending_route_c_fallback
+                const bool stability_swap = profile == 10 && g_pending_route_c_restore
+                    && g_pending_route_c_restore->phase == RouteCRestorePhase::AwaitingPostRestoreStability
+                    && g_pending_route_c_restore->field_counter_status == "verified-native-counters";
+                if ((g_pending_route_c_restore && !stability_swap) || g_pending_route_c_capture || g_pending_route_c_fallback
                     || g_pending_move_card_probe || g_pending_health_write_probe || g_pending_turn_write_probe
                     || g_pending_battle_turn_write_probe || g_pending_draw_delay_write_probe
                     || required_text(export_property_text(objects.card_engine,STR("currentGameState")),"state") != "OPEN"
@@ -10720,7 +10880,7 @@ namespace QuantumCheckpoint
                 const auto special = property("nativeCounters:specialCounters");
                 before = generic + ";" + special;
                 const auto add = [&](std::string_view tag,std::int32_t amount,std::int32_t limit = -1) {
-                    queue_native_counter_fixture(objects.card_engine,field[0],tag,amount,limit);
+                    queue_native_player_counter(objects.card_engine,field[0],tag,amount,limit);
                     if (!queued.empty()) queued += ';';
                     queued += std::string{tag} + "," + std::to_string(amount) + "," + std::to_string(limit);
                 };
@@ -10731,7 +10891,7 @@ namespace QuantumCheckpoint
                     else if (generic == "4") add("",-10);
                     else throw std::runtime_error{"unexpected generic counter fixture state"};
                 }
-                else if (profile == 9 && generic == "0")
+                else if (profile == 9 && (generic == "0" || generic == "3"))
                 {
                     if (special == R"([])") add("quantumCounterA",2);
                     else if (special == R"([{"tag":"quantumCounterA","count":2}])") add("quantumCounterB",3);
@@ -10739,6 +10899,8 @@ namespace QuantumCheckpoint
                     else if (special == R"([{"tag":"quantumCounterA","count":3},{"tag":"quantumCounterB","count":2}])") add("quantumCounterA",-3);
                     else if (special == R"([{"tag":"quantumCounterA","count":0},{"tag":"quantumCounterB","count":2}])"
                         || special == R"([{"tag":"quantumCounterA","count":0},{"tag":"quantumCounterB","count":3}])") add("quantumCounterA",-1);
+                    else if (special == R"([{"tag":"quantumCounterA","count":-1},{"tag":"quantumCounterB","count":2}])") add("quantumCounterB",-3);
+                    else if (special == R"([{"tag":"quantumCounterA","count":-1},{"tag":"quantumCounterB","count":3}])") add("quantumCounterB",-4);
                     else throw std::runtime_error{"unexpected special counter fixture state"};
                 }
                 else if (profile == 10 && generic == "0"
@@ -11048,9 +11210,9 @@ namespace QuantumCheckpoint
         QuantumCheckpointMod()
         {
             ModName = STR("QuantumCheckpoint");
-            ModVersion = STR("0.28.0");
+            ModVersion = STR("0.29.0");
 #if defined(QUANTUM_CHECKPOINT_RUNTIME_TEST_FIXTURES)
-            ModVersion = STR("0.28.0-test-fixtures");
+            ModVersion = STR("0.29.0-test-fixtures");
 #endif
             ModDescription = STR("Route C checkpoint with optional exact-state supplements");
             ModAuthors = STR("zaofenMachine and contributors");

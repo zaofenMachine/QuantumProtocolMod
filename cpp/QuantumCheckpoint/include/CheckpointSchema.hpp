@@ -20,7 +20,7 @@ namespace QuantumCheckpoint
     inline constexpr int ExactPlayerTrashSchemaVersion = 2;
     inline constexpr std::string_view ExactPlayerTrashCheckpointKind =
         "route-c-exact-player-trash";
-    inline constexpr int ExactPlayerFieldSchemaVersion = 4;
+    inline constexpr int ExactPlayerFieldSchemaVersion = 5;
     inline constexpr std::string_view ExactPlayerFieldCheckpointKind =
         "route-c-exact-player-field";
     inline constexpr int ExactCharacterChargeSchemaVersion = 1;
@@ -167,6 +167,7 @@ namespace QuantumCheckpoint
         std::string player_field_states{};
         std::string player_field_attack_states{};
         std::string player_field_health_states{};
+        std::string player_field_counter_states{};
         std::string payload_checksum{};
     };
 
