@@ -550,6 +550,39 @@ int main()
     require(field_startup.has_value(), error.c_str());
     require(field_startup->find("fixedOrder=True") != std::string::npos,
             "player-field startup enables fixed order");
+    const std::string generated_active =
+        "(cardList=((cardName=\"naturalApple\",count=2),(cardName=\"naturalSpring\",count=1),"
+        "(cardName=\"genericBattery\",count=1)),fixedOrder=False)";
+    const auto generated_field = card_array({"naturalApple","naturalSpring"});
+    const auto generated_hand = card_array({"genericBattery","naturalApple"});
+    const auto generated_trash = card_array({"naturalApple"});
+    require(!exact_player_field_startup_decklist(generated_active,"()",generated_hand,
+                generated_trash,generated_field,error),
+            "legacy startup still rejects an additional generated copy");
+    std::size_t additional_card_count = 999;
+    const auto generated_startup = exact_player_field_startup_decklist(generated_active,"()",
+        generated_hand,generated_trash,generated_field,error,true,&additional_card_count);
+    require(generated_startup && generated_startup->find("fixedOrder=True") != std::string::npos,
+            "schema-6 startup accepts exactly one additional unupgraded Apple with Apple and Spring in the active deck");
+    require(additional_card_count == 1,"generated startup explicitly reports its temporary extra card");
+    require(!exact_player_field_startup_decklist(generated_active,"()",generated_hand,
+                card_array({"naturalApple","naturalApple"}),generated_field,error,true,&additional_card_count),
+            "two additional copies remain outside the tested extension");
+    require(additional_card_count == 0,"rejected startup cannot retain a previous extra-card count");
+    require(!exact_player_field_startup_decklist(generated_active,"()",generated_hand,
+                card_array({"naturalCherry"}),generated_field,error,true),
+            "an additional unsupported identity cannot pass the generated Apple guard");
+    require(!exact_player_field_startup_decklist(generated_active,"()",card_array({"naturalApple"}),
+                generated_trash,generated_field,error,true),
+            "a missing original Battery cannot be hidden by an extra Apple");
+    require(!exact_player_field_startup_decklist(
+                "(cardList=((cardName=\"naturalApple\",count=2),(cardName=\"genericBattery\",count=1)))",
+                "()",generated_hand,generated_trash,card_array({"naturalApple"}),error,true),
+            "additional Apple requires a tested Spring source in the original active deck");
+    require(exact_player_field_startup_decklist(generated_active,"()",card_array({"genericBattery"}),
+                generated_trash,generated_field,error,true,&additional_card_count).has_value(),
+            "schema-6 also retains the ordinary complete active multiset");
+    require(additional_card_count == 0,"ordinary startup requires no extra-card normalization");
     require(field_startup->find("cardName=\"naturalApple\"")
                 < field_startup->find("cardName=\"naturalLemon\""),
             "player-field startup preserves placement order below the saved hand");
@@ -1096,6 +1129,13 @@ int main()
     require(parsed_counters && parsed_counters->schema_version == 5
         && parsed_counters->player_field_counter_states == field_with_counters.player_field_counter_states,
         "schema-5 counters round trip with zero and negative entries and independent stat tags");
+    auto generated_schema = *parsed_counters;
+    generated_schema.schema_version = 6;
+    const auto parsed_generated_schema = parse_exact_player_field_checkpoint(
+        serialize_exact_player_field_checkpoint(generated_schema),error);
+    require(parsed_generated_schema && parsed_generated_schema->schema_version == 6
+        && parsed_generated_schema->player_field_counter_states == parsed_counters->player_field_counter_states,
+        "schema-6 keeps all earlier FIELD supplements and binds its startup policy through the schema checksum");
     field_with_counters.player_field_counter_states = "3";
     require(!parse_exact_player_field_checkpoint(serialize_exact_player_field_checkpoint(field_with_counters),error),
         "counter records must align with every field card");

@@ -197,6 +197,9 @@ namespace QuantumCheckpoint
             std::string exact_turn_progress_status{"unavailable"};
             std::string exact_turn_progress_reason{};
             bool active_decklist_restored_after_exact_startup{};
+            std::size_t generated_player_card_count{};
+            bool generated_startup_max_health_normalized{};
+            std::int32_t generated_startup_max_countdown{};
             std::string interception_error{};
             std::string last_diagnostic{};
             std::chrono::steady_clock::time_point next_diagnostic_at{};
@@ -3670,15 +3673,34 @@ namespace QuantumCheckpoint
                 {
                     throw std::runtime_error{exact_validation_error};
                 }
+                std::size_t generated_count{};
                 if (!exact_player_field_startup_decklist(
                         checkpoint.active_decklist,
                         exact.player_deck,
                         exact.player_hand,
                         exact.player_trash,
                         exact.player_field,
-                        exact_validation_error))
+                        exact_validation_error,exact.schema_version >= 6,&generated_count))
                 {
                     throw std::runtime_error{exact_validation_error};
+                }
+                if (generated_count != 0)
+                {
+                    // This schema stores dynamic stats only for FIELD. A copied
+                    // card that retains buffs in another zone cannot be inferred
+                    // from its CardInfoInstance alone.
+                    for (const auto location : {0,1,2})
+                        for (const auto& card : native_cards_at_location(objects.card_engine,api.location,location))
+                        {
+                            const auto attack = capture_player_attack_state(card.card,true);
+                            const auto health_state = capture_player_health_state(card.card);
+                            const auto counters = capture_player_counter_state(card.card);
+                            if (!attack.modifiers.empty() || attack.current_attack != attack.base_attack
+                                || !health_state.modifiers.empty() || health_state.max_health != health_state.base_health
+                                || parse_int32(required_getter_text(card.card,STR("getCurrentHealth"))) != health_state.base_health
+                                || counters.generic != 0 || !counters.special.empty())
+                                throw std::runtime_error{"generated-card restore requires default off-field player statistics"};
+                        }
                 }
                 exact_player_field = std::move(exact);
                 append_route_c_trace("capture.exact-player-field.prepare.complete");
@@ -3999,6 +4021,11 @@ namespace QuantumCheckpoint
                    << json_escape(restore.field_health_status) << "\",\n"
                    << "  \"exactPlayerFieldCounterStatus\": \""
                    << json_escape(restore.field_counter_status) << "\",\n"
+                   << "  \"generatedPlayerCardCount\": " << restore.generated_player_card_count << ",\n"
+                   << "  \"generatedStartupMaxCountdown\": " << restore.generated_startup_max_countdown << ",\n"
+                   << "  \"playerEffectActionHistoryRestored\": false,\n"
+                   << "  \"generatedStartupMaxHealthNormalized\": "
+                   << (restore.generated_startup_max_health_normalized ? "true" : "false") << ",\n"
                    << "  \"exactPlayerFieldTargetCount\": "
                    << restore.exact_player_field_targets.size() << ",\n"
                    << "  \"exactPlayerFieldTrashTargetCount\": "
@@ -4613,6 +4640,7 @@ namespace QuantumCheckpoint
                 append_route_c_trace("restore.original-storage.complete");
             }
             auto startup_decklist = route_c_startup_decklist(checkpoint.active_decklist);
+            std::size_t generated_player_card_count{};
             if (exact_player_field)
             {
                 std::string fixed_order_error{};
@@ -4622,7 +4650,7 @@ namespace QuantumCheckpoint
                     exact_player_field->player_hand,
                     exact_player_field->player_trash,
                     exact_player_field->player_field,
-                    fixed_order_error);
+                    fixed_order_error,exact_player_field->schema_version >= 6,&generated_player_card_count);
                 if (fixed_order)
                 {
                     startup_decklist = std::move(*fixed_order);
@@ -4803,6 +4831,7 @@ namespace QuantumCheckpoint
                 .exact_turn_progress_status = exact_turn_progress_available
                     ? "pending" : "unavailable",
                 .exact_turn_progress_reason = std::move(exact_turn_progress_reason),
+                .generated_player_card_count = exact_player_field_available ? generated_player_card_count : 0,
                 .semantic_fallback = semantic_only,
                 .fallback_reason = std::move(fallback_reason),
             });
@@ -4823,6 +4852,103 @@ namespace QuantumCheckpoint
             Output::send<LogLevel::Verbose>(
                 STR("[QuantumCheckpoint] Route C reload requested; waiting for native startup to select wave {}.\n"),
                 g_pending_route_c_restore->checkpoint.wave_index);
+        }
+
+        auto normalize_generated_startup_scalars(PendingRouteCRestore& restore,
+                                                    const RouteCBattleObjects& objects,
+                                                    std::int32_t current,
+                                                    std::int32_t maximum) -> void
+        {
+            const auto desired = restore.checkpoint.player_max_health;
+            if (restore.generated_player_card_count != 1 || !restore.exact_player_field
+                || restore.exact_player_field->schema_version < 6
+                || restore.exact_player_field_status != "verified-position-health"
+                || !restore.active_decklist_restored_after_exact_startup
+                || restore.generated_startup_max_health_normalized
+                || maximum != desired + 1 || current < 1 || current > maximum)
+                throw std::runtime_error{"Native startup produced a different maximum health"};
+            const auto api = validated_native_move_card_api(objects.card_engine);
+            const auto module_base = reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr));
+            const auto* setter = objects.card_engine->GetFunctionByNameInChain(STR("setNewMaxHealth"));
+            const auto* current_getter = objects.card_engine->GetFunctionByNameInChain(STR("getCurrentHealth"));
+            const auto* maximum_getter = objects.card_engine->GetFunctionByNameInChain(STR("getMaxHealth"));
+            const auto signature = [&](std::uintptr_t rva,const auto& bytes) {
+                const auto* address = reinterpret_cast<const std::uint8_t*>(module_base + rva);
+                if (!address_is_readable(address,bytes.size()) || !std::equal(bytes.begin(),bytes.end(),address))
+                    throw std::runtime_error{"native maximum-health setter signature changed"};
+            };
+            signature(0xE52753,std::array<std::uint8_t,10>{0x44,0x8B,0x43,0x1C,0x41,0x8B,0xC8,0x2B,0x4B,0x20});
+            signature(0xE527BE,std::array<std::uint8_t,6>{0x89,0x7B,0x1C,0x89,0x73,0x20});
+            signature(0xE52812,std::array<std::uint8_t,6>{0x48,0x8B,0x08,0x89,0x59,0x24});
+            signature(0xE284A0,std::array<std::uint8_t,10>{0x83,0xF9,0x05,0x73,0x07,0xB8,0x04,0x00,0x00,0x00});
+            signature(0xFF26E2,std::array<std::uint8_t,13>{0xE8,0x99,0x81,0x00,0x00,0x8B,0xD0,0x89,0x83,0x34,0x02,0x00,0x00});
+            const auto validate_function = [&](StringViewType name,std::uintptr_t rva,int size) {
+                const auto* function = objects.card_engine->GetFunctionByNameInChain(name.data());
+                if (!function || function->GetParmsSize() != size
+                    || reinterpret_cast<std::uintptr_t>(function->GetFunc()) != module_base + rva)
+                    throw std::runtime_error{"generated startup countdown API changed"};
+            };
+            validate_function(STR("getMaxTurnCountdown"),0x1019D00,8);
+            validate_function(STR("setNewMaxTurnCountdown"),0x101B6A0,4);
+            validate_function(STR("fillSpawnTurnCountdownTime"),0x1019810,0);
+            validate_function(STR("getCurrentMaxTurnCountdown"),0x1019960,4);
+            if (GetCurrentThreadId() != g_game_thread_id.load(std::memory_order_acquire)
+                || !setter || setter->GetParmsSize() != 4
+                || reinterpret_cast<std::uintptr_t>(setter->GetFunc()) != module_base + 0x101B610
+                || !current_getter || reinterpret_cast<std::uintptr_t>(current_getter->GetFunc())
+                    != module_base + CardEngineCurrentHealthGetterThunkRva
+                || !maximum_getter || reinterpret_cast<std::uintptr_t>(maximum_getter->GetFunc())
+                    != module_base + CardEngineMaxHealthGetterThunkRva
+                || read_native_value<const void*>(objects.card_engine,CardEngineHealthStatePointerOffset) != api.engine_state
+                || read_native_value<const void*>(api.engine_state,0x10) != objects.card_engine
+                || !address_is_writable(static_cast<const std::byte*>(api.engine_state) + PlayerStateCurrentHealthOffset,8)
+                || read_native_value<std::int32_t>(api.engine_state,PlayerStateCurrentHealthOffset) != current
+                || read_native_value<std::int32_t>(api.engine_state,PlayerStateMaxHealthOffset) != maximum)
+                throw std::runtime_error{"generated startup maximum-health normalization failed its native preflight"};
+            std::size_t total_cards{};
+            std::string array_error;
+            for (const auto* zone : {&restore.exact_player_field->player_deck,&restore.exact_player_field->player_hand,
+                                    &restore.exact_player_field->player_trash,&restore.exact_player_field->player_field})
+            {
+                const auto cards = split_route_c_unreal_array(*zone,array_error);
+                if (!cards) throw std::runtime_error{array_error};
+                total_cards += cards->size();
+            }
+            if (total_cards < 2 || total_cards > 128
+                || read_native_value<const void*>(objects.card_engine,0x288) != objects.spawner)
+                throw std::runtime_error{"generated startup countdown owner or count is invalid"};
+            const auto countdown_for_count = reinterpret_cast<std::int32_t(*)(UObject*,std::int32_t)>(module_base + 0xE28480);
+            const auto temporary_countdown = countdown_for_count(objects.card_engine,static_cast<std::int32_t>(total_cards));
+            const auto original_countdown = countdown_for_count(objects.card_engine,static_cast<std::int32_t>(total_cards - 1));
+            if (original_countdown <= 0 || temporary_countdown <= original_countdown
+                || parse_int32(required_getter_text(objects.card_engine,STR("getCurrentMaxTurnCountdown"))) != temporary_countdown
+                || read_native_value<std::int32_t>(api.engine_state,0x24) != temporary_countdown
+                || parse_int32(required_text(export_property_text(objects.spawner,STR("currentTurnCountdown")),"spawn countdown")) != temporary_countdown)
+                throw std::runtime_error{"generated startup countdown did not match its temporary deck"};
+            // The temporary ninth startup card raises player max health by one.
+            // Restore the original maximum once, using the game's damage-preserving
+            // setter, before the existing exact current-health restoration runs.
+            const auto projected = std::max(1,current - maximum + desired);
+            append_route_c_trace_failure("restore.generated-player.max-health.begin",
+                "current=" + std::to_string(current) + " max=" + std::to_string(maximum)
+                    + " targetMax=" + std::to_string(desired));
+            call_reflected(objects.card_engine,STR("setNewMaxHealth"),
+                {{STR("newMaxHealth"),std::to_string(desired)}});
+            if (parse_int32(required_getter_text(objects.card_engine,STR("getMaxHealth"))) != desired
+                || parse_int32(required_getter_text(objects.card_engine,STR("getCurrentHealth"))) != projected)
+                throw std::runtime_error{"generated startup native maximum-health adjustment did not verify"};
+            call_reflected(objects.card_engine,STR("OnHealthChanged"),
+                {{STR("Delta"),"0"},{STR("changeType"),"IN_GAME"}});
+            call_reflected(objects.card_engine,STR("setNewMaxTurnCountdown"),
+                {{STR("newMaxCountdown"),std::to_string(original_countdown)}});
+            call_reflected(objects.card_engine,STR("fillSpawnTurnCountdownTime"));
+            if (parse_int32(required_getter_text(objects.card_engine,STR("getCurrentMaxTurnCountdown"))) != original_countdown
+                || read_native_value<std::int32_t>(api.engine_state,0x24) != original_countdown
+                || parse_int32(required_text(export_property_text(objects.spawner,STR("currentTurnCountdown")),"spawn countdown")) != original_countdown)
+                throw std::runtime_error{"generated startup countdown normalization did not verify"};
+            restore.generated_startup_max_countdown = original_countdown;
+            restore.generated_startup_max_health_normalized = true;
+            append_route_c_trace("restore.generated-player.max-health.verified");
         }
 
         auto apply_route_c_health(const RouteCCheckpoint& checkpoint,
@@ -7359,11 +7485,13 @@ namespace QuantumCheckpoint
                     {
                         return;
                     }
-                    if (*maximum != restore.checkpoint.player_max_health)
+                    if (restore.generated_player_card_count != 0 && !restore.generated_startup_max_health_normalized)
                     {
-                        throw std::runtime_error{
-                            "Native startup produced a different maximum health"};
+                        normalize_generated_startup_scalars(restore,objects,*health,*maximum);
+                        return;
                     }
+                    if (*maximum != restore.checkpoint.player_max_health)
+                        throw std::runtime_error{"Native startup produced a different maximum health"};
                     append_route_c_trace_failure(
                         "restore.loot-drops.begin",
                         "count=" + std::to_string(restore.loot_drops.size()));
@@ -7402,6 +7530,10 @@ namespace QuantumCheckpoint
                     throw std::runtime_error{
                         "Restored player health or maximum health did not verify"};
                 }
+                if (restore.generated_startup_max_health_normalized
+                    && (parse_int32(required_getter_text(objects.card_engine,STR("getCurrentMaxTurnCountdown"))) != restore.generated_startup_max_countdown
+                        || parse_int32(required_text(export_property_text(objects.spawner,STR("currentTurnCountdown")),"spawn countdown")) != restore.generated_startup_max_countdown))
+                    throw std::runtime_error{"generated startup countdown drifted during verification"};
                 const auto restored_deck = required_getter_text(
                     objects.game_instance, STR("getActiveDecklist"));
                 const auto canonical_restored_deck = route_c_startup_decklist(restored_deck);
@@ -11269,9 +11401,9 @@ namespace QuantumCheckpoint
         QuantumCheckpointMod()
         {
             ModName = STR("QuantumCheckpoint");
-            ModVersion = STR("0.30.0");
+            ModVersion = STR("0.31.0");
 #if defined(QUANTUM_CHECKPOINT_RUNTIME_TEST_FIXTURES)
-            ModVersion = STR("0.30.0-test-fixtures");
+            ModVersion = STR("0.31.0-test-fixtures");
 #endif
             ModDescription = STR("Route C checkpoint with optional exact-state supplements");
             ModAuthors = STR("zaofenMachine and contributors");

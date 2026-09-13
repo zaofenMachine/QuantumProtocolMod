@@ -840,10 +840,13 @@ namespace QuantumCheckpoint
     auto exact_player_zones_startup_decklist(std::string_view active_decklist,
                                              std::string_view player_deck,
                                              std::string_view player_hand,
-                                             std::string& error)
+                                             std::string& error,
+                                             bool allow_single_generated_apple,
+                                             std::size_t* additional_card_count)
         -> std::optional<std::string>
     {
         error.clear();
+        if (additional_card_count) *additional_card_count = 0;
         auto startup = route_c_startup_decklist(active_decklist);
         auto card_list_span = parenthesized_field_span(startup, "cardList=", error);
         if (!card_list_span)
@@ -919,8 +922,22 @@ namespace QuantumCheckpoint
         if (active_total != deck_cards.size() + hand_cards.size()
             || active_counts != exact_counts)
         {
-            error = "exact player zones do not match the active deck card multiset";
-            return std::nullopt;
+            auto with_copy = active_counts;
+            ++with_copy["naturalApple@0"];
+            if (!allow_single_generated_apple
+                || !active_counts.contains("naturalApple@0")
+                || !active_counts.contains("naturalSpring@0")
+                || deck_cards.size() + hand_cards.size() != active_total + 1
+                || with_copy != exact_counts)
+            {
+                error = "exact player zones do not match the active deck card multiset"
+                    + std::string{allow_single_generated_apple ? " or its single generated apple extension" : ""};
+                return std::nullopt;
+            }
+            // Both ordinary startup and Spring construct a new native card via
+            // DF55F0. The caller restores the original active Decklist after this
+            // temporary load; the additional Apple remains a battle card only.
+            if (additional_card_count) *additional_card_count = 1;
         }
 
         // The guarded fixed-order experiment models native draws as TArray::Pop().
@@ -1215,10 +1232,13 @@ namespace QuantumCheckpoint
                                              std::string_view player_hand,
                                              std::string_view player_trash,
                                              std::string_view player_field,
-                                             std::string& error)
+                                             std::string& error,
+                                             bool allow_single_generated_apple,
+                                             std::size_t* additional_card_count)
         -> std::optional<std::string>
     {
         error.clear();
+        if (additional_card_count) *additional_card_count = 0;
         auto deck = split_route_c_unreal_array(player_deck, error);
         auto hand = split_route_c_unreal_array(player_hand, error);
         auto trash = split_route_c_unreal_array(player_trash, error);
@@ -1246,7 +1266,7 @@ namespace QuantumCheckpoint
         }
         staged_deck += ')';
         return exact_player_zones_startup_decklist(
-            active_decklist, staged_deck, player_hand, error);
+            active_decklist, staged_deck, player_hand, error, allow_single_generated_apple, additional_card_count);
     }
 
     auto exact_player_field_staging_matches(std::string_view expected_deck,

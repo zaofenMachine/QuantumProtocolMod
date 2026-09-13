@@ -2,6 +2,7 @@
 
 #include "CheckpointSchema.hpp"
 
+#include <cstddef>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -37,7 +38,9 @@ namespace QuantumCheckpoint
     auto exact_player_zones_startup_decklist(std::string_view active_decklist,
                                              std::string_view player_deck,
                                              std::string_view player_hand,
-                                             std::string& error)
+                                             std::string& error,
+                                             bool allow_single_generated_apple = false,
+                                             std::size_t* additional_card_count = nullptr)
         -> std::optional<std::string>;
     auto exact_player_trash_payload_checksum(const ExactPlayerTrashCheckpoint& checkpoint)
         -> std::string;
@@ -74,7 +77,9 @@ namespace QuantumCheckpoint
                                              std::string_view player_hand,
                                              std::string_view player_trash,
                                              std::string_view player_field,
-                                             std::string& error)
+                                             std::string& error,
+                                             bool allow_single_generated_apple = false,
+                                             std::size_t* additional_card_count = nullptr)
         -> std::optional<std::string>;
     auto exact_player_field_staging_matches(std::string_view expected_deck,
                                             std::string_view expected_hand,

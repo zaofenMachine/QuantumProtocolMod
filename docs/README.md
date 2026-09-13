@@ -50,3 +50,5 @@
 - [phase-26-player-field-health.md](phase-26-player-field-health.md)：场地生命修正、攻击与生命联合恢复、衰减及高于上限的当前生命。
 
 - [phase-27-native-player-counters.md](phase-27-native-player-counters.md)：原生计数器来源、逐标签观测、同总量差异和零／负值样本。
+
+- [phase-30-generated-player-card.md](phase-30-generated-player-card.md)：一张额外苹果、临时启动数值归一化、永久牌组保留及动作显示历史边界。
