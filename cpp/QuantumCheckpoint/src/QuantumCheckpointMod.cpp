@@ -2849,6 +2849,75 @@ namespace QuantumCheckpoint
             }
         }
 
+        auto append_native_card_health_statistics(ObjectSnapshot& snapshot, UObject* object) -> void
+        {
+            try
+            {
+                const auto live = find_route_c_objects();
+                const auto api = validated_native_move_card_api(live.card_engine);
+                if (object->GetWorld() != live.card_engine->GetWorld()
+                    || !address_is_readable(static_cast<const std::byte*>(static_cast<const void*>(object))
+                        + InGameCardStatePointerOffset, sizeof(void*)))
+                    throw std::runtime_error{"health statistics object is outside the active world"};
+                const auto* state = read_native_value<const void*>(object, InGameCardStatePointerOffset);
+                if (!native_card_location(api.engine_state, state, api.get_card_location)
+                    || !address_is_readable(state, 0x180))
+                    throw std::runtime_error{"health statistics ownership is unverified"};
+                const auto module_base = reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr));
+                const auto signature = [&](std::uintptr_t rva, const auto& bytes) {
+                    const auto* address = reinterpret_cast<const std::uint8_t*>(module_base + rva);
+                    if (!address_is_readable(address, bytes.size()) || !std::equal(bytes.begin(), bytes.end(), address))
+                        throw std::runtime_error{"native health statistics signature changed"};
+                };
+                signature(0xE1DF40, std::array<std::uint8_t,7>{0x8B,0x81,0x18,0x01,0,0,0xC3});
+                signature(0xE220A0, std::array<std::uint8_t,7>{0x8B,0x81,0x1C,0x01,0,0,0xC3});
+                signature(0xE28289, std::array<std::uint8_t,7>{0x48,0x8D,0xB1,0x40,0x01,0,0});
+                signature(0xE28417, std::array<std::uint8_t,18>{
+                    0x48,0x6B,0xC8,0x78,0x48,0x8B,0x02,0x80,0x7C,0x01,0x08,0x02,
+                    0x75,0x04,0x03,0x5C,0x01,0x68});
+                signature(0xE2843C, std::array<std::uint8_t,7>{0x41,0x8B,0x87,0x20,0x01,0,0});
+                signature(0xE2844B, std::array<std::uint8_t,7>{0x41,0x03,0x87,0x18,0x01,0,0});
+                const auto base = read_native_value<std::int32_t>(state, 0x118);
+                const auto current = read_native_value<std::int32_t>(state, 0x11C);
+                const auto adjustment = read_native_value<std::int32_t>(state, 0x120);
+                const auto bounded = [](std::int64_t value) { return value >= -100000 && value <= 100000; };
+                if (!bounded(base) || !bounded(current) || !bounded(adjustment))
+                    throw std::runtime_error{"native health scalar exceeds diagnostic bounds"};
+                std::int64_t modifier_sum{};
+                for (const auto* entry : read_native_sparse_elements(static_cast<const std::byte*>(state) + 0x130, 0x78))
+                {
+                    const auto stat = read_native_value<std::uint8_t>(entry, 8);
+                    const auto amount = read_native_value<std::int32_t>(entry, 0x68);
+                    if (stat > 3 || !bounded(amount)) throw std::runtime_error{"native health modifier is outside diagnostic bounds"};
+                    if (stat == 2) modifier_sum += amount;
+                }
+                const std::int64_t computed = base + static_cast<std::int64_t>(adjustment) + modifier_sum;
+                if (!bounded(computed) || !bounded(modifier_sum))
+                    throw std::runtime_error{"native maximum health exceeds diagnostic bounds"};
+                // E28260 is a pure sum of HEALTH modifiers, +118 and +120.
+                // It does not clamp current health or normalize the modifier map.
+                using Getter = std::int32_t (*)(const void*);
+                const auto actual = reinterpret_cast<Getter>(module_base + 0xE28260)(state);
+                if (actual != computed
+                    || reinterpret_cast<Getter>(module_base + 0xE1DF40)(state) != base
+                    || reinterpret_cast<Getter>(module_base + 0xE220A0)(state) != current)
+                    throw std::runtime_error{"native health getters disagree with decoded state"};
+                snapshot.properties.push_back({"nativeHealth:baseHealth",std::to_string(base)});
+                snapshot.properties.push_back({"nativeHealth:currentHealth",std::to_string(current)});
+                snapshot.properties.push_back({"nativeHealth:maxHealthAdjustment",std::to_string(adjustment)});
+                snapshot.properties.push_back({"nativeHealth:modifierHealthSum",std::to_string(modifier_sum)});
+                snapshot.properties.push_back({"nativeHealth:maxHealth",std::to_string(actual)});
+                if (auto* face = reflected_object_property(object, STR("CardFaceWidget"));
+                    face && address_is_readable(static_cast<const std::byte*>(static_cast<const void*>(face)) + 0x29C, 8))
+                {
+                    snapshot.properties.push_back({"nativeHealth:cardFaceCurrentHealth",std::to_string(read_native_value<std::int32_t>(face, 0x29C))});
+                    snapshot.properties.push_back({"nativeHealth:cardFaceBaseHealth",std::to_string(read_native_value<std::int32_t>(face, 0x2A0))});
+                }
+                snapshot.properties.push_back({"nativeHealth:status","verified-native-health"});
+            }
+            catch (const std::exception& error) { snapshot.properties.push_back({"nativeHealth:readError",error.what()}); }
+        }
+
         auto capture_player_attack_state(UObject* card) -> PlayerAttackState
         {
             ObjectSnapshot observation{};
@@ -3892,9 +3961,12 @@ namespace QuantumCheckpoint
             return {object, controller};
         }
 
-        auto queue_native_player_attack_modifier(UObject* engine, const NativeCardReference& card,
-                                                 const PlayerAttackModifier& modifier) -> void
+        auto queue_native_player_stat_modifier(UObject* engine, const NativeCardReference& card,
+                                               const PlayerAttackModifier& modifier,
+                                               std::uint8_t native_stat = 1) -> void
         {
+            if (native_stat != 1 && native_stat != 2)
+                throw std::runtime_error{"native stat action type is outside the tested ATTACK/HEALTH pair"};
             const auto api = validated_native_move_card_api(engine);
             if (GetCurrentThreadId() != g_game_thread_id.load(std::memory_order_acquire)
                 || !card.card || card.card->GetWorld() != engine->GetWorld()
@@ -3931,7 +4003,8 @@ namespace QuantumCheckpoint
             const std::array names{"NONE", "ONE_ATTACK", "DECAY"};
             for (std::size_t index{}; index < names.size(); ++index)
                 if (modifier.flags & (1u << index)) { if (!flags.empty()) flags += ','; flags += names[index]; }
-            const auto value = to_wstring("(stat=ATTACK,Tag=" + modifier.tag + ",Amount="
+            const auto stat_name = native_stat == 1 ? std::string{"ATTACK"} : std::string{"HEALTH"};
+            const auto value = to_wstring("(stat=" + stat_name + ",Tag=" + modifier.tag + ",Amount="
                 + std::to_string(modifier.amount) + ",limit=" + std::to_string(modifier.limit)
                 + ",Flags=(" + flags + "))");
             FOutputDevice errors{};
@@ -3944,7 +4017,7 @@ namespace QuantumCheckpoint
                 if (enum_value > 2) throw std::runtime_error{"native attack flag import changed"};
                 imported_flags |= static_cast<std::uint8_t>(1u << enum_value);
             }
-            if (read_native_value<std::uint8_t>(original.bytes.data(), 0) != 1
+            if (read_native_value<std::uint8_t>(original.bytes.data(), 0) != native_stat
                 || to_string(FName{read_native_value<std::int64_t>(original.bytes.data(), 0x58)}.ToString()) != modifier.tag
                 || read_native_value<std::int32_t>(original.bytes.data(), 0x60) != modifier.amount
                 || read_native_value<std::int32_t>(original.bytes.data(), 0x64) != modifier.limit
@@ -5182,7 +5255,7 @@ namespace QuantumCheckpoint
                     const auto order = player_attack_restore_order(saved);
                     const auto& modifier = saved.modifiers.at(order.at(prefix.modifiers.size()));
                     restore.field_attack_before_queue = prefix;
-                    queue_native_player_attack_modifier(objects.card_engine, cards[index], modifier);
+                    queue_native_player_stat_modifier(objects.card_engine, cards[index], modifier);
                     prefix.modifiers.push_back(modifier);
                     std::sort(prefix.modifiers.begin(), prefix.modifiers.end(),
                         [](const auto& a, const auto& b) { return a.tag < b.tag; });
@@ -7512,6 +7585,7 @@ namespace QuantumCheckpoint
                 {
                     append_private_card_state_diagnostics(snapshot, object);
                     append_native_card_statistics(snapshot, object);
+                    append_native_card_health_statistics(snapshot, object);
                     append_getters(snapshot, object, InGameCardGetters);
                     append_function_pointers(
                         snapshot, object, InGameCardDiagnosticFunctions);
@@ -10321,9 +10395,19 @@ namespace QuantumCheckpoint
                     modifier = {"quantumDecay",3,-1,4};
                 else if (profile == 5 && (before == "2,2" || before == "2,4|quantumLimit,2,3,0"))
                     modifier = {"quantumLimit",2,3,0};
+                else if ((profile == 6 || profile == 7) && before == "2,2")
+                {
+                    if (read_native_value<std::int32_t>(field[0].state, 0x118) != 2
+                        || read_native_value<std::int32_t>(field[0].state, 0x11C) != 2
+                        || read_native_value<std::int32_t>(field[0].state, 0x120) != 0)
+                        throw std::runtime_error{"health fixture requires an unmodified full-health apple"};
+                    modifier = {profile == 6 ? "quantumHealth" : "quantumHealthDecay",3,-1,
+                        static_cast<std::uint8_t>(profile == 6 ? 0 : 4)};
+                }
                 else throw std::runtime_error{"fixture profile refuses unexpected existing modifiers"};
                 queued = modifier.tag;
-                queue_native_player_attack_modifier(objects.card_engine, field[0], modifier);
+                queue_native_player_stat_modifier(objects.card_engine, field[0], modifier,
+                    static_cast<std::uint8_t>(profile >= 6 ? 2 : 1));
                 status = "queued";
                 resume_native_restore_actions(objects.card_engine);
                 reason = "native lifecycle action queued; observe its normalized result separately";
@@ -10547,7 +10631,7 @@ namespace QuantumCheckpoint
         QuantumCheckpointMod()
         {
             ModName = STR("QuantumCheckpoint");
-            ModVersion = STR("0.25.0");
+            ModVersion = STR("0.26.0");
 #if defined(QUANTUM_CHECKPOINT_RUNTIME_TEST_FIXTURES)
             ModVersion = STR("0.24.0-test-fixtures");
 #endif
@@ -10658,6 +10742,12 @@ namespace QuantumCheckpoint
             UE4SSProgram::get_program().register_keydown_event(
                 static_cast<Input::Key>(33), {Input::ModifierKey::CONTROL, Input::ModifierKey::SHIFT},
                 []() { g_player_stat_fixture_action.store(5, std::memory_order_release); });
+            UE4SSProgram::get_program().register_keydown_event(
+                static_cast<Input::Key>(34), {Input::ModifierKey::CONTROL, Input::ModifierKey::SHIFT},
+                []() { g_player_stat_fixture_action.store(6, std::memory_order_release); });
+            UE4SSProgram::get_program().register_keydown_event(
+                static_cast<Input::Key>(46), {Input::ModifierKey::CONTROL, Input::ModifierKey::SHIFT},
+                []() { g_player_stat_fixture_action.store(7, std::memory_order_release); });
             Output::send<LogLevel::Warning>(STR("[QuantumCheckpoint] DEVELOPMENT BUILD: Ctrl+Shift+F3 returns HAND to DECK, F4 fills HAND, F10 sends HAND to TRASH in a disposable battle.\n"));
 #endif
             Output::send<LogLevel::Verbose>(

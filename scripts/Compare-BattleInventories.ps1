@@ -311,6 +311,12 @@ function ConvertTo-NormalizedInventory {
             nativeCurrentAttack = Get-SnapshotProperty $card 'nativeStats:currentAttack'
             nativeModifierCount = Get-SnapshotProperty $card 'nativeStats:modifierCount'
             nativeModifiers = Get-SnapshotProperty $card 'nativeStats:modifiers'
+            nativeHealthStatus = Get-SnapshotProperty $card 'nativeHealth:status'
+            nativeBaseHealth = Get-SnapshotProperty $card 'nativeHealth:baseHealth'
+            nativeCurrentHealth = Get-SnapshotProperty $card 'nativeHealth:currentHealth'
+            nativeMaxHealthAdjustment = Get-SnapshotProperty $card 'nativeHealth:maxHealthAdjustment'
+            nativeModifierHealthSum = Get-SnapshotProperty $card 'nativeHealth:modifierHealthSum'
+            nativeMaxHealth = Get-SnapshotProperty $card 'nativeHealth:maxHealth'
             effects = @($effects)
         })
     }
@@ -437,6 +443,16 @@ function ConvertTo-NormalizedInventory {
                     $_.nativeModifierCount, $_.nativeModifiers
             }
         )
+        playerNativeHealthAvailable = $playerCards.Count -gt 0 -and @(
+            $playerCards | Where-Object { $_.nativeHealthStatus -cne 'verified-native-health' }
+        ).Count -eq 0
+        playerNativeHealth = ConvertTo-CountedValues @(
+            $playerCards | ForEach-Object {
+                'card={0}|location={1}|field={2}|base={3}|current={4}|adjustment={5}|modifierSum={6}|max={7}' -f `
+                    $_.descriptor, $_.location, $_.field, $_.nativeBaseHealth, $_.nativeCurrentHealth, `
+                    $_.nativeMaxHealthAdjustment, $_.nativeModifierHealthSum, $_.nativeMaxHealth
+            }
+        )
         playerCardRuntimeStateIgnoringLocation = ConvertTo-CountedValues @(
             $playerCards | ForEach-Object { Get-CardStateSignature $_ -IgnoreLocation }
         )
@@ -508,6 +524,10 @@ Add-Difference 'player-card-state' 'playerCardState' `
 if ($beforeState.playerNativeStatisticsAvailable -and $afterState.playerNativeStatisticsAvailable) {
     Add-Difference 'player-native-statistics' 'playerNativeStatistics' `
         $beforeState.playerNativeStatistics $afterState.playerNativeStatistics
+}
+if ($beforeState.playerNativeHealthAvailable -and $afterState.playerNativeHealthAvailable) {
+    Add-Difference 'player-native-health' 'playerNativeHealth' `
+        $beforeState.playerNativeHealth $afterState.playerNativeHealth
 }
 Add-Difference 'player-card-state' 'playerCardRuntimeStateIgnoringLocation' `
     $beforeState.playerCardRuntimeStateIgnoringLocation `
@@ -582,6 +602,10 @@ $report = [ordered]@{
         playerNativeStatisticsAvailable = $beforeState.playerNativeStatisticsAvailable -and $afterState.playerNativeStatisticsAvailable
         playerNativeStatisticsEqual = if ($beforeState.playerNativeStatisticsAvailable -and $afterState.playerNativeStatisticsAvailable) {
             Test-Equivalent $beforeState.playerNativeStatistics $afterState.playerNativeStatistics
+        } else { $null }
+        playerNativeHealthAvailable = $beforeState.playerNativeHealthAvailable -and $afterState.playerNativeHealthAvailable
+        playerNativeHealthEqual = if ($beforeState.playerNativeHealthAvailable -and $afterState.playerNativeHealthAvailable) {
+            Test-Equivalent $beforeState.playerNativeHealth $afterState.playerNativeHealth
         } else { $null }
         playerCardRuntimeStateIgnoringLocationEqual = Test-Equivalent `
             $beforeState.playerCardRuntimeStateIgnoringLocation `
