@@ -3122,6 +3122,192 @@ namespace QuantumCheckpoint
             catch (const std::exception& error) { snapshot.properties.push_back({"nativeCounters:readError",error.what()}); }
         }
 
+        auto append_native_card_effects(ObjectSnapshot& snapshot, UObject* object) -> void
+        {
+            try
+            {
+                if (GetCurrentThreadId() != g_game_thread_id.load(std::memory_order_acquire))
+                    throw std::runtime_error{"native effects observation requires the game thread"};
+                const auto live = find_route_c_objects();
+                const auto api = validated_native_move_card_api(live.card_engine);
+                auto* world = live.card_engine->GetWorld();
+                if (!object || object->IsUnreachable()
+                    || object->HasAnyFlags(static_cast<EObjectFlags>(RF_BeginDestroyed | RF_FinishDestroyed))
+                    || !world || object->GetWorld() != world
+                    || !address_is_readable(static_cast<const std::byte*>(static_cast<const void*>(object))
+                        + InGameCardStatePointerOffset, sizeof(void*)))
+                    throw std::runtime_error{"effect target is outside the current card-engine world"};
+                const auto* state = read_native_value<const void*>(object, InGameCardStatePointerOffset);
+                if (!native_card_location(api.engine_state, state, api.get_card_location))
+                    throw std::runtime_error{"native effect target ownership is unverified"};
+                const auto* card = read_native_value<const void*>(state, CardStateSharedObjectOffset);
+                const auto* owner = read_native_value<const void*>(state, CardStateSharedControllerOffset);
+                if (!card || !owner || !address_is_readable(
+                        static_cast<const std::byte*>(owner) + sizeof(void*), sizeof(std::int32_t)))
+                    throw std::runtime_error{"native effect card shared ownership is unreadable"};
+                const auto owner_count = read_native_value<std::int32_t>(owner, sizeof(void*));
+                if (owner_count <= 0 || owner_count > 1'000'000)
+                    throw std::runtime_error{"native effect card shared ownership is outside diagnostic bounds"};
+
+                // UI observations remain independent: a missing overlay or an
+                // uninitialized face must not imply an empty native effect list.
+                try
+                {
+                    auto* property = object->GetPropertyByNameInChain(STR("cardOverlayEffects"));
+                    auto* inner = property && property->IsA<FArrayProperty>()
+                        ? static_cast<FArrayProperty*>(property)->GetInner() : nullptr;
+                    if (!inner || !inner->IsA<FObjectProperty>() || inner->GetElementSize() != sizeof(void*))
+                        throw std::runtime_error{"UI effect overlay property is not an object-pointer array"};
+                    const auto* array = property->ContainerPtrToValuePtr<void>(object);
+                    if (!array || !address_is_readable(array, sizeof(void*) + sizeof(std::int32_t) * 2))
+                        throw std::runtime_error{"UI effect overlay array header is unreadable"};
+                    const auto* data = read_native_value<const void*>(array, 0);
+                    const auto count = read_native_value<std::int32_t>(array, sizeof(void*));
+                    const auto capacity = read_native_value<std::int32_t>(array, sizeof(void*) + sizeof(std::int32_t));
+                    snapshot.properties.push_back({"nativeEffects:uiOverlayCount", std::to_string(count)});
+                    snapshot.properties.push_back({"nativeEffects:uiOverlayCapacity", std::to_string(capacity)});
+                    if (count < 0 || count > 64 || capacity < count || capacity > 256
+                        || (capacity > 0 && !data)
+                        || (count > 0 && !address_is_readable(data, count * sizeof(void*))))
+                        throw std::runtime_error{"UI effect overlay array exceeds diagnostic bounds"};
+                    snapshot.properties.push_back({"nativeEffects:uiOverlayStatus", "verified-ui-effect-array"});
+                }
+                catch (const std::exception& error)
+                {
+                    snapshot.properties.push_back({"nativeEffects:uiOverlayStatus", "unavailable"});
+                    snapshot.properties.push_back({"nativeEffects:uiOverlayReadError", error.what()});
+                }
+                try
+                {
+                    auto* face = reflected_object_property(object, STR("CardFaceWidget"));
+                    snapshot.properties.push_back({"nativeEffects:cardFacePresent", face ? "True" : "False"});
+                    snapshot.properties.push_back({"nativeEffects:cardFaceFullName", face ? to_string(face->GetFullName()) : "None"});
+                    auto* face_world = face ? face->GetWorld() : nullptr;
+                    // This SDK forward-declares UWorld; its object identity is
+                    // read through the UObject base, without calling game logic.
+                    auto* face_world_object = reinterpret_cast<UObject*>(face_world);
+                    snapshot.properties.push_back({"nativeEffects:cardFaceWorld", face_world_object ? to_string(face_world_object->GetFullName()) : "None"});
+                    snapshot.properties.push_back({"nativeEffects:cardFaceWorldMatchesCard", face_world == world ? "True" : "False"});
+                    if (!face)
+                    {
+                        snapshot.properties.push_back({"nativeEffects:cardFaceStatus", "absent"});
+                    }
+                    else
+                    {
+                        if (!address_is_readable(static_cast<const std::byte*>(static_cast<const void*>(face)) + 0x294, 20))
+                            throw std::runtime_error{"card face scalar cache is unreadable"};
+                        for (const auto& [name, offset] : {
+                            std::pair{"nativeEffects:cardFaceCurrentAttack", std::size_t{0x294}},
+                            std::pair{"nativeEffects:cardFaceBaseAttack", std::size_t{0x298}},
+                            std::pair{"nativeEffects:cardFaceCurrentHealth", std::size_t{0x29C}},
+                            std::pair{"nativeEffects:cardFaceBaseHealth", std::size_t{0x2A0}},
+                            std::pair{"nativeEffects:cardFaceLevel", std::size_t{0x2A4}}})
+                            snapshot.properties.push_back({name, std::to_string(read_native_value<std::int32_t>(face, offset))});
+                        snapshot.properties.push_back({"nativeEffects:cardFaceStatus", "readable-ui-cache"});
+                    }
+                }
+                catch (const std::exception& error)
+                {
+                    snapshot.properties.push_back({"nativeEffects:cardFaceStatus", "unavailable"});
+                    snapshot.properties.push_back({"nativeEffects:cardFaceReadError", error.what()});
+                }
+
+                const auto module_base = reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr));
+                const auto signature = [&](std::uintptr_t rva, const auto& bytes) {
+                    const auto* address = reinterpret_cast<const std::uint8_t*>(module_base + rva);
+                    if (!address_is_readable(address, bytes.size()) || !std::equal(bytes.begin(), bytes.end(), address))
+                        throw std::runtime_error{"native effect descriptor getter signature changed"};
+                };
+                // E31E80 copies the eight-byte FName at effect+38 to its return
+                // buffer; E324E0 returns the uint8 effect type at +90. Read these
+                // same fields in place, never copy the shared effect array.
+                signature(0xE31E80, std::array<std::uint8_t, 11>{0x48,0x8B,0x41,0x38,0x48,0x89,0x02,0x48,0x8B,0xC2,0xC3});
+                signature(0xE324E0, std::array<std::uint8_t, 8>{0x0F,0xB6,0x81,0x90,0,0,0,0xC3});
+                // EAA97E forwards the original definition factory string to
+                // E528F0, which assigns it to the FString at effect+58. Read
+                // that bounded UTF-16 buffer directly, without native copies.
+                signature(0xEAA97E, std::array<std::uint8_t, 29>{0x49,0x8B,0xD7,0x48,0x8D,0x4C,0x24,0x60,0xE8,0x15,0x95,0x93,0xFF,0x48,0x8B,0x74,0x24,0x40,0x48,0x8B,0xD0,0x48,0x8B,0xCE,0xE8,0x55,0x7F,0xFA,0xFF});
+                signature(0xE528F0, std::array<std::uint8_t, 18>{0x40,0x53,0x48,0x83,0xEC,0x20,0x48,0x83,0xC1,0x58,0x48,0x8B,0xDA,0xE8,0xEE,0x0D,0x99,0xFF});
+                if (!address_is_readable(static_cast<const std::byte*>(card) + NativeCardEffectListPointerOffset,
+                                         sizeof(void*) + sizeof(std::int32_t) * 2))
+                    throw std::runtime_error{"native effect array header is unreadable"};
+                const auto* data = read_native_value<const void*>(card, NativeCardEffectListPointerOffset);
+                const auto count = read_native_value<std::int32_t>(card, NativeCardEffectListCountOffset);
+                const auto capacity = read_native_value<std::int32_t>(card, NativeCardEffectListCapacityOffset);
+                snapshot.properties.push_back({"nativeEffects:count", std::to_string(count)});
+                snapshot.properties.push_back({"nativeEffects:capacity", std::to_string(capacity)});
+                if (count < 0 || count > 64 || capacity < count || capacity > 256
+                    || (capacity > 0 && !data)
+                    || (count > 0 && !address_is_readable(data, count * sizeof(NativeSharedPointerPair))))
+                    throw std::runtime_error{"native effect array exceeds diagnostic bounds"};
+                std::string descriptors{"["};
+                for (std::int32_t index{}; index < count; ++index)
+                {
+                    const auto offset = static_cast<std::size_t>(index) * sizeof(NativeSharedPointerPair);
+                    const auto* effect = read_native_value<const void*>(data, offset);
+                    const auto* effect_owner = read_native_value<const void*>(data, offset + sizeof(void*));
+                    if (!effect || !effect_owner || !address_is_readable(effect, 0x91)
+                        || !address_is_readable(static_cast<const std::byte*>(effect_owner) + sizeof(void*), sizeof(std::int32_t)))
+                        throw std::runtime_error{"native effect entry shared ownership is unreadable"};
+                    const auto references = read_native_value<std::int32_t>(effect_owner, sizeof(void*));
+                    if (references <= 0 || references > 1'000'000)
+                        throw std::runtime_error{"native effect entry shared ownership is outside diagnostic bounds"};
+                    const auto tag = to_string(FName{read_native_value<std::int64_t>(effect, 0x38)}.ToString());
+                    const auto type = read_native_value<std::uint8_t>(effect, 0x90);
+                    // ECARD_EFFECT_TYPES 0..14 are valid, including NONE=14;
+                    // 15 is the MAX sentinel. Empty effect arrays are valid too.
+                    if (tag.empty() || tag.size() > 256 || type > 14)
+                        throw std::runtime_error{"native effect descriptor exceeds diagnostic bounds"};
+                    const auto* factory_data = read_native_value<const wchar_t*>(effect, 0x58);
+                    const auto factory_count = read_native_value<std::int32_t>(effect, 0x60);
+                    const auto factory_capacity = read_native_value<std::int32_t>(effect, 0x64);
+                    if (factory_count < 0 || factory_count > 1024 || factory_capacity < factory_count
+                        || factory_capacity > 4096 || (factory_capacity > 0 && !factory_data)
+                        || (factory_count > 0 && !address_is_readable(factory_data,
+                            static_cast<std::size_t>(factory_count) * sizeof(wchar_t))))
+                        throw std::runtime_error{"native effect factory string exceeds diagnostic bounds"};
+                    std::string factory_key{};
+                    if (factory_count > 0)
+                    {
+                        if (factory_data[factory_count - 1] != L'\0')
+                            throw std::runtime_error{"native effect factory string is not terminated"};
+                        const std::wstring_view factory_view{factory_data, static_cast<std::size_t>(factory_count - 1)};
+                        if (factory_view.find(L'\0') != std::wstring_view::npos)
+                            throw std::runtime_error{"native effect factory string contains an embedded terminator"};
+                        factory_key = to_string(factory_view);
+                    }
+                    // Unknown native factory fallbacks retain an empty key;
+                    // preserve that observation rather than infer a definition.
+                    if (read_native_value<const void*>(data, offset) != effect
+                        || read_native_value<const void*>(data, offset + sizeof(void*)) != effect_owner
+                        || read_native_value<std::int32_t>(effect_owner, sizeof(void*)) != references
+                        || read_native_value<const wchar_t*>(effect, 0x58) != factory_data
+                        || read_native_value<std::int32_t>(effect, 0x60) != factory_count
+                        || read_native_value<std::int32_t>(effect, 0x64) != factory_capacity)
+                        throw std::runtime_error{"native effect entry changed during observation"};
+                    if (index != 0) descriptors += ',';
+                    descriptors += "{\"tag\":\"" + json_escape(tag) + "\",\"type\":" + std::to_string(type)
+                        + ",\"factoryKey\":\"" + json_escape(factory_key) + "\"}";
+                }
+                descriptors += ']';
+                if (read_native_value<const void*>(object, InGameCardStatePointerOffset) != state
+                    || read_native_value<const void*>(state, CardStateSharedObjectOffset) != card
+                    || read_native_value<const void*>(state, CardStateSharedControllerOffset) != owner
+                    || read_native_value<std::int32_t>(owner, sizeof(void*)) != owner_count
+                    || read_native_value<const void*>(card, NativeCardEffectListPointerOffset) != data
+                    || read_native_value<std::int32_t>(card, NativeCardEffectListCountOffset) != count
+                    || read_native_value<std::int32_t>(card, NativeCardEffectListCapacityOffset) != capacity)
+                    throw std::runtime_error{"native effect owner or array changed during observation"};
+                snapshot.properties.push_back({"nativeEffects:ordered", std::move(descriptors)});
+                snapshot.properties.push_back({"nativeEffects:status", "verified-native-effects"});
+            }
+            catch (const std::exception& error)
+            {
+                snapshot.properties.push_back({"nativeEffects:status", "unavailable"});
+                snapshot.properties.push_back({"nativeEffects:readError", error.what()});
+            }
+        }
+
         // Call only after a native observer has validated the state owner and layout.
         auto decode_player_stat_modifiers(const void* state, std::uint8_t wanted, bool allow_health)
             -> std::vector<PlayerStatModifier>
@@ -8792,6 +8978,7 @@ namespace QuantumCheckpoint
                     append_native_card_health_statistics(snapshot, object);
                     append_native_card_level(snapshot, object);
                     append_native_card_counters(snapshot, object);
+                    append_native_card_effects(snapshot, object);
                     append_getters(snapshot, object, InGameCardGetters);
                     append_function_pointers(
                         snapshot, object, InGameCardDiagnosticFunctions);
@@ -11942,9 +12129,9 @@ namespace QuantumCheckpoint
         QuantumCheckpointMod()
         {
             ModName = STR("QuantumCheckpoint");
-            ModVersion = STR("0.34.0");
+            ModVersion = STR("0.35.0");
 #if defined(QUANTUM_CHECKPOINT_RUNTIME_TEST_FIXTURES)
-            ModVersion = STR("0.34.0-test-fixtures");
+            ModVersion = STR("0.35.0-test-fixtures");
 #endif
             ModDescription = STR("Route C checkpoint with optional exact-state supplements");
             ModAuthors = STR("zaofenMachine and contributors");

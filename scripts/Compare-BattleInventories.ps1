@@ -245,7 +245,7 @@ function Get-NativeHealthSignature {
         $Card.nativeMaxHealthAdjustment, $Card.nativeModifierHealthSum, $Card.nativeMaxHealth)
 }
 
-function ConvertTo-NativeOrderedPlayerState {
+function ConvertTo-NativeOrderedPlayerCards {
     param(
         [Parameter(Mandatory = $true)][object]$Inventory,
         [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$Cards
@@ -304,6 +304,25 @@ function ConvertTo-NativeOrderedPlayerState {
                 if ($card.location -cne $location -or $card.instance -cne $instances[$index]) {
                     throw "Native player $location ID disagrees with its zone or ordered card instance"
                 }
+                $states.Add($card)
+            }
+            $orderedState[$location] = @($states)
+        }
+        return [ordered]@{ available = $true; reason = 'Complete native DECK/HAND/TRASH ID and instance order'; state = $orderedState }
+    } catch {
+        return [ordered]@{ available = $false; reason = $_.Exception.Message; state = $null }
+    }
+}
+
+function ConvertTo-NativeOrderedPlayerState {
+    param([Parameter(Mandatory = $true)][object]$OrderedCards)
+
+    try {
+        if (-not $OrderedCards.available) { throw $OrderedCards.reason }
+        $orderedState = [ordered]@{}
+        foreach ($location in $OrderedCards.state.Keys) {
+            $states = [System.Collections.Generic.List[object]]::new()
+            foreach ($card in $OrderedCards.state[$location]) {
                 if ($card.nativeStatisticsStatus -cne 'verified-native-attack' -or
                     $card.nativeHealthStatus -cne 'verified-native-health' -or
                     $card.nativeCountersStatus -cne 'verified-native-counters' -or
@@ -335,11 +354,72 @@ function ConvertTo-NativeOrderedPlayerState {
     }
 }
 
+function ConvertTo-NativeEffectMembership {
+    param(
+        [Parameter(Mandatory = $true)][object]$OrderedCards,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$PlayerCards
+    )
+
+    try {
+        if (-not $OrderedCards.available) { throw $OrderedCards.reason }
+        $state = [ordered]@{}
+        foreach ($location in @('DECK', 'HAND', 'TRASH', 'FIELD')) {
+            $zoneCards = if ($location -ceq 'FIELD') {
+                @($PlayerCards | Where-Object location -CEQ 'FIELD' | Sort-Object field)
+            } else { @($OrderedCards.state[$location]) }
+            $seenSlots = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+            $states = [System.Collections.Generic.List[object]]::new()
+            foreach ($card in $zoneCards) {
+                if ($location -ceq 'FIELD' -and (-not $card.fieldBindingAvailable -or
+                    $card.field -cnotmatch '^PLAYER:(FRONT|BACK):[0-4]$' -or -not $seenSlots.Add($card.field))) {
+                    throw 'Native player FIELD effects lack unique, resolved player slot bindings'
+                }
+                if ($card.nativeEffectsStatus -cne 'verified-native-effects' -or
+                    -not [string]::IsNullOrEmpty($card.nativeEffectsReadError) -or
+                    $card.nativeEffectsCount -cnotmatch '^(0|[1-9][0-9]?)$' -or [int]$card.nativeEffectsCount -gt 64 -or
+                    [string]::IsNullOrWhiteSpace($card.nativeEffectsOrdered)) {
+                    throw "Native player $location effect membership is unavailable or invalid"
+                }
+                $parsed = ('{"effects":' + $card.nativeEffectsOrdered + '}') | ConvertFrom-Json
+                if ($parsed.effects -isnot [System.Array] -or @($parsed.PSObject.Properties).Count -ne 1 -or
+                    @($parsed.effects).Count -ne [int]$card.nativeEffectsCount) {
+                    throw "Native player $location effect membership count or array is invalid"
+                }
+                $effects = [System.Collections.Generic.List[object]]::new()
+                foreach ($effect in $parsed.effects) {
+                    if ($null -eq $effect -or @($effect.PSObject.Properties).Count -ne 3 -or
+                        @($effect.PSObject.Properties.Name | Where-Object { $_ -cnotin @('tag', 'type', 'factoryKey') }).Count -ne 0 -or
+                        $effect.tag -isnot [string] -or [string]::IsNullOrEmpty($effect.tag) -or
+                        [System.Text.Encoding]::UTF8.GetByteCount($effect.tag) -gt 256 -or
+                        $effect.factoryKey -isnot [string] -or $effect.factoryKey.Length -gt 1023 -or
+                        $effect.factoryKey.IndexOf([char]0) -ge 0 -or
+                        ($effect.type -isnot [int] -and $effect.type -isnot [long]) -or $effect.type -lt 0 -or $effect.type -gt 14) {
+                        throw "Native player $location effect descriptor is malformed"
+                    }
+                    $effects.Add([ordered]@{ tag = $effect.tag; type = $effect.type; factoryKey = $effect.factoryKey })
+                }
+                $entry = [ordered]@{ instance = $card.instance; effects = @($effects) }
+                if ($location -ceq 'FIELD') { $entry['field'] = $card.field }
+                $states.Add($entry)
+            }
+            $state[$location] = @($states)
+        }
+        # Storage and the character ability slot are outside the Route C D/H/T/F
+        # layout contract. Do not silently ignore transient zones such as PENDING.
+        if (@($PlayerCards | Where-Object { $_.location -cnotin @('DECK', 'HAND', 'TRASH', 'FIELD', 'STORAGE', 'CHARACTER') }).Count -ne 0) {
+            throw 'Native player effect membership contains an unsupported player zone'
+        }
+        return [ordered]@{ available = $true; reason = 'Complete ordered native effect membership bound to DECK/HAND/TRASH positions, FIELD slots and full card instances; STORAGE and CHARACTER ability cards excluded'; state = $state }
+    } catch {
+        return [ordered]@{ available = $false; reason = $_.Exception.Message; state = $null }
+    }
+}
+
 function ConvertTo-NormalizedInventory {
     param([Parameter(Mandatory = $true)][string]$Path)
 
     $resolvedPath = (Resolve-Path -LiteralPath $Path).Path
-    $inventory = Get-Content -LiteralPath $resolvedPath -Raw | ConvertFrom-Json
+    $inventory = Get-Content -LiteralPath $resolvedPath -Raw -Encoding UTF8 | ConvertFrom-Json
     if ($inventory.kind -ne 'read-only-battle-inventory') {
         throw "Not a read-only battle inventory: $resolvedPath"
     }
@@ -348,6 +428,7 @@ function ConvertTo-NormalizedInventory {
     }
 
     $objectsByName = @{}
+    $objectNameCounts = @{}
     foreach ($snapshot in $inventory.objects) {
         if ($snapshot.role -eq 'CardPlacementComponent') {
             continue
@@ -355,14 +436,17 @@ function ConvertTo-NormalizedInventory {
         $objectName = Get-UnrealObjectName $snapshot.fullName
         if ($objectName) {
             $objectsByName[$objectName] = $snapshot
+            $objectNameCounts[$objectName]++
         }
     }
 
     $placementsByOwner = @{}
+    $placementCountsByOwner = @{}
     foreach ($placement in @($inventory.objects | Where-Object role -eq 'CardPlacementComponent')) {
         $ownerMatch = [regex]::Match($placement.fullName, 'BP_InGameCard_C_\d+')
         if ($ownerMatch.Success) {
             $placementsByOwner[$ownerMatch.Value] = $placement
+            $placementCountsByOwner[$ownerMatch.Value]++
         }
     }
 
@@ -371,6 +455,7 @@ function ConvertTo-NormalizedInventory {
         $cardName = Get-UnrealObjectName $card.fullName
         $placement = $placementsByOwner[$cardName]
         $field = '-'
+        $fieldBindingAvailable = $false
         if ($null -ne $placement) {
             $slotName = Get-UnrealObjectName (Get-SnapshotProperty $placement 'getter:getPlacedFieldSlot')
             $slot = if ($slotName) { $objectsByName[$slotName] } else { $null }
@@ -379,6 +464,9 @@ function ConvertTo-NormalizedInventory {
                     (Get-SnapshotProperty $slot 'boardSide'), `
                     (Get-SnapshotProperty $slot 'rowType'), `
                     (Get-SnapshotProperty $slot 'SlotIndex')
+                $fieldBindingAvailable = $placementCountsByOwner[$cardName] -eq 1 -and
+                    $objectNameCounts[$cardName] -eq 1 -and $objectNameCounts[$slotName] -eq 1 -and
+                    $slot.role -ceq 'BP_FieldSlot_C'
             }
         }
 
@@ -425,6 +513,7 @@ function ConvertTo-NormalizedInventory {
             id = Get-SnapshotProperty $card 'getter:getId'
             location = Get-SnapshotProperty $card 'getter:getCardLocation'
             field = $field
+            fieldBindingAvailable = $fieldBindingAvailable
             health = Get-SnapshotProperty $card 'getter:getCurrentHealth'
             baseHealth = Get-SnapshotProperty $card 'nativeDiagnostic:baseHealth'
             turn = Get-SnapshotProperty $card 'getter:getCurrentTurnCounter'
@@ -458,6 +547,10 @@ function ConvertTo-NormalizedInventory {
             nativeMaxHealthAdjustment = Get-SnapshotProperty $card 'nativeHealth:maxHealthAdjustment'
             nativeModifierHealthSum = Get-SnapshotProperty $card 'nativeHealth:modifierHealthSum'
             nativeMaxHealth = Get-SnapshotProperty $card 'nativeHealth:maxHealth'
+            nativeEffectsStatus = Get-SnapshotProperty $card 'nativeEffects:status'
+            nativeEffectsReadError = Get-SnapshotProperty $card 'nativeEffects:readError'
+            nativeEffectsCount = Get-SnapshotProperty $card 'nativeEffects:count'
+            nativeEffectsOrdered = Get-SnapshotProperty $card 'nativeEffects:ordered'
             effects = @($effects)
             effectsAvailable = $effectsAvailable
         })
@@ -522,7 +615,9 @@ function ConvertTo-NormalizedInventory {
 
     $playerCards = @($cards | Where-Object { -not $_.location.StartsWith('ENEMY_') })
     $enemyCards = @($cards | Where-Object { $_.location.StartsWith('ENEMY_') })
-    $orderedPlayerState = ConvertTo-NativeOrderedPlayerState $inventory @($cards)
+    $orderedPlayerCards = ConvertTo-NativeOrderedPlayerCards $inventory @($cards)
+    $orderedPlayerState = ConvertTo-NativeOrderedPlayerState $orderedPlayerCards
+    $nativeEffectMembership = ConvertTo-NativeEffectMembership $orderedPlayerCards $playerCards
 
     return [ordered]@{
         path = $resolvedPath
@@ -576,6 +671,9 @@ function ConvertTo-NormalizedInventory {
         playerNativeOrderedStateAvailable = $orderedPlayerState.available
         playerNativeOrderedStateReason = $orderedPlayerState.reason
         playerNativeOrderedState = $orderedPlayerState.state
+        playerNativeEffectMembershipAvailable = $nativeEffectMembership.available
+        playerNativeEffectMembershipReason = $nativeEffectMembership.reason
+        playerNativeEffectMembership = $nativeEffectMembership.state
         playerCardState = ConvertTo-CountedValues @(
             $playerCards | ForEach-Object { Get-CardStateSignature $_ }
         )
@@ -674,6 +772,12 @@ if ($beforeState.playerNativeOrderedStateAvailable -and $afterState.playerNative
             $beforeState.playerNativeOrderedState[$zone] $afterState.playerNativeOrderedState[$zone]
     }
 }
+if ($beforeState.playerNativeEffectMembershipAvailable -and $afterState.playerNativeEffectMembershipAvailable) {
+    foreach ($zone in $beforeState.playerNativeEffectMembership.Keys) {
+        Add-Difference 'player-native-effect-membership' "playerNativeEffectMembership.$zone" `
+            $beforeState.playerNativeEffectMembership[$zone] $afterState.playerNativeEffectMembership[$zone]
+    }
+}
 
 Add-Difference 'player-card-state' 'playerCardState' `
     $beforeState.playerCardState $afterState.playerCardState
@@ -765,6 +869,10 @@ $report = [ordered]@{
         playerNativeOrderedStateEqual = if ($beforeState.playerNativeOrderedStateAvailable -and $afterState.playerNativeOrderedStateAvailable) {
             Test-Equivalent $beforeState.playerNativeOrderedState $afterState.playerNativeOrderedState
         } else { $null }
+        playerNativeEffectMembershipAvailable = $beforeState.playerNativeEffectMembershipAvailable -and $afterState.playerNativeEffectMembershipAvailable
+        playerNativeEffectMembershipEqual = if ($beforeState.playerNativeEffectMembershipAvailable -and $afterState.playerNativeEffectMembershipAvailable) {
+            Test-Equivalent $beforeState.playerNativeEffectMembership $afterState.playerNativeEffectMembership
+        } else { $null }
         playerCardStateIncludingLocationEqual = Test-Equivalent `
             $beforeState.playerCardState $afterState.playerCardState
         playerNativeStatisticsAvailable = $beforeState.playerNativeStatisticsAvailable -and $afterState.playerNativeStatisticsAvailable
@@ -797,6 +905,9 @@ $report = [ordered]@{
         sharedRuntimeCardIdCount = $sharedIds.Count
         beforeNativeOrderedStateCoverage = $beforeState.playerNativeOrderedStateReason
         afterNativeOrderedStateCoverage = $afterState.playerNativeOrderedStateReason
+        beforeNativeEffectMembershipCoverage = $beforeState.playerNativeEffectMembershipReason
+        afterNativeEffectMembershipCoverage = $afterState.playerNativeEffectMembershipReason
+        nativeEffectMembershipNote = 'Native effect membership compares ordered tag/type/factoryKey arrays without UI or action-history inference. DECK/HAND/TRASH use verified native ID-to-instance bindings; FIELD uses unique resolved player slots. Full CardInfoInstance text is compared in every position. STORAGE and CHARACTER ability cards are outside this D/H/T/F scope; other player zones, including PENDING, make coverage unknown. Empty arrays are valid; missing or invalid native coverage yields null and does not alter older checks.'
         note = 'Runtime GUIDs are excluded from equality. playerZoneSequencesEqual compares metadata-sorted controller views, not draw/hand order. Native order is unknown (null) unless both inventories include all three player-zone arrays. Ordered runtime state requires complete native DECK/HAND/TRASH ID arrays resolving unique cards in the correct zone and instance position, with verified attack/health/counters/level and complete turn/effect observations. GUIDs only link each inventory internally; missing or invalid coverage yields null, never inferred order. Native attack/modifier equality is unknown (null) unless every player card in both inventories has verified native statistics; the older card-state check does not cover those fields.'
     }
     futureSpawnPlan = [ordered]@{

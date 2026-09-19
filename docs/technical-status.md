@@ -1,20 +1,18 @@
 # 技术状态与已知事实
 
-> 2026-09-20 当前续接入口：[第三十三阶段](phase-33-player-hand-counters.md)。用户授权持续推进并自由使用电脑，仅在确需决定方向时停下。下方旧调试内容只保留历史证据，不代表当前版本或待办。
+> 2026-09-20 当前续接入口：[第三十四阶段](phase-34-native-effect-membership.md)。用户授权持续推进并自由使用电脑，仅在确需决定方向时停下。下方旧调试内容仅保留历史证据。
 
 ## 2026-09-20 当前状态
 
-当前 v0.34.0 已补齐受限 HAND generic 计数，与已有 HAND HEALTH 共用 schema 2 补充文件和原生位置绑定。布局 zones 3 / trash 4 / field 7 沿用原依赖校验和，无需再新增文件或升级布局；schema 1 保留原字节与校验语义，只允许零计数。HAND generic 范围 0–256、special 为空；DECK/TRASH 仍要求默认数值。
+当前 v0.35.0 增加 F1 原生技能成员与独立 UI 诊断，保存/恢复行为仍沿用 v0.34.0。原生效果按顺序导出内部 tag、type、原始 factoryKey；比较脚本新增与原生牌序、完整 CardInfo 和 FIELD 槽位绑定的成员比较，缺失观测为 unknown。生产 DLL `1735B21D35D38036E5C75823A08930DC02FAA4FD654E46FBC70A88497E0EA493`，开发夹具关闭，4/4 CTest 通过。
 
-恢复在所有移动结束后，先预验全部手牌的默认起点，再分别重放 HEALTH 与 generic 原生动作；逐张真实读回，最终稳定窗口持续验证，失败仅回退一次。生产 DLL 为 `42F6F6661E4FA6E92FCEC03614F580529BD860CB62CA71544E3F3E58C033D3E1`，开发夹具关闭，4/4 CTest 通过。
+已用正常操作复现既有漏洞：露西娅原 2/2，格式化删除两个技能后仍为 2/2，完整 CardInfo 不变；上升涡流回手、清空 FIELD 后，旧捕获接受 HAND+TRASH 精确补充，恢复报告 passed，但原生技能 0→2。该样本是漏检证据，不是技能精确恢复成功。
 
-14 组恢复（13 条 cases + 独立 one-fresh）、3 项依赖故障和稳定窗口干扰已完成。真实 Rocket 计数 1/4、生命 +1 与计数共存、混合场地、再次保存、旧格式及生成卡均验证。三组恢复后出牌实际消费计数并造成预期伤害；one/mixed 对照完整玩家状态相同。
+连续 one/mixed/combined/four/zero 五组恢复的原生成员都符合定义，UI 数量也匹配。第三十三阶段 Cherry 显示缺口未复现，根因仍未知，不改写旧失败。原始用户检查点已恢复，17 文件与备份按字节一致。
 
-效果历史不在本轮恢复范围。one-fresh/combined/four 仍有 Rocket TRIGGER 与 Flashbang INIT 的 COMPLETE→NONE 差异，全量比较保持 false，另有严格限定专项核对；旧 FIELD 基线缺原生 ID 顺序时保持未知。一次零计数同进程观测的 DECK 效果显示不完整，严格验收拒绝；新进程相同检查点零差异通过，原失败保留。不能把这些范围描述成全游戏精确快照。
+证据目录：`F:/Project/QuantumProtoclMod.runtime-evidence/20260920-native-effect-membership`。源码提交、推送与最终测试记录见该目录 validation-summary.json。
 
-证据目录：`F:/Project/QuantumProtoclMod.runtime-evidence/20260920-hand-counters`。源码提交与推送状态以 `validation-summary.json` 为准。原始用户检查点已恢复，全部文件与开始备份按字节一致。
-
-下一项：先补原生效果列表观测，查清同进程樱桃效果显示缺口及效果删除与 CardInfo 的关系，再实机验证 sorc 回手增加动态 baseHP，推进基础生命与 HEALTH modifier 组合。已确认 mageSharedAdder 调 SET_BASE_STATS，不是 maxHP adjustment；暂不扩大 HAND ATTACK/special。满充能、更多生成卡、LEVEL 修正、独立生命调整、STORAGE/角色能力卡和效果动作历史仍有缺口。继续“小关重开 + 玩家精确恢复”，重编程和敌人精确恢复保持搁置。
+下一项先修技能成员门禁：全部 D/H/T/F 保存时符合定义，恢复在原生临时抑制之外复查；新布局 schema 标记捕获证明，旧版明确未知。同时让旧补充在新保存前失效，避免同秒拒绝保存后残留旧有效布局。完成后继续 sorc 回手动态 baseHP 与 HEALTH modifier 组合。技能动作历史、更多生成卡、满充能、LEVEL 修正、独立生命调整、STORAGE/能力卡仍未补齐；重编程与敌人精确恢复继续搁置。
 
 ## 早期阶段历史记录
 
