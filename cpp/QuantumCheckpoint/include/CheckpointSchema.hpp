@@ -14,13 +14,20 @@ namespace QuantumCheckpoint
     inline constexpr int ExactSpawnPlanSchemaVersion = 1;
     inline constexpr std::string_view ExactSpawnPlanCheckpointKind =
         "route-c-exact-spawn-plan";
-    inline constexpr int ExactPlayerZonesSchemaVersion = 3;
+    // These fixed minimum versions attest that capture checked ordered native
+    // effect membership against each player's selected CardInfo upgrade effects
+    // across DECK/HAND/TRASH/FIELD. They do not attest effect private state/history.
+    // Keep them independent of later increases to the supported schema maxima.
+    inline constexpr int ExactPlayerZonesEffectMembershipSchemaVersion = 4;
+    inline constexpr int ExactPlayerTrashEffectMembershipSchemaVersion = 5;
+    inline constexpr int ExactPlayerFieldEffectMembershipSchemaVersion = 8;
+    inline constexpr int ExactPlayerZonesSchemaVersion = 4;
     inline constexpr std::string_view ExactPlayerZonesCheckpointKind =
         "route-c-exact-player-zones";
-    inline constexpr int ExactPlayerTrashSchemaVersion = 4;
+    inline constexpr int ExactPlayerTrashSchemaVersion = 5;
     inline constexpr std::string_view ExactPlayerTrashCheckpointKind =
         "route-c-exact-player-trash";
-    inline constexpr int ExactPlayerFieldSchemaVersion = 7;
+    inline constexpr int ExactPlayerFieldSchemaVersion = 8;
     inline constexpr std::string_view ExactPlayerFieldCheckpointKind =
         "route-c-exact-player-field";
     inline constexpr int ExactPlayerHandHealthSchemaVersion = 2;

@@ -707,6 +707,18 @@ int main()
     require(full_hand_staging && full_hand_staging->moves.size() == 12
                 && full_hand_staging->before_field_move_count == 11,
             "a full hand defers its last card until the native field staging slot is no longer needed");
+    auto attested_field_staging_layout = full_hand_layout;
+    attested_field_staging_layout.schema_version = ExactPlayerFieldSchemaVersion;
+    const auto attested_field_staging = plan_player_hand_staging(
+        attested_field_staging_layout, initial_full_hand, 7, error);
+    require(attested_field_staging
+                && attested_field_staging->moves.size() == full_hand_staging->moves.size()
+                && attested_field_staging->before_field_move_count == full_hand_staging->before_field_move_count
+                && std::equal(attested_field_staging->moves.begin(), attested_field_staging->moves.end(),
+                    full_hand_staging->moves.begin(), [](const auto& left, const auto& right) {
+                        return left.candidate == right.candidate && left.destination == right.destination;
+                    }),
+            "the membership-attested FIELD schema preserves the existing full-hand staging plan");
     std::vector<std::size_t> staged_deck_indices{5,6,7}, staged_hand_indices{0,1,2,3,4};
     for (std::size_t step{}; step < full_hand_staging->moves.size(); ++step)
     {
@@ -1431,11 +1443,14 @@ int main()
                 && error.find("legacy") != std::string::npos,
             "downgrading a sidecar cannot hide newer hand counter claims");
 
-    require(ExactPlayerZonesCheckpoint{}.schema_version == 3
-                && ExactPlayerTrashCheckpoint{}.schema_version == 4
-                && ExactPlayerFieldCheckpoint{}.schema_version == 7,
-            "new captures select layouts with mandatory versioned hand-health dependencies");
-    const auto check_hand_health_dependency = [&](auto legacy_layout, int latest,
+    require(ExactPlayerZonesCheckpoint{}.schema_version == 4
+                && ExactPlayerTrashCheckpoint{}.schema_version == 5
+                && ExactPlayerFieldCheckpoint{}.schema_version == 8
+                && ExactPlayerZonesEffectMembershipSchemaVersion == 4
+                && ExactPlayerTrashEffectMembershipSchemaVersion == 5
+                && ExactPlayerFieldEffectMembershipSchemaVersion == 8,
+            "new captures select layouts that attest whole-player native effect membership");
+    const auto check_hand_health_dependency = [&](auto legacy_layout, int dependency_version,
                                                    auto serialize, auto parse, auto checksum) {
         const auto legacy_json = serialize(legacy_layout);
         const auto legacy_hash = checksum(legacy_layout);
@@ -1454,7 +1469,7 @@ int main()
                 "legacy layout JSON cannot carry an unchecked newer hand-health dependency");
 
         auto current = legacy_layout;
-        current.schema_version = latest;
+        current.schema_version = dependency_version;
         current.player_hand = parsed_hand_health->player_hand;
         current.player_hand_health_checksum = parsed_hand_health->payload_checksum;
         const auto current_json = serialize(current);
@@ -1497,7 +1512,7 @@ int main()
                 "changing a valid dependency digest without changing the layout checksum is rejected");
         auto downgraded = current_json;
         const auto version_begin = downgraded.find("\"schemaVersion\": ") + std::string{"\"schemaVersion\": "}.size();
-        downgraded.replace(version_begin, 1, std::to_string(latest - 1));
+        downgraded.replace(version_begin, 1, std::to_string(dependency_version - 1));
         require(!parse(downgraded, error),
                 "downgrading a layout cannot hide its required hand-health dependency");
 
@@ -1527,6 +1542,80 @@ int main()
         serialize_exact_player_trash_checkpoint, parse_exact_player_trash_checkpoint,
         exact_player_trash_payload_checksum);
     check_hand_health_dependency(generated_schema, 7,
+        serialize_exact_player_field_checkpoint, parse_exact_player_field_checkpoint,
+        exact_player_field_payload_checksum);
+
+    const auto check_effect_membership_schema = [&](auto layout, int legacy_version,
+                                                      int attested_version, int proof_version,
+                                                      auto serialize, auto parse, auto checksum) {
+        layout.schema_version = legacy_version;
+        layout.player_hand = parsed_hand_health->player_hand;
+        layout.player_hand_health_checksum = parsed_hand_health->payload_checksum;
+        const auto legacy_json = serialize(layout);
+        const auto parsed_legacy = parse(legacy_json, error);
+        require(parsed_legacy && parsed_legacy->schema_version == legacy_version
+                    && parsed_legacy->schema_version < proof_version
+                    && parsed_legacy->payload_checksum == checksum(layout),
+                "previous latest layouts retain readable payloads without a saved-membership proof");
+
+        auto attested = layout;
+        attested.schema_version = attested_version;
+        const auto attested_json = serialize(attested);
+        const auto parsed_attested = parse(attested_json, error);
+        require(parsed_attested && parsed_attested->schema_version >= proof_version
+                    && parsed_attested->payload_checksum == checksum(attested)
+                    && parsed_attested->player_hand_health_checksum == layout.player_hand_health_checksum
+                    && serialize(*parsed_attested) == attested_json,
+                "membership-attested layouts round trip with their existing HAND dependency");
+        require(checksum(attested) != checksum(layout),
+                "the membership attestation version participates in each layout payload checksum");
+
+        const auto change_version = [](std::string json, int version) {
+            const auto begin = json.find("\"schemaVersion\": ") + std::string{"\"schemaVersion\": "}.size();
+            const auto end = json.find(',', begin);
+            json.replace(begin, end - begin, std::to_string(version));
+            return json;
+        };
+        auto promoted = change_version(legacy_json, attested_version);
+        error.clear();
+        require(!parse(promoted, error) && error.find("checksum") != std::string::npos,
+                "editing only a legacy schema version cannot add a saved-membership proof");
+        error.clear();
+        require(!parse(change_version(attested_json, legacy_version), error)
+                    && error.find("checksum") != std::string::npos,
+                "editing only the attested schema version cannot discard its integrity binding");
+        const auto digest_begin = promoted.find("\"payloadChecksum\": \"")
+            + std::string{"\"payloadChecksum\": \""}.size();
+        promoted.replace(digest_begin, parsed_legacy->payload_checksum.size(), parsed_attested->payload_checksum);
+        require(promoted == attested_json,
+                "membership attestation changes only schema and checksum, with no extra payload fields");
+
+        auto missing_dependency = attested;
+        missing_dependency.player_hand_health_checksum.clear();
+        require(!parse(serialize(missing_dependency), error),
+                "new proof versions still require a linked sidecar for a nonempty HAND");
+        auto empty_hand = attested;
+        empty_hand.player_hand = "()";
+        empty_hand.player_hand_health_checksum.clear();
+        require(parse(serialize(empty_hand), error).has_value(),
+                "new proof versions allow an empty HAND without inventing a dependency");
+        empty_hand.player_hand_health_checksum = attested.player_hand_health_checksum;
+        require(!parse(serialize(empty_hand), error),
+                "new proof versions reject a sidecar dependency on an empty HAND");
+        require(!parse(change_version(attested_json, attested_version + 1), error)
+                    && error.find("schema") != std::string::npos,
+                "future layout versions remain unsupported rather than inheriting capture-proof claims");
+    };
+    check_effect_membership_schema(zones, 3, ExactPlayerZonesSchemaVersion,
+        ExactPlayerZonesEffectMembershipSchemaVersion,
+        serialize_exact_player_zones_checkpoint, parse_exact_player_zones_checkpoint,
+        exact_player_zones_payload_checksum);
+    check_effect_membership_schema(trash, 4, ExactPlayerTrashSchemaVersion,
+        ExactPlayerTrashEffectMembershipSchemaVersion,
+        serialize_exact_player_trash_checkpoint, parse_exact_player_trash_checkpoint,
+        exact_player_trash_payload_checksum);
+    check_effect_membership_schema(generated_schema, 7, ExactPlayerFieldSchemaVersion,
+        ExactPlayerFieldEffectMembershipSchemaVersion,
         serialize_exact_player_field_checkpoint, parse_exact_player_field_checkpoint,
         exact_player_field_payload_checksum);
 

@@ -1,6 +1,6 @@
 # 文档索引
 
-当前入口（2026-09-20）：继续“小关重开 + 玩家精确恢复”，重编程与敌人精确恢复保持搁置。v0.34.0 的手牌生命/计数联合恢复、兼容边界与已完成验收见 [第三十三阶段](phase-33-player-hand-counters.md)。继续工作先读 [当前工作进度](WIP-current-progress-2026-09-10.md) 文首，勿沿用下方历史版本。
+当前入口（2026-09-20）：继续“小关重开 + 玩家精确恢复”，重编程与敌人精确恢复保持搁置。v0.36.0 的玩家技能成员门禁与保存证明见 [第三十五阶段](phase-35-player-effect-membership-guards.md)。继续工作先读 [当前工作进度](WIP-current-progress-2026-09-10.md) 文首，勿沿用下方历史版本。
 
 以下文件是后续维护时应优先更新的权威文档：
 
@@ -64,3 +64,7 @@
 维护规则：需求发生变化时先更新 `requirements.md`；技术实验产生新证据时更新 `technical-status.md` 并补充对应阶段报告；正式选定恢复路线后在 `architecture-options.md` 记录决定与理由。
 
 - [phase-33-player-hand-counters.md](phase-33-player-hand-counters.md)：HAND generic 计数、与生命联合恢复、效果历史范围和实机验收。
+
+- [phase-34-native-effect-membership.md](phase-34-native-effect-membership.md)：原生技能成员与独立 UI 观测，以及真实删除技能后旧恢复补回技能的复现。
+
+- [phase-35-player-effect-membership-guards.md](phase-35-player-effect-membership-guards.md)：技能成员捕获/恢复门禁、布局证明版本与旧补充失效。

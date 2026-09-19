@@ -365,7 +365,9 @@ function ConvertTo-NativeEffectMembership {
         $state = [ordered]@{}
         foreach ($location in @('DECK', 'HAND', 'TRASH', 'FIELD')) {
             $zoneCards = if ($location -ceq 'FIELD') {
-                @($PlayerCards | Where-Object location -CEQ 'FIELD' | Sort-Object field)
+                # These cards are ordered dictionaries, not PSCustomObjects.
+                # Sort-Object field does not resolve their keys in either PS5/7.
+                @($PlayerCards | Where-Object location -CEQ 'FIELD' | Sort-Object { $_['field'] })
             } else { @($OrderedCards.state[$location]) }
             $seenSlots = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
             $states = [System.Collections.Generic.List[object]]::new()

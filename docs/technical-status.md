@@ -1,18 +1,19 @@
 # 技术状态与已知事实
 
-> 2026-09-20 当前续接入口：[第三十四阶段](phase-34-native-effect-membership.md)。用户授权持续推进并自由使用电脑，仅在确需决定方向时停下。下方旧调试内容仅保留历史证据。
+> 2026-09-20 当前续接入口：[第三十五阶段](phase-35-player-effect-membership-guards.md)。用户授权持续推进并自由使用电脑，仅在确需决定方向时停下。下方旧调试内容仅保留历史证据。
 
 ## 2026-09-20 当前状态
 
-当前 v0.35.0 增加 F1 原生技能成员与独立 UI 诊断，保存/恢复行为仍沿用 v0.34.0。原生效果按顺序导出内部 tag、type、原始 factoryKey；比较脚本新增与原生牌序、完整 CardInfo 和 FIELD 槽位绑定的成员比较，缺失观测为 unknown。生产 DLL `1735B21D35D38036E5C75823A08930DC02FAA4FD654E46FBC70A88497E0EA493`，开发夹具关闭，4/4 CTest 通过。
+当前 v0.36.0 已加入玩家技能成员门禁：保存时检查所有 DECK/HAND/TRASH/FIELD 的原生技能工厂键与当前完整定义逐项一致，恢复时在布局前后及最终稳定窗口复核。新增 zones 4 / trash 5 / field 8 标记保存时证明；旧布局继续兼容，但报告明确为 `legacy-unknown`。HAND schema 2 不变。生产 DLL `DC2239856598C231E1FE41107E879723801A80E799F28708F574A26D40D3BABD`，开发夹具关闭，4/4 CTest 通过。
 
-已用正常操作复现既有漏洞：露西娅原 2/2，格式化删除两个技能后仍为 2/2，完整 CardInfo 不变；上升涡流回手、清空 FIELD 后，旧捕获接受 HAND+TRASH 精确补充，恢复报告 passed，但原生技能 0→2。该样本是漏检证据，不是技能精确恢复成功。
+露西娅回手和苹果留场的真实操作均确认旧版漏洞：格式化删除技能后数值及完整 CardInfo 不变，旧版精确恢复会补回技能。新版已拒绝苹果 FIELD 及回手后的精确捕获，只保存普通 Route C 与有效未来刷怪计划；降级后的读取已通过。保存新主文件前先清理七类现行补充及其备份，首个文件被锁定时安全停止，主文件和原检查点文件均未改变。
 
-连续 one/mixed/combined/four/zero 五组恢复的原生成员都符合定义，UI 数量也匹配。第三十三阶段 Cherry 显示缺口未复现，根因仍未知，不改写旧失败。原始用户检查点已恢复，17 文件与备份按字节一致。
+旧/新 zones、trash、field，场地跨进程，生成苹果、生成卡退场空 HAND、全部牌在 TRASH 的回归均通过。14 组精确恢复回归已完成；稳定窗口操作干扰触发一次普通回退，原用户检查点另行恢复且 17 文件逐字节一致。比较脚本的 FIELD 枚举换序误报已修正并保留原始失败。完整结论以阶段文档和 evidence summary 为准。
 
-证据目录：`F:/Project/QuantumProtoclMod.runtime-evidence/20260920-native-effect-membership`。源码提交、推送与最终测试记录见该目录 validation-summary.json。
+证据目录：`F:/Project/QuantumProtoclMod.runtime-evidence/20260920-effect-membership-guards`。源码提交、推送与最终测试记录见该目录 validation-summary.json。
 
-下一项先修技能成员门禁：全部 D/H/T/F 保存时符合定义，恢复在原生临时抑制之外复查；新布局 schema 标记捕获证明，旧版明确未知。同时让旧补充在新保存前失效，避免同秒拒绝保存后残留旧有效布局。完成后继续 sorc 回手动态 baseHP 与 HEALTH modifier 组合。技能动作历史、更多生成卡、满充能、LEVEL 修正、独立生命调整、STORAGE/能力卡仍未补齐；重编程与敌人精确恢复继续搁置。
+下一项验证 sorc 正常回手的动态基础生命，再按 HAND 范围实现 baseHP 与 HEALTH modifier 联合恢复。技能成员相同不代表动作历史恢复；第三十三阶段 Cherry 显示缺口原因仍未知。技能私有历史、更多生成卡、满充能、LEVEL 修正、独立生命调整、STORAGE/能力卡仍未补齐；重编程与敌人精确恢复继续搁置。
+
 
 ## 早期阶段历史记录
 
