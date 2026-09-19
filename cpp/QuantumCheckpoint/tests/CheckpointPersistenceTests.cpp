@@ -63,6 +63,7 @@ namespace
         -> QuantumCheckpoint::ExactPlayerZonesCheckpoint
     {
         return {
+            .schema_version = 2,
             .captured_at_utc = route_c.captured_at_utc,
             .route_c_payload_checksum = route_c.payload_checksum,
             .game_executable_sha256 = route_c.game_executable_sha256,
@@ -78,6 +79,7 @@ namespace
         -> QuantumCheckpoint::ExactPlayerTrashCheckpoint
     {
         return {
+            .schema_version = 3,
             .captured_at_utc = route_c.captured_at_utc,
             .route_c_payload_checksum = route_c.payload_checksum,
             .game_executable_sha256 = route_c.game_executable_sha256,
@@ -108,6 +110,22 @@ namespace
                 "((CardInfo=(Tag=\"naturalApple\")),"
                 "(CardInfo=(Tag=\"naturalLemon\")))",
             .player_field_states = "0,0,1,0;1,3,2,1",
+        };
+    }
+
+    auto sample_exact_player_hand_health(const QuantumCheckpoint::RouteCCheckpoint& route_c)
+        -> QuantumCheckpoint::ExactPlayerHandHealthCheckpoint
+    {
+        return {
+            .captured_at_utc = route_c.captured_at_utc,
+            .route_c_payload_checksum = route_c.payload_checksum,
+            .game_executable_sha256 = route_c.game_executable_sha256,
+            .game_executable_size = route_c.game_executable_size,
+            .source_level_name = route_c.source_level_name,
+            .wave_index = route_c.wave_index,
+            .player_hand =
+                "((CardInfo=(Tag=\"naturalApple\")),(CardInfo=(Tag=\"naturalApple\")))",
+            .player_hand_health_states = "2,3|mageOctavia_init,1,-1,0;2,2",
         };
     }
 
@@ -1172,6 +1190,230 @@ int main()
     auto disguised_counter_property = health_json;
     disguised_counter_property.insert(disguised_counter_property.rfind('}'),",\"playerFieldCounterStates\":\"0;0\"");
     require(!parse_exact_player_field_checkpoint(disguised_counter_property,error),"schema-4 cannot carry unchecked counter records");
+
+    auto hand_health = sample_exact_player_hand_health(attack_source);
+    const auto hand_health_json = serialize_exact_player_hand_health_checkpoint(hand_health);
+    const auto parsed_hand_health = parse_exact_player_hand_health_checkpoint(hand_health_json, error);
+    require(parsed_hand_health && parsed_hand_health->schema_version == 1
+                && parsed_hand_health->player_hand == hand_health.player_hand
+                && parsed_hand_health->player_hand_health_states == hand_health.player_hand_health_states
+                && parsed_hand_health->route_c_payload_checksum == attack_source.payload_checksum,
+            "hand health preserves native order and distinct health for duplicate Apple identities");
+    require(validate_exact_player_hand_health_checkpoint(*parsed_hand_health, error),
+            "parsed hand-health checkpoint passes standalone validation");
+    auto swapped_hand_health = hand_health;
+    swapped_hand_health.player_hand_health_states = "2,2;2,3|mageOctavia_init,1,-1,0";
+    require(swapped_hand_health.player_hand == hand_health.player_hand
+                && exact_player_hand_health_payload_checksum(swapped_hand_health)
+                    != exact_player_hand_health_payload_checksum(hand_health),
+            "swapping duplicate hand-card health records changes the checksum");
+    require(parse_exact_player_hand_health_checkpoint(
+                serialize_exact_player_hand_health_checkpoint(swapped_hand_health), error).has_value(),
+            "health alignment is native hand position and does not merge duplicate identities");
+
+    // Missing sidecar files are handled by the runtime loader. The semantic Route C
+    // and previous exact formats do not acquire a hand-health dependency.
+    require(parse_route_c_checkpoint(serialize_route_c_checkpoint(attack_source), error).has_value()
+                && parse_exact_player_field_checkpoint(field_v2_json, error).has_value(),
+            "legacy semantic and field checkpoints remain valid without hand-health metadata");
+    require(!parse_exact_player_hand_health_checkpoint("", error),
+            "an empty hand-health file is invalid rather than an implicit default");
+
+    auto invalid_hand_health = hand_health;
+    for (const auto* invalid_records : {
+             "2,3|mageOctavia_init,1,-1,0", "2,2;2,2;2,2", "2,2;0,0",
+             "2,4|mageOctavia_init,1,-1,0;2,2", "2,1|negative,-1,-1,0;2,2",
+             "2,3|mageOctavia_init,1,-1,8;2,2", "2,3|bad/tag,1,-1,0;2,2",
+             "2,3|mageOctavia_init,1,-2,0;2,2", "2,4|same,1,-1,0|SAME,1,-1,0;2,2"})
+    {
+        invalid_hand_health.player_hand_health_states = invalid_records;
+        require(!parse_exact_player_hand_health_checkpoint(
+                    serialize_exact_player_hand_health_checkpoint(invalid_hand_health), error),
+                "hand-health grammar rejects count, scalar, negative modifier, tag, flag and limit violations");
+    }
+    for (int flags = 0; flags <= 7; ++flags)
+    {
+        auto valid_flags = hand_health;
+        valid_flags.player_hand_health_states =
+            "2,3|mageOctavia_init,1,2," + std::to_string(flags) + ";2,2|zero,0,-1,0";
+        const auto parsed_flags = parse_exact_player_hand_health_checkpoint(
+            serialize_exact_player_hand_health_checkpoint(valid_flags), error);
+        require(parsed_flags && parsed_flags->player_hand_health_states == valid_flags.player_hand_health_states,
+                "hand health retains complete native flags, limit and explicit zero modifier");
+    }
+    for (const int count : {0, 1, 7, 8})
+    {
+        auto bounded_hand = hand_health;
+        bounded_hand.player_hand = "(";
+        bounded_hand.player_hand_health_states.clear();
+        for (int index{}; index < count; ++index)
+        {
+            if (index != 0)
+            {
+                bounded_hand.player_hand += ',';
+                bounded_hand.player_hand_health_states += ';';
+            }
+            bounded_hand.player_hand += "(CardInfo=(Tag=\"naturalApple\"))";
+            bounded_hand.player_hand_health_states += "2,2";
+        }
+        bounded_hand.player_hand += ')';
+        require(parse_exact_player_hand_health_checkpoint(
+                    serialize_exact_player_hand_health_checkpoint(bounded_hand), error).has_value()
+                    == (count >= 1 && count <= 7),
+                "hand-health supplement supports exactly one through seven aligned hand cards");
+    }
+    invalid_hand_health = hand_health;
+    invalid_hand_health.player_hand = "((CardInfo=(Tag=\"naturalApple\")),(upgradeLevel=0))";
+    require(!parse_exact_player_hand_health_checkpoint(
+                serialize_exact_player_hand_health_checkpoint(invalid_hand_health), error),
+            "hand-health supplement rejects an invalid card instance");
+    for (const int version : {0, 2})
+    {
+        invalid_hand_health = hand_health;
+        invalid_hand_health.schema_version = version;
+        require(!parse_exact_player_hand_health_checkpoint(
+                    serialize_exact_player_hand_health_checkpoint(invalid_hand_health), error),
+                "hand-health schema has no implicit legacy or future compatibility");
+    }
+    for (const auto member : {&ExactPlayerHandHealthCheckpoint::kind,
+                             &ExactPlayerHandHealthCheckpoint::captured_at_utc,
+                             &ExactPlayerHandHealthCheckpoint::route_c_payload_checksum,
+                             &ExactPlayerHandHealthCheckpoint::game_executable_sha256,
+                             &ExactPlayerHandHealthCheckpoint::source_level_name})
+    {
+        invalid_hand_health = hand_health;
+        invalid_hand_health.*member = "";
+        require(!parse_exact_player_hand_health_checkpoint(
+                    serialize_exact_player_hand_health_checkpoint(invalid_hand_health), error),
+                "hand-health supplement requires kind, capture, linkage, fingerprint and source level");
+    }
+    invalid_hand_health = hand_health;
+    invalid_hand_health.route_c_payload_checksum = "G123456789ABCDEF";
+    require(!parse_exact_player_hand_health_checkpoint(
+                serialize_exact_player_hand_health_checkpoint(invalid_hand_health), error),
+            "hand-health Route C linkage must be a hexadecimal checksum");
+    invalid_hand_health = hand_health;
+    invalid_hand_health.game_executable_size = 0;
+    require(!parse_exact_player_hand_health_checkpoint(
+                serialize_exact_player_hand_health_checkpoint(invalid_hand_health), error),
+            "hand-health executable fingerprint requires a nonzero size");
+    for (const int wave : {-1, 1001})
+    {
+        invalid_hand_health = hand_health;
+        invalid_hand_health.wave_index = wave;
+        require(!parse_exact_player_hand_health_checkpoint(
+                    serialize_exact_player_hand_health_checkpoint(invalid_hand_health), error),
+                "hand-health wave index retains bounded Route C semantics");
+    }
+    auto hand_health_tampering = hand_health_json;
+    hand_health_tampering.replace(hand_health_tampering.find("mageOctavia_init"), 16, "mageOctavia_edit");
+    require(!parse_exact_player_hand_health_checkpoint(hand_health_tampering, error)
+                && error.find("checksum") != std::string::npos,
+            "valid hand-health modifier grammar cannot conceal payload corruption");
+    hand_health_tampering = hand_health_json;
+    const auto linkage_offset = hand_health_tampering.find(attack_source.payload_checksum);
+    hand_health_tampering[linkage_offset] = hand_health_tampering[linkage_offset] == '0' ? '1' : '0';
+    require(!parse_exact_player_hand_health_checkpoint(hand_health_tampering, error)
+                && error.find("checksum") != std::string::npos,
+            "Route C linkage is included in hand-health payload integrity");
+    auto missing_hand_health = hand_health_json;
+    const auto hand_health_begin = missing_hand_health.find("  \"playerHandHealthStates\"");
+    missing_hand_health.erase(hand_health_begin,
+        missing_hand_health.find('\n', hand_health_begin) - hand_health_begin + 1);
+    require(!parse_exact_player_hand_health_checkpoint(missing_hand_health, error),
+            "hand-health records are mandatory in this supplement");
+
+    require(ExactPlayerZonesCheckpoint{}.schema_version == 3
+                && ExactPlayerTrashCheckpoint{}.schema_version == 4
+                && ExactPlayerFieldCheckpoint{}.schema_version == 7,
+            "new captures select layouts with mandatory versioned hand-health dependencies");
+    const auto check_hand_health_dependency = [&](auto legacy_layout, int latest,
+                                                   auto serialize, auto parse, auto checksum) {
+        const auto legacy_json = serialize(legacy_layout);
+        const auto legacy_hash = checksum(legacy_layout);
+        require(legacy_json.find("playerHandHealthChecksum") == std::string::npos
+                    && parse(legacy_json, error).has_value(),
+                "legacy layout JSON keeps its original fields and remains readable");
+        auto legacy_with_marker = legacy_layout;
+        legacy_with_marker.player_hand_health_checksum = parsed_hand_health->payload_checksum;
+        require(checksum(legacy_with_marker) == legacy_hash
+                    && serialize(legacy_with_marker) == legacy_json,
+                "legacy layout hashing and serialization do not acquire a hand-health field");
+        auto disguised_legacy = legacy_json;
+        disguised_legacy.insert(disguised_legacy.rfind('}'),
+            ",\"playerHandHealthChecksum\":\"" + parsed_hand_health->payload_checksum + "\"");
+        require(!parse(disguised_legacy, error),
+                "legacy layout JSON cannot carry an unchecked newer hand-health dependency");
+
+        auto current = legacy_layout;
+        current.schema_version = latest;
+        current.player_hand = parsed_hand_health->player_hand;
+        current.player_hand_health_checksum = parsed_hand_health->payload_checksum;
+        const auto current_json = serialize(current);
+        const auto parsed = parse(current_json, error);
+        require(parsed && parsed->player_hand_health_checksum == parsed_hand_health->payload_checksum
+                    && parsed->player_hand == parsed_hand_health->player_hand,
+                "latest layout persists the exact hand-health payload checksum and native hand order");
+        require(current_json.find("playerHandHealthChecksum") != std::string::npos
+                    && checksum(current) != legacy_hash,
+                "the dependency participates in the latest layout payload checksum");
+        auto alternate = current;
+        alternate.player_hand_health_checksum = exact_player_hand_health_payload_checksum(swapped_hand_health);
+        require(alternate.player_hand_health_checksum != current.player_hand_health_checksum
+                    && checksum(alternate) != checksum(current),
+                "different health assignments for duplicate hand cards change the layout dependency hash");
+
+        for (const std::string marker : {"", "123456789ABCDEF", "123456789ABCDEF01", "G123456789ABCDEF"})
+        {
+            auto invalid = current;
+            invalid.player_hand_health_checksum = marker;
+            require(!parse(serialize(invalid), error),
+                    "a nonempty hand requires an exact sixteen-digit hexadecimal dependency");
+        }
+        auto missing = current_json;
+        const auto marker_begin = missing.find("  \"playerHandHealthChecksum\"");
+        missing.erase(marker_begin, missing.find('\n', marker_begin) - marker_begin + 1);
+        require(!parse(missing, error),
+                "missing dependency metadata cannot silently fall back to default hand health");
+        auto damaged = current_json;
+        const auto digest_begin = damaged.find(parsed_hand_health->payload_checksum);
+        damaged[digest_begin] = damaged[digest_begin] == '0' ? '1' : '0';
+        require(!parse(damaged, error) && error.find("checksum") != std::string::npos,
+                "changing a valid dependency digest without changing the layout checksum is rejected");
+        auto downgraded = current_json;
+        const auto version_begin = downgraded.find("\"schemaVersion\": ") + std::string{"\"schemaVersion\": "}.size();
+        downgraded.replace(version_begin, 1, std::to_string(latest - 1));
+        require(!parse(downgraded, error),
+                "downgrading a layout cannot hide its required hand-health dependency");
+
+        auto empty = current;
+        empty.player_hand = "()";
+        empty.player_hand_health_checksum.clear();
+        require(parse(serialize(empty), error).has_value(),
+                "latest empty-hand layouts require no sidecar and persist an empty dependency");
+        empty.player_hand_health_checksum = parsed_hand_health->payload_checksum;
+        require(!parse(serialize(empty), error),
+                "an empty hand cannot claim an unrelated hand-health dependency");
+        auto oversized = current;
+        oversized.player_hand = "(";
+        for (int index{}; index < 8; ++index)
+        {
+            if (index != 0) oversized.player_hand += ',';
+            oversized.player_hand += "(CardInfo=(Tag=\"naturalApple\"))";
+        }
+        oversized.player_hand += ')';
+        require(!parse(serialize(oversized), error),
+                "latest layouts cannot require hand-health records beyond the supported seven cards");
+    };
+    check_hand_health_dependency(zones, 3,
+        serialize_exact_player_zones_checkpoint, parse_exact_player_zones_checkpoint,
+        exact_player_zones_payload_checksum);
+    check_hand_health_dependency(trash, 4,
+        serialize_exact_player_trash_checkpoint, parse_exact_player_trash_checkpoint,
+        exact_player_trash_payload_checksum);
+    check_hand_health_dependency(generated_schema, 7,
+        serialize_exact_player_field_checkpoint, parse_exact_player_field_checkpoint,
+        exact_player_field_payload_checksum);
 
     std::cout << "Route C checkpoint persistence tests passed\n";
     return 0;

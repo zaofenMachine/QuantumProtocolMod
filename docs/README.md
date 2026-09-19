@@ -1,5 +1,7 @@
 # 文档索引
 
+当前入口（2026-09-20）：用户已授权继续“小关重开 + 玩家精确恢复”，重编程重开和敌人精确恢复仍搁置。v0.33.0 的手牌生命补充、场外严格门禁和当前验收进度见 [第三十二阶段](phase-32-player-hand-health.md)；最终 DLL 的实机回归进行中。继续工作时先读 [当前工作进度](WIP-current-progress-2026-09-10.md) 文首，勿沿用其下方历史调试状态。
+
 以下文件是后续维护时应优先更新的权威文档：
 
 - [requirements.md](requirements.md)：用户需求、检查点语义、未决产品问题。
@@ -45,12 +47,18 @@
 - [phase-24-player-attack-lifecycle.md](phase-24-player-attack-lifecycle.md)：正负修正重放顺序、独立衰减、归零与 limit 上限。
 - [phase-25-native-player-health.md](phase-25-native-player-health.md)：有效生命上限、独立比较与生命修正衰减后保留超额当前生命。
 
-维护规则：需求发生变化时先更新 `requirements.md`；技术实验产生新证据时更新 `technical-status.md` 并补充对应阶段报告；正式选定恢复路线后在 `architecture-options.md` 记录决定与理由。
-
 - [phase-26-player-field-health.md](phase-26-player-field-health.md)：场地生命修正、攻击与生命联合恢复、衰减及高于上限的当前生命。
 
 - [phase-27-native-player-counters.md](phase-27-native-player-counters.md)：原生计数器来源、逐标签观测、同总量差异和零／负值样本。
 
+- [phase-28-player-field-counters.md](phase-28-player-field-counters.md)：场地普通计数、特殊标签表与攻击/生命联合恢复。
+
+- [phase-29-native-player-level.md](phase-29-native-player-level.md)：原生等级来源、LEVEL 标签与独立生命调整的恢复边界。
+
 - [phase-30-generated-player-card.md](phase-30-generated-player-card.md)：一张额外苹果、临时启动数值归一化、永久牌组保留及动作显示历史边界。
 
 - [phase-31-generated-empty-field.md](phase-31-generated-empty-field.md)：生成卡退场后的空场、墓地 schema 3、原生操作对照及暂停交接。
+
+- [phase-32-player-hand-health.md](phase-32-player-hand-health.md)：旧版真实手牌增益丢失、HAND HEALTH schema 1、布局依赖、场外严格门禁与同名卡原生位置动态比较。
+
+维护规则：需求发生变化时先更新 `requirements.md`；技术实验产生新证据时更新 `technical-status.md` 并补充对应阶段报告；正式选定恢复路线后在 `architecture-options.md` 记录决定与理由。

@@ -96,6 +96,14 @@ namespace QuantumCheckpoint
     auto exact_card_identity_key_from_instance(std::string_view card_instance,
                                                std::string& error)
         -> std::optional<std::string>;
+    auto exact_player_hand_health_payload_checksum(
+        const ExactPlayerHandHealthCheckpoint& checkpoint) -> std::string;
+    auto serialize_exact_player_hand_health_checkpoint(
+        ExactPlayerHandHealthCheckpoint checkpoint) -> std::string;
+    auto parse_exact_player_hand_health_checkpoint(std::string_view json, std::string& error)
+        -> std::optional<ExactPlayerHandHealthCheckpoint>;
+    auto validate_exact_player_hand_health_checkpoint(
+        const ExactPlayerHandHealthCheckpoint& checkpoint, std::string& error) -> bool;
     auto exact_character_charge_payload_checksum(
         const ExactCharacterChargeCheckpoint& checkpoint) -> std::string;
     auto serialize_exact_character_charge_checkpoint(ExactCharacterChargeCheckpoint checkpoint)

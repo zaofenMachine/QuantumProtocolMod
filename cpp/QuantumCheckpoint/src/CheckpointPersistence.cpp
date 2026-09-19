@@ -345,6 +345,25 @@ namespace QuantumCheckpoint
             return is_hex_digest(value, 64);
         }
 
+        auto validate_hand_health_checksum_link(std::size_t hand_size,
+                                                std::string_view checksum,
+                                                bool required,
+                                                std::string& error) -> bool
+        {
+            if (!required)
+            {
+                if (checksum.empty()) return true;
+                error = "legacy player layout cannot claim hand-health dependency coverage";
+                return false;
+            }
+            if (hand_size > 7 || (hand_size == 0 ? !checksum.empty() : !is_hex_digest(checksum, 16)))
+            {
+                error = "player layout requires a hand-health checksum for one to seven hand cards and an empty checksum for an empty hand";
+                return false;
+            }
+            return true;
+        }
+
         auto required_string(const std::unordered_map<std::string, JsonValue>& values,
                              std::string_view name, std::string& error)
             -> std::optional<std::string>
@@ -1711,6 +1730,9 @@ namespace QuantumCheckpoint
         append_hash_bytes(hash, checkpoint.player_deck);
         append_hash_bytes(hash, checkpoint.player_hand);
 
+        if (checkpoint.schema_version >= 3)
+            append_hash_bytes(hash, checkpoint.player_hand_health_checksum);
+
         std::ostringstream output{};
         output << std::hex << std::uppercase << std::setw(16) << std::setfill('0') << hash;
         return output.str();
@@ -1735,8 +1757,11 @@ namespace QuantumCheckpoint
                << "\",\n"
                << "  \"waveIndex\": " << checkpoint.wave_index << ",\n"
                << "  \"playerDeck\": \"" << json_escape(checkpoint.player_deck) << "\",\n"
-               << "  \"playerHand\": \"" << json_escape(checkpoint.player_hand) << "\",\n"
-               << "  \"payloadChecksum\": \"" << checkpoint.payload_checksum << "\"\n"
+               << "  \"playerHand\": \"" << json_escape(checkpoint.player_hand) << "\",\n";
+        if (checkpoint.schema_version >= 3)
+            output << "  \"playerHandHealthChecksum\": \""
+                   << json_escape(checkpoint.player_hand_health_checksum) << "\",\n";
+        output << "  \"payloadChecksum\": \"" << checkpoint.payload_checksum << "\"\n"
                << "}\n";
         return output.str();
     }
@@ -1744,8 +1769,7 @@ namespace QuantumCheckpoint
     auto validate_exact_player_zones_checkpoint(const ExactPlayerZonesCheckpoint& checkpoint,
                                                 std::string& error) -> bool
     {
-        if (checkpoint.schema_version != 1
-            && checkpoint.schema_version != ExactPlayerZonesSchemaVersion)
+        if (checkpoint.schema_version < 1 || checkpoint.schema_version > ExactPlayerZonesSchemaVersion)
         {
             error = "unsupported exact player-zones schema version";
             return false;
@@ -1802,6 +1826,8 @@ namespace QuantumCheckpoint
                 }
             }
         }
+        if (!validate_hand_health_checksum_link(hand->size(), checkpoint.player_hand_health_checksum,
+                                               checkpoint.schema_version >= 3, error)) return false;
         if (checkpoint.payload_checksum != exact_player_zones_payload_checksum(checkpoint))
         {
             error = "exact player-zones payload checksum does not match";
@@ -1831,8 +1857,7 @@ namespace QuantumCheckpoint
         do { auto value = required_integer<Type>(*values, JsonName, error); if (!value) return std::nullopt; checkpoint.Field = *value; } while (false)
 
         READ_ZONES_INTEGER(schema_version, "schemaVersion", int);
-        if (checkpoint.schema_version != 1
-            && checkpoint.schema_version != ExactPlayerZonesSchemaVersion)
+        if (checkpoint.schema_version < 1 || checkpoint.schema_version > ExactPlayerZonesSchemaVersion)
         {
             error = "unsupported exact player-zones schema version";
             return std::nullopt;
@@ -1846,6 +1871,15 @@ namespace QuantumCheckpoint
         READ_ZONES_INTEGER(wave_index, "waveIndex", std::int32_t);
         READ_ZONES_STRING(player_deck, "playerDeck");
         READ_ZONES_STRING(player_hand, "playerHand");
+        if (checkpoint.schema_version >= 3)
+        {
+            READ_ZONES_STRING(player_hand_health_checksum, "playerHandHealthChecksum");
+        }
+        else if (values->contains("playerHandHealthChecksum"))
+        {
+            error = "legacy player-zones JSON contains a newer hand-health dependency";
+            return std::nullopt;
+        }
         READ_ZONES_STRING(payload_checksum, "payloadChecksum");
 
 #undef READ_ZONES_INTEGER
@@ -1874,6 +1908,9 @@ namespace QuantumCheckpoint
         append_hash_bytes(hash, checkpoint.player_hand);
         append_hash_bytes(hash, checkpoint.player_trash);
 
+        if (checkpoint.schema_version >= 4)
+            append_hash_bytes(hash, checkpoint.player_hand_health_checksum);
+
         std::ostringstream output{};
         output << std::hex << std::uppercase << std::setw(16) << std::setfill('0') << hash;
         return output.str();
@@ -1899,8 +1936,11 @@ namespace QuantumCheckpoint
                << "  \"waveIndex\": " << checkpoint.wave_index << ",\n"
                << "  \"playerDeck\": \"" << json_escape(checkpoint.player_deck) << "\",\n"
                << "  \"playerHand\": \"" << json_escape(checkpoint.player_hand) << "\",\n"
-               << "  \"playerTrash\": \"" << json_escape(checkpoint.player_trash) << "\",\n"
-               << "  \"payloadChecksum\": \"" << checkpoint.payload_checksum << "\"\n"
+               << "  \"playerTrash\": \"" << json_escape(checkpoint.player_trash) << "\",\n";
+        if (checkpoint.schema_version >= 4)
+            output << "  \"playerHandHealthChecksum\": \""
+                   << json_escape(checkpoint.player_hand_health_checksum) << "\",\n";
+        output << "  \"payloadChecksum\": \"" << checkpoint.payload_checksum << "\"\n"
                << "}\n";
         return output.str();
     }
@@ -1908,9 +1948,7 @@ namespace QuantumCheckpoint
     auto validate_exact_player_trash_checkpoint(const ExactPlayerTrashCheckpoint& checkpoint,
                                                 std::string& error) -> bool
     {
-        if (checkpoint.schema_version != 1
-            && checkpoint.schema_version != 2
-            && checkpoint.schema_version != ExactPlayerTrashSchemaVersion)
+        if (checkpoint.schema_version < 1 || checkpoint.schema_version > ExactPlayerTrashSchemaVersion)
         {
             error = "unsupported exact player-trash schema version";
             return false;
@@ -2005,6 +2043,8 @@ namespace QuantumCheckpoint
                 return false;
             }
         }
+        if (!validate_hand_health_checksum_link(hand->size(), checkpoint.player_hand_health_checksum,
+                                               checkpoint.schema_version >= 4, error)) return false;
         if (checkpoint.payload_checksum != exact_player_trash_payload_checksum(checkpoint))
         {
             error = "exact player-trash payload checksum does not match";
@@ -2034,9 +2074,7 @@ namespace QuantumCheckpoint
         do { auto value = required_integer<Type>(*values, JsonName, error); if (!value) return std::nullopt; checkpoint.Field = *value; } while (false)
 
         READ_TRASH_INTEGER(schema_version, "schemaVersion", int);
-        if (checkpoint.schema_version != 1
-            && checkpoint.schema_version != 2
-            && checkpoint.schema_version != ExactPlayerTrashSchemaVersion)
+        if (checkpoint.schema_version < 1 || checkpoint.schema_version > ExactPlayerTrashSchemaVersion)
         {
             error = "unsupported exact player-trash schema version";
             return std::nullopt;
@@ -2051,6 +2089,15 @@ namespace QuantumCheckpoint
         READ_TRASH_STRING(player_deck, "playerDeck");
         READ_TRASH_STRING(player_hand, "playerHand");
         READ_TRASH_STRING(player_trash, "playerTrash");
+        if (checkpoint.schema_version >= 4)
+        {
+            READ_TRASH_STRING(player_hand_health_checksum, "playerHandHealthChecksum");
+        }
+        else if (values->contains("playerHandHealthChecksum"))
+        {
+            error = "legacy player-trash JSON contains a newer hand-health dependency";
+            return std::nullopt;
+        }
         READ_TRASH_STRING(payload_checksum, "payloadChecksum");
 
 #undef READ_TRASH_INTEGER
@@ -2086,6 +2133,9 @@ namespace QuantumCheckpoint
             append_hash_bytes(hash, checkpoint.player_field_health_states);
         if (checkpoint.schema_version >= 5)
             append_hash_bytes(hash, checkpoint.player_field_counter_states);
+
+        if (checkpoint.schema_version >= 7)
+            append_hash_bytes(hash, checkpoint.player_hand_health_checksum);
 
         std::ostringstream output{};
         output << std::hex << std::uppercase << std::setw(16) << std::setfill('0') << hash;
@@ -2129,6 +2179,9 @@ namespace QuantumCheckpoint
         if (checkpoint.schema_version >= 5)
             output << "  \"playerFieldCounterStates\": \""
                    << json_escape(checkpoint.player_field_counter_states) << "\",\n";
+        if (checkpoint.schema_version >= 7)
+            output << "  \"playerHandHealthChecksum\": \""
+                   << json_escape(checkpoint.player_hand_health_checksum) << "\",\n";
         output << "  \"payloadChecksum\": \"" << checkpoint.payload_checksum << "\"\n"
                << "}\n";
         return output.str();
@@ -2273,6 +2326,8 @@ namespace QuantumCheckpoint
                 }
             }
         }
+        if (!validate_hand_health_checksum_link(hand->size(), checkpoint.player_hand_health_checksum,
+                                               checkpoint.schema_version >= 7, error)) return false;
         if (checkpoint.payload_checksum != exact_player_field_payload_checksum(checkpoint))
         {
             error = "exact player-field payload checksum does not match";
@@ -2346,6 +2401,15 @@ namespace QuantumCheckpoint
             error = "legacy player-field JSON contains a newer counter record";
             return std::nullopt;
         }
+        if (checkpoint.schema_version >= 7)
+        {
+            READ_FIELD_STRING(player_hand_health_checksum, "playerHandHealthChecksum");
+        }
+        else if (values->contains("playerHandHealthChecksum"))
+        {
+            error = "legacy player-field JSON contains a newer hand-health dependency";
+            return std::nullopt;
+        }
         READ_FIELD_STRING(payload_checksum, "payloadChecksum");
 
 #undef READ_FIELD_INTEGER
@@ -2355,6 +2419,167 @@ namespace QuantumCheckpoint
         {
             return std::nullopt;
         }
+        return checkpoint;
+    }
+
+    auto exact_player_hand_health_payload_checksum(
+        const ExactPlayerHandHealthCheckpoint& checkpoint) -> std::string
+    {
+        std::uint64_t hash = 14695981039346656037ULL;
+        append_hash_number(hash, checkpoint.schema_version);
+        append_hash_bytes(hash, checkpoint.kind);
+        append_hash_bytes(hash, checkpoint.captured_at_utc);
+        append_hash_bytes(hash, checkpoint.route_c_payload_checksum);
+        append_hash_bytes(hash, checkpoint.game_executable_sha256);
+        append_hash_number(hash, checkpoint.game_executable_size);
+        append_hash_bytes(hash, checkpoint.source_level_name);
+        append_hash_number(hash, checkpoint.wave_index);
+        append_hash_bytes(hash, checkpoint.player_hand);
+        append_hash_bytes(hash, checkpoint.player_hand_health_states);
+
+        std::ostringstream output{};
+        output << std::hex << std::uppercase << std::setw(16) << std::setfill('0') << hash;
+        return output.str();
+    }
+
+    auto serialize_exact_player_hand_health_checkpoint(
+        ExactPlayerHandHealthCheckpoint checkpoint) -> std::string
+    {
+        checkpoint.payload_checksum = exact_player_hand_health_payload_checksum(checkpoint);
+        std::ostringstream output{};
+        output << "{\n"
+               << "  \"schemaVersion\": " << checkpoint.schema_version << ",\n"
+               << "  \"kind\": \"" << json_escape(checkpoint.kind) << "\",\n"
+               << "  \"capturedAtUtc\": \"" << json_escape(checkpoint.captured_at_utc)
+               << "\",\n"
+               << "  \"routeCPayloadChecksum\": \""
+               << json_escape(checkpoint.route_c_payload_checksum) << "\",\n"
+               << "  \"gameExecutableSha256\": \""
+               << json_escape(checkpoint.game_executable_sha256) << "\",\n"
+               << "  \"gameExecutableSize\": " << checkpoint.game_executable_size << ",\n"
+               << "  \"sourceLevelName\": \"" << json_escape(checkpoint.source_level_name)
+               << "\",\n"
+               << "  \"waveIndex\": " << checkpoint.wave_index << ",\n"
+               << "  \"playerHand\": \"" << json_escape(checkpoint.player_hand) << "\",\n"
+               << "  \"playerHandHealthStates\": \""
+               << json_escape(checkpoint.player_hand_health_states) << "\",\n"
+               << "  \"payloadChecksum\": \"" << checkpoint.payload_checksum << "\"\n"
+               << "}\n";
+        return output.str();
+    }
+
+    auto validate_exact_player_hand_health_checkpoint(
+        const ExactPlayerHandHealthCheckpoint& checkpoint, std::string& error) -> bool
+    {
+        if (checkpoint.schema_version != ExactPlayerHandHealthSchemaVersion)
+        {
+            error = "unsupported exact player-hand-health schema version";
+            return false;
+        }
+        if (checkpoint.kind != ExactPlayerHandHealthCheckpointKind)
+        {
+            error = "checkpoint kind is not exact player hand health";
+            return false;
+        }
+        if (checkpoint.captured_at_utc.empty()
+            || !is_hex_digest(checkpoint.route_c_payload_checksum, 16))
+        {
+            error = "exact player hand health has invalid Route C linkage";
+            return false;
+        }
+        if (!is_sha256(checkpoint.game_executable_sha256)
+            || checkpoint.game_executable_size == 0)
+        {
+            error = "exact player hand health has an invalid game executable fingerprint";
+            return false;
+        }
+        if (checkpoint.source_level_name.empty() || checkpoint.source_level_name == "None"
+            || checkpoint.source_level_name.size() > 256 || checkpoint.wave_index < 0
+            || checkpoint.wave_index > 1000)
+        {
+            error = "exact player hand health has invalid level or wave data";
+            return false;
+        }
+
+        std::string state_error{};
+        const auto hand = split_route_c_unreal_array(checkpoint.player_hand, state_error);
+        if (!hand || hand->empty() || hand->size() > 7)
+        {
+            error = "exact player-hand-health capture requires one to seven hand cards: "
+                + state_error;
+            return false;
+        }
+        const auto health = parse_player_health_states(
+            checkpoint.player_hand_health_states, state_error);
+        if (!health || health->size() != hand->size())
+        {
+            error = "exact player-hand-health states are invalid or misaligned: "
+                + state_error;
+            return false;
+        }
+        for (std::size_t index{}; index < hand->size(); ++index)
+        {
+            if (!exact_card_from_instance((*hand)[index], state_error))
+            {
+                error = "exact player-hand-health hand contains an invalid card: " + state_error;
+                return false;
+            }
+            for (const auto& modifier : (*health)[index].modifiers)
+            {
+                if (modifier.amount < 0)
+                {
+                    error = "exact player-hand-health restoration requires nonnegative HEALTH modifiers";
+                    return false;
+                }
+            }
+        }
+        if (checkpoint.payload_checksum != exact_player_hand_health_payload_checksum(checkpoint))
+        {
+            error = "exact player-hand-health payload checksum does not match";
+            return false;
+        }
+        return true;
+    }
+
+    auto parse_exact_player_hand_health_checkpoint(std::string_view json, std::string& error)
+        -> std::optional<ExactPlayerHandHealthCheckpoint>
+    {
+        if (json.empty() || json.size() > RouteCMaximumFileBytes)
+        {
+            error = "exact player-hand-health file is empty or exceeds the 2 MiB limit";
+            return std::nullopt;
+        }
+        auto values = FlatJsonParser{json}.parse(error);
+        if (!values) return std::nullopt;
+
+        ExactPlayerHandHealthCheckpoint checkpoint{};
+#define READ_HAND_HEALTH_STRING(Field, JsonName) \
+        do { auto value = required_string(*values, JsonName, error); if (!value) return std::nullopt; checkpoint.Field = std::move(*value); } while (false)
+#define READ_HAND_HEALTH_INTEGER(Field, JsonName, Type) \
+        do { auto value = required_integer<Type>(*values, JsonName, error); if (!value) return std::nullopt; checkpoint.Field = *value; } while (false)
+
+        READ_HAND_HEALTH_INTEGER(schema_version, "schemaVersion", int);
+        if (checkpoint.schema_version != ExactPlayerHandHealthSchemaVersion)
+        {
+            error = "unsupported exact player-hand-health schema version";
+            return std::nullopt;
+        }
+        READ_HAND_HEALTH_STRING(kind, "kind");
+        READ_HAND_HEALTH_STRING(captured_at_utc, "capturedAtUtc");
+        READ_HAND_HEALTH_STRING(route_c_payload_checksum, "routeCPayloadChecksum");
+        READ_HAND_HEALTH_STRING(game_executable_sha256, "gameExecutableSha256");
+        READ_HAND_HEALTH_INTEGER(game_executable_size, "gameExecutableSize", std::uint64_t);
+        READ_HAND_HEALTH_STRING(source_level_name, "sourceLevelName");
+        READ_HAND_HEALTH_INTEGER(wave_index, "waveIndex", std::int32_t);
+        READ_HAND_HEALTH_STRING(player_hand, "playerHand");
+        READ_HAND_HEALTH_STRING(player_hand_health_states, "playerHandHealthStates");
+        READ_HAND_HEALTH_STRING(payload_checksum, "payloadChecksum");
+
+#undef READ_HAND_HEALTH_INTEGER
+#undef READ_HAND_HEALTH_STRING
+
+        if (!validate_exact_player_hand_health_checkpoint(checkpoint, error))
+            return std::nullopt;
         return checkpoint;
     }
 

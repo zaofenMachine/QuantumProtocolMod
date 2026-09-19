@@ -14,15 +14,18 @@ namespace QuantumCheckpoint
     inline constexpr int ExactSpawnPlanSchemaVersion = 1;
     inline constexpr std::string_view ExactSpawnPlanCheckpointKind =
         "route-c-exact-spawn-plan";
-    inline constexpr int ExactPlayerZonesSchemaVersion = 2;
+    inline constexpr int ExactPlayerZonesSchemaVersion = 3;
     inline constexpr std::string_view ExactPlayerZonesCheckpointKind =
         "route-c-exact-player-zones";
-    inline constexpr int ExactPlayerTrashSchemaVersion = 3;
+    inline constexpr int ExactPlayerTrashSchemaVersion = 4;
     inline constexpr std::string_view ExactPlayerTrashCheckpointKind =
         "route-c-exact-player-trash";
-    inline constexpr int ExactPlayerFieldSchemaVersion = 6;
+    inline constexpr int ExactPlayerFieldSchemaVersion = 7;
     inline constexpr std::string_view ExactPlayerFieldCheckpointKind =
         "route-c-exact-player-field";
+    inline constexpr int ExactPlayerHandHealthSchemaVersion = 1;
+    inline constexpr std::string_view ExactPlayerHandHealthCheckpointKind =
+        "route-c-exact-player-hand-health";
     inline constexpr int ExactCharacterChargeSchemaVersion = 1;
     inline constexpr std::string_view ExactCharacterChargeCheckpointKind =
         "route-c-exact-character-charge";
@@ -117,6 +120,8 @@ namespace QuantumCheckpoint
         std::int32_t wave_index{};
         std::string player_deck{};
         std::string player_hand{};
+        // Latest schemas require the linked hand-health payload for nonempty HAND.
+        std::string player_hand_health_checksum{};
         std::string payload_checksum{};
     };
 
@@ -136,6 +141,7 @@ namespace QuantumCheckpoint
         std::string player_deck{};
         std::string player_hand{};
         std::string player_trash{};
+        std::string player_hand_health_checksum{};
         std::string payload_checksum{};
     };
 
@@ -168,6 +174,26 @@ namespace QuantumCheckpoint
         std::string player_field_attack_states{};
         std::string player_field_health_states{};
         std::string player_field_counter_states{};
+        std::string player_hand_health_checksum{};
+        std::string payload_checksum{};
+    };
+
+    // Each health record belongs to the same native hand-array index, including
+    // duplicate card identities. This slice has only nonnegative HEALTH modifiers;
+    // capture and runtime verification require current health to equal the saved
+    // maximum. The existing positive base/max health bounds remain in force.
+    struct ExactPlayerHandHealthCheckpoint
+    {
+        int schema_version{ExactPlayerHandHealthSchemaVersion};
+        std::string kind{ExactPlayerHandHealthCheckpointKind};
+        std::string captured_at_utc{};
+        std::string route_c_payload_checksum{};
+        std::string game_executable_sha256{};
+        std::uint64_t game_executable_size{};
+        std::string source_level_name{};
+        std::int32_t wave_index{};
+        std::string player_hand{};
+        std::string player_hand_health_states{};
         std::string payload_checksum{};
     };
 

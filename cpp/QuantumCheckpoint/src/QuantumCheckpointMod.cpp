@@ -46,6 +46,8 @@
 #include <Unreal/Hooks.hpp>
 #include <Unreal/Property/FArrayProperty.hpp>
 #include <Unreal/Property/FObjectProperty.hpp>
+#include <Unreal/Property/FStructProperty.hpp>
+#include <Unreal/UScriptStruct.hpp>
 #include <Unreal/UClass.hpp>
 #include <Unreal/UFunction.hpp>
 #include <Unreal/UFunctionStructs.hpp>
@@ -142,6 +144,7 @@ namespace QuantumCheckpoint
             std::optional<ExactPlayerZonesCheckpoint> exact_player_zones{};
             std::optional<ExactPlayerTrashCheckpoint> exact_player_trash{};
             std::optional<ExactPlayerFieldCheckpoint> exact_player_field{};
+            std::optional<ExactPlayerHandHealthCheckpoint> exact_player_hand_health{};
             std::optional<ExactCharacterChargeCheckpoint> exact_character_charge{};
             std::optional<ExactTurnProgressCheckpoint> exact_turn_progress{};
             std::string exact_player_startup_decklist{};
@@ -235,6 +238,14 @@ namespace QuantumCheckpoint
             std::optional<std::size_t> field_counter_pending_card{};
             PlayerCounterState field_counter_before_queue{};
             std::chrono::steady_clock::time_point field_counter_queued_at{};
+            std::string hand_health_status{"legacy-unavailable"};
+            std::string hand_health_reason{};
+            std::vector<PlayerHealthState> hand_health_prefix{};
+            std::vector<PendingNativeTrashMove> hand_health_targets{};
+            std::optional<std::size_t> hand_health_pending_card{};
+            PlayerHealthState hand_health_before_queue{};
+            std::chrono::steady_clock::time_point hand_health_queued_at{};
+            bool off_field_statistics_covered{};
         };
 
         struct PendingRouteCCapture
@@ -1538,6 +1549,11 @@ namespace QuantumCheckpoint
                 / STR("route-c-exact-player-field.json");
         }
 
+        auto exact_player_hand_health_checkpoint_path() -> std::filesystem::path
+        {
+            return route_c_checkpoint_path().parent_path() / STR("route-c-exact-player-hand-health.json");
+        }
+
         auto exact_character_charge_checkpoint_path() -> std::filesystem::path
         {
             const auto mods_directory = std::filesystem::path{
@@ -2031,6 +2047,47 @@ namespace QuantumCheckpoint
                     + error.what();
                 append_route_c_trace_failure(
                     "restore.exact-player-field.rejected", reason);
+                return std::nullopt;
+            }
+        }
+
+        auto try_read_exact_player_hand_health_checkpoint(const RouteCCheckpoint& route_c,
+                                                          std::string& reason)
+            -> std::optional<ExactPlayerHandHealthCheckpoint>
+        {
+            try
+            {
+                const auto path = exact_player_hand_health_checkpoint_path();
+                // Windows filesystem exceptions can contain local-codepage text.
+                // Keep ordinary missing/invalid file diagnostics valid UTF-8 JSON.
+                std::error_code file_error{};
+                if (!std::filesystem::exists(path, file_error))
+                    throw std::runtime_error{file_error
+                        ? "hand-health path could not be inspected"
+                        : "hand-health supplement does not exist"};
+                const auto size = std::filesystem::file_size(path, file_error);
+                if (file_error || size == 0 || size > RouteCMaximumFileBytes)
+                    throw std::runtime_error{"hand-health supplement has an invalid size"};
+                std::ifstream input{path, std::ios::binary};
+                std::string contents(static_cast<std::size_t>(size), '\0');
+                if (!input || !input.read(contents.data(), static_cast<std::streamsize>(size)))
+                    throw std::runtime_error{"hand-health supplement could not be read completely"};
+                std::string error{};
+                auto exact = parse_exact_player_hand_health_checkpoint(contents, error);
+                if (!exact) throw std::runtime_error{error};
+                if (exact->route_c_payload_checksum != route_c.payload_checksum
+                    || exact->game_executable_sha256 != route_c.game_executable_sha256
+                    || exact->game_executable_size != route_c.game_executable_size
+                    || exact->source_level_name != route_c.source_level_name
+                    || exact->wave_index != route_c.wave_index)
+                    throw std::runtime_error{"hand-health supplement does not match Route C"};
+                reason = "linked hand-health supplement loaded";
+                return exact;
+            }
+            catch (const std::exception& error)
+            {
+                reason = std::string{"required hand-health supplement unavailable: "} + error.what();
+                append_route_c_trace_failure("restore.exact-player-hand-health.rejected", reason);
                 return std::nullopt;
             }
         }
@@ -3274,21 +3331,122 @@ namespace QuantumCheckpoint
             return std::move(value->value);
         }
 
-        auto validate_generated_off_field_statistics(UObject* engine,const NativeMoveCardApi& api) -> void
+        struct DefinedPlayerCardStatistics
         {
-            // Generated-card schemas persist dynamic stats only for FIELD.
-            for (const auto location : {0,1,2})
-                for (const auto& card : native_cards_at_location(engine,api,location))
+            std::int32_t attack{}, health{}, level{};
+        };
+
+        auto defined_player_card_statistics(UObject* game_instance, UObject* card)
+            -> DefinedPlayerCardStatistics
+        {
+            auto* instance_function = card->GetFunctionByNameInChain(STR("getCardInfoInstance"));
+            auto* instance_return = instance_function ? instance_function->GetReturnProperty() : nullptr;
+            if (!instance_return || !instance_return->IsA<FStructProperty>()
+                || instance_function->GetParmsSize() != 0xB8 || instance_return->GetElementSize() != 0xB8)
+                throw std::runtime_error{"card-info instance reflected layout changed"};
+            ReflectedParameterBuffer instance_buffer{instance_function};
+            card->ProcessEvent(instance_function, instance_buffer.bytes.data());
+            auto* instance = instance_return->ContainerPtrToValuePtr<void>(instance_buffer.bytes.data());
+            auto* instance_type = static_cast<FStructProperty*>(instance_return)->GetStruct();
+            auto* info_property = instance_type->GetPropertyByNameInChain(STR("CardInfo"));
+            auto* upgrade_property = instance_type->GetPropertyByNameInChain(STR("upgradeLevel"));
+            if (!info_property || !info_property->IsA<FStructProperty>() || info_property->GetElementSize() != 0xB0
+                || !upgrade_property || upgrade_property->GetElementSize() != 4)
+                throw std::runtime_error{"card-info instance fields changed"};
+            auto* info = info_property->ContainerPtrToValuePtr<void>(instance);
+            const auto upgrade = *upgrade_property->ContainerPtrToValuePtr<std::int32_t>(instance);
+            auto* info_type = static_cast<FStructProperty*>(info_property)->GetStruct();
+            auto* tag_property = info_type->GetPropertyByNameInChain(STR("Tag"));
+            auto* level_property = info_type->GetPropertyByNameInChain(STR("Level"));
+            auto* levels_property = info_type->GetPropertyByNameInChain(STR("upgradeLevels"));
+            if (!tag_property || tag_property->GetElementSize() != 8 || !level_property
+                || level_property->GetElementSize() != 4 || !levels_property || !levels_property->IsA<FArrayProperty>())
+                throw std::runtime_error{"card definition fields changed"};
+            FString tag_text{};
+            tag_property->ExportTextItem(tag_text, tag_property->ContainerPtrToValuePtr<void>(info), nullptr, card, 0);
+
+            // Compare with the game's immutable card table, then read the selected
+            // upgrade through initialized reflected values (omitted text fields
+            // have defaults and must never be interpreted as zero).
+            auto* definition_function = game_instance->GetFunctionByNameInChain(STR("getCardInfo"));
+            auto* name_argument = definition_function ? definition_function->GetPropertyByNameInChain(STR("cardName")) : nullptr;
+            auto* definition_return = definition_function ? definition_function->GetReturnProperty() : nullptr;
+            if (!name_argument || !definition_return || !definition_return->IsA<FStructProperty>()
+                || definition_return->GetElementSize() != 0xB0 || definition_function->GetParmsSize() > 0xC0)
+                throw std::runtime_error{"game card-definition getter layout changed"};
+            ReflectedParameterBuffer definition_buffer{definition_function};
+            FOutputDevice errors{};
+            if (!name_argument->ImportText(tag_text.GetCharArray(),
+                    name_argument->ContainerPtrToValuePtr<void>(definition_buffer.bytes.data()), 0, game_instance, &errors))
+                throw std::runtime_error{"game card-definition name import failed"};
+            game_instance->ProcessEvent(definition_function, definition_buffer.bytes.data());
+            FString actual_text{}, definition_text{};
+            info_property->ExportTextItem(actual_text, info, nullptr, card, 0);
+            definition_return->ExportTextItem(definition_text,
+                definition_return->ContainerPtrToValuePtr<void>(definition_buffer.bytes.data()), nullptr, game_instance, 0);
+            if (to_string(actual_text.GetCharArray()) != to_string(definition_text.GetCharArray()))
+                throw std::runtime_error{"live card info differs from its game-table definition"};
+            const auto* levels = levels_property->ContainerPtrToValuePtr<void>(info);
+            const auto count = read_native_value<std::int32_t>(levels, 8);
+            const auto capacity = read_native_value<std::int32_t>(levels, 12);
+            const auto* entries = read_native_value<const void*>(levels, 0);
+            auto* entry_property = static_cast<FArrayProperty*>(levels_property)->GetInner();
+            if (upgrade < 0 || upgrade >= count || count <= 0 || count > 32 || capacity < count || capacity > 128
+                || !entry_property || !entry_property->IsA<FStructProperty>() || entry_property->GetElementSize() != 0x18
+                || !entries || !address_is_readable(entries, count * 0x18))
+                throw std::runtime_error{"card upgrade definition array is invalid"};
+            auto* entry_type = static_cast<FStructProperty*>(entry_property)->GetStruct();
+            auto* attack_property = entry_type->GetPropertyByNameInChain(STR("attack"));
+            auto* health_property = entry_type->GetPropertyByNameInChain(STR("health"));
+            if (!attack_property || attack_property->GetElementSize() != 4
+                || !health_property || health_property->GetElementSize() != 4)
+                throw std::runtime_error{"card upgrade scalar definition changed"};
+            auto* entry = const_cast<std::byte*>(static_cast<const std::byte*>(entries)) + upgrade * 0x18;
+            return {*attack_property->ContainerPtrToValuePtr<std::int32_t>(entry),
+                    *health_property->ContainerPtrToValuePtr<std::int32_t>(entry),
+                    *level_property->ContainerPtrToValuePtr<std::int32_t>(info)};
+        }
+
+        auto validate_off_field_statistics(const RouteCBattleObjects& objects, bool allow_hand_health)
+            -> std::vector<PlayerHealthState>
+        {
+            std::vector<PlayerHealthState> hand_health{};
+            for (const std::uint8_t location : {0,1,2})
+                for (const auto& card : read_native_player_zone_cards(objects.card_engine, location))
                 {
-                    const auto attack = capture_player_attack_state(card.card,true);
+                    const auto attack = capture_player_attack_state(card.card, true);
                     const auto health = capture_player_health_state(card.card);
                     const auto counters = capture_player_counter_state(card.card);
-                    if (!attack.modifiers.empty() || attack.current_attack != attack.base_attack
-                        || !health.modifiers.empty() || health.max_health != health.base_health
-                        || parse_int32(required_getter_text(card.card,STR("getCurrentHealth"))) != health.base_health
-                        || counters.generic != 0 || !counters.special.empty())
-                        throw std::runtime_error{"generated-card restore requires default off-field player statistics"};
+                    const auto definition = defined_player_card_statistics(objects.game_instance, card.card);
+                    ObjectSnapshot level{};
+                    append_native_card_level(level, card.card);
+                    const auto level_verified = std::find_if(level.properties.begin(), level.properties.end(),
+                        [](const auto& value) { return value.name == "nativeLevel:status" && value.value == "verified-native-level"; });
+                    if (level_verified == level.properties.end()
+                        || read_native_value<std::int32_t>(card.state,0x110) != definition.level
+                        || attack.base_attack != definition.attack || health.base_health != definition.health
+                        || !attack.modifiers.empty() || attack.current_attack != attack.base_attack
+                        || parse_int32(required_getter_text(card.card,STR("getCurrentHealth"))) != health.max_health
+                        || counters.generic != 0 || !counters.special.empty()
+                        || read_native_value<std::int32_t>(card.state,CardStateTurnBaseOffset) != 0
+                        || read_native_value<std::int32_t>(card.state,CardStateTurnAdjustmentOffset) != -1
+                        || parse_int32(required_getter_text(card.card,STR("getCurrentTurnCounter"))) != -1
+                        || required_getter_text(card.card,STR("isTurnActive")) != "True")
+                        throw std::runtime_error{"off-field card has unsupported base, attack, level, counter, current health, or turn state"};
+                    if (location != 0 || !allow_hand_health)
+                    {
+                        if (!health.modifiers.empty() || health.max_health != health.base_health)
+                            throw std::runtime_error{"DECK/TRASH or uncovered HAND requires default health"};
+                    }
+                    else
+                    {
+                        for (const auto& modifier : health.modifiers)
+                            if (modifier.amount < 0)
+                                throw std::runtime_error{"HAND health only supports nonnegative modifiers"};
+                        hand_health.push_back(health);
+                    }
                 }
+            return hand_health;
         }
 
         auto capture_route_c_checkpoint(std::optional<PendingRouteCCapture> expected = std::nullopt)
@@ -3464,10 +3622,46 @@ namespace QuantumCheckpoint
                     "capture.exact-spawn-plan.skipped", error.what());
             }
 
+            std::optional<ExactPlayerHandHealthCheckpoint> exact_player_hand_health{};
+            std::string off_field_rejection{}, hand_health_checksum{};
+            try
+            {
+                const auto states = validate_off_field_statistics(objects, true);
+                if (!states.empty())
+                {
+                    ExactPlayerHandHealthCheckpoint exact{};
+                    exact.captured_at_utc = checkpoint.captured_at_utc;
+                    exact.route_c_payload_checksum = checkpoint.payload_checksum;
+                    exact.game_executable_sha256 = checkpoint.game_executable_sha256;
+                    exact.game_executable_size = checkpoint.game_executable_size;
+                    exact.source_level_name = checkpoint.source_level_name;
+                    exact.wave_index = checkpoint.wave_index;
+                    exact.player_hand = read_native_player_zone_order(objects.card_engine, 0);
+                    exact.player_hand_health_states = serialize_player_health_states(states);
+                    exact.payload_checksum = exact_player_hand_health_payload_checksum(exact);
+                    std::string error{};
+                    if (!validate_exact_player_hand_health_checkpoint(exact, error))
+                        throw std::runtime_error{error};
+                    hand_health_checksum = exact.payload_checksum;
+                    exact_player_hand_health = std::move(exact);
+                }
+                append_route_c_trace("capture.off-field-statistics.preflight.complete");
+            }
+            catch (const std::exception& error)
+            {
+                off_field_rejection = error.what();
+                append_route_c_trace_failure("capture.off-field-statistics.rejected", off_field_rejection);
+            }
+
             std::optional<ExactPlayerZonesCheckpoint> exact_player_zones{};
             try
             {
                 append_route_c_trace("capture.exact-player-zones.prepare.begin");
+                if (!off_field_rejection.empty()) throw std::runtime_error{off_field_rejection};
+                const auto api = validated_native_move_card_api(objects.card_engine);
+                for (const auto location : {2,3,4})
+                    if (!native_cards_at_location(objects.card_engine, api, location).empty())
+                        throw std::runtime_error{"clean zones require empty player TRASH/FIELD/PENDING"};
                 const auto zones = find_route_c_player_zone_objects(
                     static_cast<const void*>(objects.card_engine->GetWorld()));
                 if (!zones.deck || !zones.hand)
@@ -3491,6 +3685,7 @@ namespace QuantumCheckpoint
                 exact.player_hand = required_player_zone_order(
                     objects.card_engine, zones.hand, 0, exact.schema_version);
                 append_route_c_trace("capture.exact-player-zones.get-hand.complete");
+                exact.player_hand_health_checksum = hand_health_checksum;
                 exact.payload_checksum = exact_player_zones_payload_checksum(exact);
                 std::string exact_validation_error{};
                 if (!validate_exact_player_zones_checkpoint(exact, exact_validation_error))
@@ -3518,6 +3713,7 @@ namespace QuantumCheckpoint
             try
             {
                 append_route_c_trace("capture.exact-player-trash.prepare.begin");
+                if (!off_field_rejection.empty()) throw std::runtime_error{off_field_rejection};
                 const auto zones = find_route_c_player_zone_objects(
                     static_cast<const void*>(objects.card_engine->GetWorld()));
                 if (!zones.deck || !zones.hand || !zones.trash)
@@ -3546,6 +3742,7 @@ namespace QuantumCheckpoint
                     objects.card_engine, zones.hand, 0, exact.schema_version);
                 exact.player_trash = required_player_zone_order(
                     objects.card_engine, zones.trash, 2, exact.schema_version);
+                exact.player_hand_health_checksum = hand_health_checksum;
                 exact.payload_checksum = exact_player_trash_payload_checksum(exact);
                 std::string exact_validation_error{};
                 if (!validate_exact_player_trash_checkpoint(exact, exact_validation_error))
@@ -3562,7 +3759,6 @@ namespace QuantumCheckpoint
                 {
                     throw std::runtime_error{exact_validation_error};
                 }
-                if (generated_count != 0) validate_generated_off_field_statistics(objects.card_engine,api);
                 exact_player_trash = std::move(exact);
                 append_route_c_trace("capture.exact-player-trash.prepare.complete");
             }
@@ -3576,6 +3772,7 @@ namespace QuantumCheckpoint
             try
             {
                 append_route_c_trace("capture.exact-player-field.prepare.begin");
+                if (!off_field_rejection.empty()) throw std::runtime_error{off_field_rejection};
                 const auto zones = find_route_c_player_zone_objects(
                     static_cast<const void*>(objects.card_engine->GetWorld()));
                 if (!zones.deck || !zones.hand || !zones.trash)
@@ -3685,6 +3882,7 @@ namespace QuantumCheckpoint
                 exact.player_field_attack_states = serialize_player_attack_states(attacks);
                 exact.player_field_health_states = serialize_player_health_states(health_states);
                 exact.player_field_counter_states = serialize_player_counter_states(counter_states);
+                exact.player_hand_health_checksum = hand_health_checksum;
                 exact.payload_checksum = exact_player_field_payload_checksum(exact);
                 std::string exact_validation_error{};
                 if (!validate_exact_player_field_checkpoint(
@@ -3702,10 +3900,6 @@ namespace QuantumCheckpoint
                         exact_validation_error,exact.schema_version >= 6,&generated_count))
                 {
                     throw std::runtime_error{exact_validation_error};
-                }
-                if (generated_count != 0)
-                {
-                    validate_generated_off_field_statistics(objects.card_engine,api.location);
                 }
                 exact_player_field = std::move(exact);
                 append_route_c_trace("capture.exact-player-field.prepare.complete");
@@ -3840,6 +4034,23 @@ namespace QuantumCheckpoint
                 {
                     append_route_c_trace_failure(
                     "capture.exact-spawn-plan.write.failed", error.what());
+                }
+            }
+            if (exact_player_hand_health && (exact_player_zones || exact_player_trash || exact_player_field))
+            {
+                try
+                {
+                    write_file_atomically(exact_player_hand_health_checkpoint_path(),
+                        serialize_exact_player_hand_health_checkpoint(*exact_player_hand_health));
+                    append_route_c_trace("capture.exact-player-hand-health.write.complete");
+                }
+                catch (const std::exception& error)
+                {
+                    // Never publish a layout that depends on an uncommitted sidecar.
+                    exact_player_zones.reset();
+                    exact_player_trash.reset();
+                    exact_player_field.reset();
+                    append_route_c_trace_failure("capture.exact-player-hand-health.write.failed", error.what());
                 }
             }
             if (exact_player_zones)
@@ -4026,6 +4237,18 @@ namespace QuantumCheckpoint
                    << json_escape(restore.field_health_status) << "\",\n"
                    << "  \"exactPlayerFieldCounterStatus\": \""
                    << json_escape(restore.field_counter_status) << "\",\n"
+                   << "  \"exactPlayerHandHealthSupplementPresent\": "
+                   << (restore.exact_player_hand_health ? "true" : "false") << ",\n"
+                   << "  \"exactPlayerHandHealthStatus\": \""
+                   << json_escape(restore.hand_health_status) << "\",\n"
+                   << "  \"exactPlayerHandHealthReason\": \""
+                   << json_escape(restore.hand_health_reason) << "\",\n"
+                   << "  \"playerOffFieldStatisticsRequired\": "
+                   << (restore.off_field_statistics_covered ? "true" : "false") << ",\n"
+                   << "  \"playerOffFieldStatisticsScope\": \""
+                   << (restore.off_field_statistics_covered
+                           ? "DECK/TRASH default numeric state; HAND native-index HEALTH nonnegative modifiers with current=max; definition base stats, level and default turns verified; effect/action history excluded"
+                           : "legacy or semantic layout: off-field statistics not covered") << "\",\n"
                    << "  \"generatedPlayerCardCount\": " << restore.generated_player_card_count << ",\n"
                    << "  \"generatedStartupMaxCountdown\": " << restore.generated_startup_max_countdown << ",\n"
                    << "  \"playerEffectActionHistoryRestored\": false,\n"
@@ -4271,7 +4494,8 @@ namespace QuantumCheckpoint
 
         auto queue_native_player_stat_modifier(UObject* engine, const NativeCardReference& card,
                                                const PlayerAttackModifier& modifier,
-                                               std::uint8_t native_stat = 1) -> void
+                                               std::uint8_t native_stat = 1,
+                                               std::uint8_t expected_location = 3) -> void
         {
             if (native_stat != 1 && native_stat != 2
 #if defined(QUANTUM_CHECKPOINT_RUNTIME_TEST_FIXTURES)
@@ -4280,11 +4504,12 @@ namespace QuantumCheckpoint
             )
                 throw std::runtime_error{"native stat action type is outside the tested ATTACK/HEALTH pair"};
             const auto api = validated_native_move_card_api(engine);
-            if (GetCurrentThreadId() != g_game_thread_id.load(std::memory_order_acquire)
+            if ((expected_location != 3 && (expected_location != 0 || native_stat != 2 || modifier.amount < 0))
+                || GetCurrentThreadId() != g_game_thread_id.load(std::memory_order_acquire)
                 || !card.card || card.card->GetWorld() != engine->GetWorld()
                 || read_native_value<const void*>(card.card, InGameCardStatePointerOffset) != card.state
-                || native_card_location(api.engine_state, card.state, api.get_card_location) != 3)
-                throw std::runtime_error{"attack modifier target is not a live player FIELD card"};
+                || native_card_location(api.engine_state, card.state, api.get_card_location) != expected_location)
+                throw std::runtime_error{"stat modifier target is not in the guarded player location"};
             const auto module_base = reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr));
             const auto signature = [&](std::uintptr_t rva, const auto& bytes) {
                 const auto* address = reinterpret_cast<const std::uint8_t*>(module_base + rva);
@@ -4475,7 +4700,8 @@ namespace QuantumCheckpoint
                 && completed.game_instance_reimported_at_card_engine_begin_play
                 && (completed.exact_player_field || completed.exact_player_trash
                     || completed.exact_player_zones || completed.exact_turn_progress
-                    || completed.exact_character_charge || completed.exact_spawn_plan))
+                    || completed.exact_character_charge || completed.exact_spawn_plan
+                    || completed.exact_player_hand_health))
             {
                 g_pending_route_c_fallback = PendingRouteCFallback{
                     completed.checkpoint, completed.reason};
@@ -4568,6 +4794,55 @@ namespace QuantumCheckpoint
                 exact_player_zones.reset();
                 append_route_c_trace("restore.exact-player-trash.supersedes-clean-zones");
             }
+            std::optional<ExactPlayerHandHealthCheckpoint> exact_player_hand_health{};
+            std::string hand_health_reason{semantic_only ? "ordinary Route C fallback does not restore hand health"
+                                                        : "legacy layout has no off-field statistics coverage"};
+            std::string hand_health_status{"legacy-unavailable"};
+            bool off_field_statistics_covered{}, invalid_hand_health_dependency{};
+            const std::string* required_hand_checksum{};
+            const std::string* required_hand{};
+            if (exact_player_field && exact_player_field->schema_version >= 7)
+            {
+                required_hand_checksum = &exact_player_field->player_hand_health_checksum;
+                required_hand = &exact_player_field->player_hand;
+            }
+            else if (exact_player_trash && exact_player_trash->schema_version >= 4)
+            {
+                required_hand_checksum = &exact_player_trash->player_hand_health_checksum;
+                required_hand = &exact_player_trash->player_hand;
+            }
+            else if (exact_player_zones && exact_player_zones->schema_version >= 3)
+            {
+                required_hand_checksum = &exact_player_zones->player_hand_health_checksum;
+                required_hand = &exact_player_zones->player_hand;
+            }
+            if (required_hand_checksum)
+            {
+                if (required_hand_checksum->empty() && *required_hand == "()")
+                {
+                    hand_health_status = "not-applicable-empty-hand";
+                    hand_health_reason = "new layout captured and requires an empty HAND";
+                    off_field_statistics_covered = true;
+                }
+                else
+                {
+                    exact_player_hand_health = try_read_exact_player_hand_health_checkpoint(checkpoint, hand_health_reason);
+                    if (!exact_player_hand_health
+                        || exact_player_hand_health->payload_checksum != *required_hand_checksum
+                        || exact_player_hand_health->player_hand != *required_hand)
+                    {
+                        invalid_hand_health_dependency = true;
+                        hand_health_status = "rejected-before-startup";
+                        hand_health_reason = "required HAND HEALTH checksum, full hand order, or Route C linkage failed; " + hand_health_reason;
+                        exact_player_hand_health.reset();
+                    }
+                    else
+                    {
+                        off_field_statistics_covered = true;
+                        hand_health_status = "pending";
+                    }
+                }
+            }
             std::string exact_character_charge_reason{};
             auto exact_character_charge = semantic_only ? std::nullopt : try_read_exact_character_charge_checkpoint(
                 checkpoint, exact_character_charge_reason);
@@ -4579,9 +4854,9 @@ namespace QuantumCheckpoint
             const bool missing_turn_for_cards = (exact_player_field || exact_player_trash) && !exact_turn_progress;
             const bool missing_cards_for_turn = exact_turn_progress
                 && !exact_player_field && !exact_player_trash && !exact_player_zones;
-            if (legacy_turn || missing_turn_for_cards || missing_cards_for_turn)
+            if (legacy_turn || missing_turn_for_cards || missing_cards_for_turn || invalid_hand_health_dependency)
             {
-                fallback_reason = legacy_turn
+                fallback_reason = invalid_hand_health_dependency ? hand_health_reason : legacy_turn
                     ? "legacy turn supplement has no native countdown/modifier"
                     : missing_turn_for_cards
                         ? "field/trash supplement requires valid native turn progress"
@@ -4597,6 +4872,9 @@ namespace QuantumCheckpoint
                 exact_player_trash.reset();
                 exact_player_zones.reset();
                 exact_character_charge.reset();
+                exact_player_hand_health.reset();
+                off_field_statistics_covered = false;
+                if (!invalid_hand_health_dependency) hand_health_status = "disabled-with-player-layout";
                 append_route_c_trace_failure("restore.combat-supplements.preflight-disabled", fallback_reason);
             }
 
@@ -4724,6 +5002,16 @@ namespace QuantumCheckpoint
                     exact_player_zones.reset();
                 }
             }
+            if (!exact_player_field && !exact_player_trash && !exact_player_zones)
+            {
+                exact_player_hand_health.reset();
+                off_field_statistics_covered = false;
+                if (hand_health_status == "pending" || hand_health_status == "not-applicable-empty-hand")
+                {
+                    hand_health_status = "disabled-with-player-layout";
+                    hand_health_reason = "no accepted exact player-card layout remains";
+                }
+            }
             std::string loot_error{};
             auto loot_drops = split_route_c_unreal_array(checkpoint.loot_drops, loot_error);
             if (!loot_drops)
@@ -4811,6 +5099,7 @@ namespace QuantumCheckpoint
                 .exact_player_zones = std::move(exact_player_zones),
                 .exact_player_trash = std::move(exact_player_trash),
                 .exact_player_field = std::move(exact_player_field),
+                .exact_player_hand_health = std::move(exact_player_hand_health),
                 .exact_character_charge = std::move(exact_character_charge),
                 .exact_turn_progress = std::move(exact_turn_progress),
                 .exact_player_startup_decklist = startup_decklist,
@@ -4839,6 +5128,9 @@ namespace QuantumCheckpoint
                 .generated_player_card_count = (exact_player_field_available || exact_player_trash_available) ? generated_player_card_count : 0,
                 .semantic_fallback = semantic_only,
                 .fallback_reason = std::move(fallback_reason),
+                .hand_health_status = std::move(hand_health_status),
+                .hand_health_reason = std::move(hand_health_reason),
+                .off_field_statistics_covered = off_field_statistics_covered,
             });
 
             try
@@ -5600,6 +5892,96 @@ namespace QuantumCheckpoint
                     "exact player-trash native moves could not be rolled back"};
             }
             return false;
+        }
+
+        auto verify_exact_player_hand_health(PendingRouteCRestore& restore,
+                                              const RouteCBattleObjects& objects,
+                                              std::chrono::steady_clock::time_point now) -> bool
+        {
+            if (!restore.off_field_statistics_covered) return true;
+            try
+            {
+                // This runs only after every native move/play has completed, and
+                // runs again throughout the final stability window. Moving a card
+                // after applying this layer would reset its modifiers.
+                const auto observed = validate_off_field_statistics(objects, true);
+                if (!restore.exact_player_hand_health)
+                {
+                    if (!observed.empty()) throw std::runtime_error{"saved empty HAND acquired cards"};
+                    return true;
+                }
+                const auto& exact = *restore.exact_player_hand_health;
+                if (read_native_player_zone_order(objects.card_engine, 0) != exact.player_hand)
+                    throw std::runtime_error{"HAND order or complete card definitions differ from the linked health supplement"};
+                std::string error{};
+                const auto desired = parse_player_health_states(exact.player_hand_health_states, error);
+                const auto cards = read_native_player_zone_cards(objects.card_engine, 0);
+                if (!desired || desired->size() != observed.size() || cards.size() != observed.size())
+                    throw std::runtime_error{"HAND HEALTH record alignment changed: " + error};
+                if (restore.hand_health_prefix.empty())
+                {
+                    for (std::size_t index{}; index < observed.size(); ++index)
+                    {
+                        if (observed[index].base_health != (*desired)[index].base_health
+                            || observed[index].max_health != observed[index].base_health
+                            || !observed[index].modifiers.empty())
+                            throw std::runtime_error{"fresh HAND health differs from the supported default state"};
+                        restore.hand_health_targets.push_back({cards[index].card, cards[index].state, 0});
+                    }
+                    restore.hand_health_prefix = observed;
+                    restore.hand_health_status = "applying";
+                    restore.hand_health_reason = "replaying native HEALTH actions after final card placement";
+                }
+                bool waiting{};
+                for (std::size_t index{}; index < observed.size(); ++index)
+                {
+                    if (cards[index].card != restore.hand_health_targets.at(index).card
+                        || cards[index].state != restore.hand_health_targets.at(index).state)
+                        throw std::runtime_error{"HAND card object or duplicate-card order changed during health restoration"};
+                    if (observed[index] == restore.hand_health_prefix.at(index)) continue;
+                    if (restore.hand_health_pending_card == index
+                        && observed[index] == restore.hand_health_before_queue
+                        && now - restore.hand_health_queued_at <= std::chrono::seconds{8})
+                        waiting = true;
+                    else throw std::runtime_error{"native HAND health changed or a queued modifier did not verify: index="
+                        + std::to_string(index) + " expected=" + serialize_player_health_states({restore.hand_health_prefix.at(index)})
+                        + " observed=" + serialize_player_health_states({observed[index]})};
+                }
+                if (waiting) return false;
+                restore.hand_health_pending_card.reset();
+                for (std::size_t index{}; index < observed.size(); ++index)
+                {
+                    auto& prefix = restore.hand_health_prefix[index];
+                    const auto& saved = (*desired)[index];
+                    if (prefix == saved) continue;
+                    if (restore.hand_health_status == "verified-native-health"
+                        || prefix.modifiers.size() >= saved.modifiers.size())
+                        throw std::runtime_error{"HAND health changed after verification or has an invalid replay prefix"};
+                    const auto& modifier = saved.modifiers.at(prefix.modifiers.size());
+                    if (modifier.amount < 0) throw std::runtime_error{"negative HAND health replay is unsupported"};
+                    restore.hand_health_before_queue = prefix;
+                    queue_native_player_stat_modifier(objects.card_engine, cards[index], modifier, 2, 0);
+                    prefix.modifiers.push_back(modifier);
+                    prefix.max_health += modifier.amount;
+                    restore.hand_health_pending_card = index;
+                    restore.hand_health_queued_at = now;
+                    append_route_c_trace_failure("restore.exact-player-hand-health.queued",
+                        "index=" + std::to_string(index) + " tag=" + modifier.tag);
+                    resume_native_restore_actions(objects.card_engine);
+                    return false;
+                }
+                if (restore.hand_health_status != "verified-native-health")
+                    append_route_c_trace("restore.exact-player-hand-health.verified-native-health");
+                restore.hand_health_status = "verified-native-health";
+                restore.hand_health_reason = "native HAND order, definitions, HEALTH modifiers and current=max verified";
+                return true;
+            }
+            catch (const std::exception& error)
+            {
+                restore.hand_health_status = "failed";
+                restore.hand_health_reason = error.what();
+                throw;
+            }
         }
 
         auto verify_exact_player_field_attack(PendingRouteCRestore& restore,
@@ -7460,6 +7842,7 @@ namespace QuantumCheckpoint
                         + restore.exact_player_field_reason + "; "
                         + restore.exact_player_zones_reason + "; " + restore.exact_player_trash_reason};
                 }
+                if (!verify_exact_player_hand_health(restore, objects, now)) return;
 
                 if (restore.exact_spawn_plan_status == "pending")
                 {
@@ -7629,6 +8012,7 @@ namespace QuantumCheckpoint
                     }
                 }
                 if ((restore.exact_spawn_plan && restore.exact_spawn_plan_status != "verified")
+                    || (restore.exact_player_hand_health && restore.hand_health_status != "verified-native-health")
                     || (restore.exact_player_zones && restore.exact_player_zones_status != "verified")
                     || (restore.exact_player_trash && restore.exact_player_trash_status != "verified")
                     || (restore.exact_player_field && restore.exact_player_field_status != "verified-position-health")
@@ -8197,6 +8581,14 @@ namespace QuantumCheckpoint
                             role == "BP_ControllerHand_C" ? 0 : role == "BP_ControllerDeck_C" ? 1 : 2);
                         snapshot.properties.push_back({"native:cardOrder",
                             required_player_zone_order(live.card_engine, object, location, 2)});
+                        std::string card_ids{"["};
+                        for (const auto& card : read_native_player_zone_cards(live.card_engine, location))
+                        {
+                            if (card_ids.size() > 1) card_ids += ',';
+                            card_ids += '"' + json_escape(required_getter_text(card.card, STR("getId"))) + '"';
+                        }
+                        card_ids += ']';
+                        snapshot.properties.push_back({"native:cardIdOrder", std::move(card_ids)});
                         const auto* vtable = read_native_value<const void*>(object, 0);
                         if (address_is_readable(static_cast<const std::byte*>(vtable) + 0x640, sizeof(void*)))
                         {
@@ -11414,9 +11806,9 @@ namespace QuantumCheckpoint
         QuantumCheckpointMod()
         {
             ModName = STR("QuantumCheckpoint");
-            ModVersion = STR("0.32.0");
+            ModVersion = STR("0.33.0");
 #if defined(QUANTUM_CHECKPOINT_RUNTIME_TEST_FIXTURES)
-            ModVersion = STR("0.32.0-test-fixtures");
+            ModVersion = STR("0.33.0-test-fixtures");
 #endif
             ModDescription = STR("Route C checkpoint with optional exact-state supplements");
             ModAuthors = STR("zaofenMachine and contributors");

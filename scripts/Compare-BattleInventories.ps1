@@ -218,6 +218,123 @@ function Get-CardStateSignature {
     return ($parts -join '|')
 }
 
+function Get-NativeAttackSignature {
+    param([Parameter(Mandatory = $true)][object]$Card)
+    return ('card={0}|location={1}|field={2}|baseAttack={3}|currentAttack={4}|modifierCount={5}|modifiers={6}' -f `
+        $Card.descriptor, $Card.location, $Card.field, $Card.nativeBaseAttack, $Card.nativeCurrentAttack, `
+        $Card.nativeModifierCount, $Card.nativeModifiers)
+}
+
+function Get-NativeLevelSignature {
+    param([Parameter(Mandatory = $true)][object]$Card)
+    return ('card={0}|location={1}|field={2}|level={3}|modifierSum={4}|modifierCount={5}' -f `
+        $Card.descriptor, $Card.location, $Card.field, $Card.nativeLevel, $Card.nativeLevelModifierSum, $Card.nativeLevelModifierCount)
+}
+
+function Get-NativeCounterSignature {
+    param([Parameter(Mandatory = $true)][object]$Card)
+    return ('card={0}|location={1}|field={2}|generic={3}|specialTotal={4}|specialEntries={5}|special={6}' -f `
+        $Card.descriptor, $Card.location, $Card.field, $Card.nativeGenericCounters, $Card.nativeSpecialCounterTotal, `
+        $Card.nativeSpecialCounterEntries, $Card.nativeSpecialCounters)
+}
+
+function Get-NativeHealthSignature {
+    param([Parameter(Mandatory = $true)][object]$Card)
+    return ('card={0}|location={1}|field={2}|base={3}|current={4}|adjustment={5}|modifierSum={6}|max={7}' -f `
+        $Card.descriptor, $Card.location, $Card.field, $Card.nativeBaseHealth, $Card.nativeCurrentHealth, `
+        $Card.nativeMaxHealthAdjustment, $Card.nativeModifierHealthSum, $Card.nativeMaxHealth)
+}
+
+function ConvertTo-NativeOrderedPlayerState {
+    param(
+        [Parameter(Mandatory = $true)][object]$Inventory,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$Cards
+    )
+
+    # GUIDs anchor observations inside one inventory only. They are excluded from
+    # comparison because native startup creates new GUIDs. Never infer this order
+    # from actor enumeration, metadata sorting, or matching duplicate card names.
+    try {
+        $cardsById = [System.Collections.Generic.Dictionary[string,object]]::new([System.StringComparer]::Ordinal)
+        foreach ($card in $Cards) {
+            if ([string]::IsNullOrWhiteSpace($card.id) -or $cardsById.ContainsKey($card.id)) {
+                throw 'Card observations contain a missing or duplicate runtime ID'
+            }
+            $cardsById.Add($card.id, $card)
+        }
+        $roles = [ordered]@{
+            BP_ControllerDeck_C = 'DECK'
+            BP_ControllerHand_C = 'HAND'
+            BP_ControllerTrash_C = 'TRASH'
+        }
+        $seenIds = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+        $orderedState = [ordered]@{}
+        foreach ($role in $roles.Keys) {
+            $location = $roles[$role]
+            $controllers = @($Inventory.objects | Where-Object {
+                $_.role -ceq $role -and -not $_.fullName.Contains('Default__') -and
+                (Get-SnapshotProperty $_ 'boardSide') -ceq 'PLAYER'
+            })
+            if ($controllers.Count -ne 1) { throw "Expected one native player $location controller" }
+            $idText = Get-SnapshotProperty $controllers[0] 'native:cardIdOrder'
+            $instanceText = Get-SnapshotProperty $controllers[0] 'native:cardOrder'
+            if ([string]::IsNullOrWhiteSpace($idText) -or [string]::IsNullOrWhiteSpace($instanceText)) {
+                throw "Native player $location ID or instance order is unavailable"
+            }
+            # Wrapping preserves [] and single-element arrays on Windows PowerShell
+            # as well as PowerShell 7, without ConvertFrom-Json enumeration ambiguity.
+            $parsed = ('{"ids":' + $idText + '}') | ConvertFrom-Json
+            if ($parsed.ids -isnot [System.Array] -or @($parsed.PSObject.Properties).Count -ne 1) {
+                throw "Native player $location ID order is not a JSON array"
+            }
+            $ids = @($parsed.ids)
+            $instances = @(Split-UnrealArray $instanceText)
+            $zoneCards = @($Cards | Where-Object { $_.location -ceq $location })
+            if ($ids.Count -ne $instances.Count -or $ids.Count -ne $zoneCards.Count) {
+                throw "Native player $location order does not cover its complete card membership"
+            }
+            $states = [System.Collections.Generic.List[object]]::new()
+            for ($index = 0; $index -lt $ids.Count; $index++) {
+                $id = $ids[$index]
+                if ($id -isnot [string] -or [string]::IsNullOrWhiteSpace($id) -or
+                    -not $seenIds.Add($id) -or -not $cardsById.ContainsKey($id)) {
+                    throw "Native player $location order contains a missing, duplicate, or unresolved ID"
+                }
+                $card = $cardsById[$id]
+                if ($card.location -cne $location -or $card.instance -cne $instances[$index]) {
+                    throw "Native player $location ID disagrees with its zone or ordered card instance"
+                }
+                if ($card.nativeStatisticsStatus -cne 'verified-native-attack' -or
+                    $card.nativeHealthStatus -cne 'verified-native-health' -or
+                    $card.nativeCountersStatus -cne 'verified-native-counters' -or
+                    $card.nativeLevelStatus -cne 'verified-native-level' -or -not $card.effectsAvailable) {
+                    throw "Native player $location card has incomplete verified runtime observations"
+                }
+                foreach ($field in @('health','baseHealth','turn','turnBase','turnAdjustment','turnActive',
+                    'nativeBaseAttack','nativeCurrentAttack','nativeModifierCount','nativeModifiers',
+                    'nativeBaseHealth','nativeCurrentHealth','nativeMaxHealthAdjustment','nativeModifierHealthSum','nativeMaxHealth',
+                    'nativeGenericCounters','nativeSpecialCounterTotal','nativeSpecialCounterEntries','nativeSpecialCounters',
+                    'nativeLevel','nativeLevelModifierSum','nativeLevelModifierCount')) {
+                    if ($null -eq $card[$field] -or ($field -ne 'nativeModifiers' -and [string]::IsNullOrWhiteSpace($card[$field]))) {
+                        throw "Native player $location card lacks runtime field $field"
+                    }
+                }
+                $states.Add([ordered]@{
+                    cardState = Get-CardStateSignature $card
+                    nativeAttack = Get-NativeAttackSignature $card
+                    nativeHealth = Get-NativeHealthSignature $card
+                    nativeCounters = Get-NativeCounterSignature $card
+                    nativeLevel = Get-NativeLevelSignature $card
+                })
+            }
+            $orderedState[$location] = @($states)
+        }
+        return [ordered]@{ available = $true; reason = 'Complete native DECK/HAND/TRASH ID order and runtime observations'; state = $orderedState }
+    } catch {
+        return [ordered]@{ available = $false; reason = $_.Exception.Message; state = $null }
+    }
+}
+
 function ConvertTo-NormalizedInventory {
     param([Parameter(Mandatory = $true)][string]$Path)
 
@@ -271,13 +388,27 @@ function ConvertTo-NormalizedInventory {
         $specialCounter = if ($specialCounterName) { $objectsByName[$specialCounterName] } else { $null }
 
         $effects = [System.Collections.Generic.List[object]]::new()
-        foreach ($effectName in (Get-EffectReferences (Get-SnapshotProperty $card 'cardOverlayEffects'))) {
+        $effectText = Get-SnapshotProperty $card 'cardOverlayEffects'
+        $effectsAvailable = $null -ne $effectText
+        $effectNames = @(Get-EffectReferences $effectText)
+        try {
+            if ([string]::IsNullOrWhiteSpace($effectText) -or
+                @(Split-UnrealArray $effectText).Count -ne $effectNames.Count) { $effectsAvailable = $false }
+        } catch { $effectsAvailable = $false }
+        foreach ($effectName in $effectNames) {
             $effect = $objectsByName[$effectName]
             if ($null -eq $effect) {
+                $effectsAvailable = $false
                 continue
             }
             $widgetName = Get-UnrealObjectName (Get-SnapshotProperty $effect 'mCardEffectWidget')
             $widget = if ($widgetName) { $objectsByName[$widgetName] } else { $null }
+            if ($null -eq $widget -or $null -eq (Get-SnapshotProperty $widget 'EffectType') -or
+                $null -eq (Get-SnapshotProperty $widget 'activationBlockers') -or
+                $null -eq (Get-SnapshotProperty $effect 'getter:getEffectActionState') -or
+                $null -eq (Get-SnapshotProperty $effect 'isAutomationHighlighted')) {
+                $effectsAvailable = $false
+            }
             $effects.Add([ordered]@{
                 type = if ($null -ne $widget) { Get-SnapshotProperty $widget 'EffectType' } else { $null }
                 blockers = if ($null -ne $widget) { Get-SnapshotProperty $widget 'activationBlockers' } else { $null }
@@ -289,6 +420,7 @@ function ConvertTo-NormalizedInventory {
         $cardInfoInstance = Get-SnapshotProperty $card 'getter:getCardInfoInstance'
         $cards.Add([ordered]@{
             descriptor = ConvertTo-CardDescriptor $cardInfoInstance
+            instance = $cardInfoInstance
             tag = Get-SnapshotProperty $card 'getter:getTag'
             id = Get-SnapshotProperty $card 'getter:getId'
             location = Get-SnapshotProperty $card 'getter:getCardLocation'
@@ -327,6 +459,7 @@ function ConvertTo-NormalizedInventory {
             nativeModifierHealthSum = Get-SnapshotProperty $card 'nativeHealth:modifierHealthSum'
             nativeMaxHealth = Get-SnapshotProperty $card 'nativeHealth:maxHealth'
             effects = @($effects)
+            effectsAvailable = $effectsAvailable
         })
     }
 
@@ -389,6 +522,7 @@ function ConvertTo-NormalizedInventory {
 
     $playerCards = @($cards | Where-Object { -not $_.location.StartsWith('ENEMY_') })
     $enemyCards = @($cards | Where-Object { $_.location.StartsWith('ENEMY_') })
+    $orderedPlayerState = ConvertTo-NativeOrderedPlayerState $inventory @($cards)
 
     return [ordered]@{
         path = $resolvedPath
@@ -439,6 +573,9 @@ function ConvertTo-NormalizedInventory {
         nativePlayerZones = $nativePlayerZones
         nativePlayerZoneInstances = $nativePlayerZoneInstances
         nativePlayerZonesAvailable = $nativePlayerZones.Count -eq 3
+        playerNativeOrderedStateAvailable = $orderedPlayerState.available
+        playerNativeOrderedStateReason = $orderedPlayerState.reason
+        playerNativeOrderedState = $orderedPlayerState.state
         playerCardState = ConvertTo-CountedValues @(
             $playerCards | ForEach-Object { Get-CardStateSignature $_ }
         )
@@ -446,40 +583,25 @@ function ConvertTo-NormalizedInventory {
             $playerCards | Where-Object { $_.nativeStatisticsStatus -cne 'verified-native-attack' }
         ).Count -eq 0
         playerNativeStatistics = ConvertTo-CountedValues @(
-            $playerCards | ForEach-Object {
-                'card={0}|location={1}|field={2}|baseAttack={3}|currentAttack={4}|modifierCount={5}|modifiers={6}' -f `
-                    $_.descriptor, $_.location, $_.field, $_.nativeBaseAttack, $_.nativeCurrentAttack, `
-                    $_.nativeModifierCount, $_.nativeModifiers
-            }
+            $playerCards | ForEach-Object { Get-NativeAttackSignature $_ }
         )
         playerNativeLevelAvailable = $playerCards.Count -gt 0 -and @(
             $playerCards | Where-Object { $_.nativeLevelStatus -cne 'verified-native-level' }
         ).Count -eq 0
         playerNativeLevel = ConvertTo-CountedValues @(
-            $playerCards | ForEach-Object {
-                'card={0}|location={1}|field={2}|level={3}|modifierSum={4}|modifierCount={5}' -f `
-                    $_.descriptor, $_.location, $_.field, $_.nativeLevel, $_.nativeLevelModifierSum, $_.nativeLevelModifierCount
-            }
+            $playerCards | ForEach-Object { Get-NativeLevelSignature $_ }
         )
         playerNativeCountersAvailable = $playerCards.Count -gt 0 -and @(
             $playerCards | Where-Object { $_.nativeCountersStatus -cne 'verified-native-counters' }
         ).Count -eq 0
         playerNativeCounters = ConvertTo-CountedValues @(
-            $playerCards | ForEach-Object {
-                'card={0}|location={1}|field={2}|generic={3}|specialTotal={4}|specialEntries={5}|special={6}' -f `
-                    $_.descriptor, $_.location, $_.field, $_.nativeGenericCounters, $_.nativeSpecialCounterTotal, `
-                    $_.nativeSpecialCounterEntries, $_.nativeSpecialCounters
-            }
+            $playerCards | ForEach-Object { Get-NativeCounterSignature $_ }
         )
         playerNativeHealthAvailable = $playerCards.Count -gt 0 -and @(
             $playerCards | Where-Object { $_.nativeHealthStatus -cne 'verified-native-health' }
         ).Count -eq 0
         playerNativeHealth = ConvertTo-CountedValues @(
-            $playerCards | ForEach-Object {
-                'card={0}|location={1}|field={2}|base={3}|current={4}|adjustment={5}|modifierSum={6}|max={7}' -f `
-                    $_.descriptor, $_.location, $_.field, $_.nativeBaseHealth, $_.nativeCurrentHealth, `
-                    $_.nativeMaxHealthAdjustment, $_.nativeModifierHealthSum, $_.nativeMaxHealth
-            }
+            $playerCards | ForEach-Object { Get-NativeHealthSignature $_ }
         )
         playerCardRuntimeStateIgnoringLocation = ConvertTo-CountedValues @(
             $playerCards | ForEach-Object { Get-CardStateSignature $_ -IgnoreLocation }
@@ -545,6 +667,12 @@ if ($beforeState.nativePlayerZonesAvailable -and $afterState.nativePlayerZonesAv
         $beforeState.nativePlayerZones $afterState.nativePlayerZones
     Add-Difference 'native-player-zone-instances' 'nativePlayerZoneInstances' `
         $beforeState.nativePlayerZoneInstances $afterState.nativePlayerZoneInstances
+}
+if ($beforeState.playerNativeOrderedStateAvailable -and $afterState.playerNativeOrderedStateAvailable) {
+    foreach ($zone in $beforeState.playerNativeOrderedState.Keys) {
+        Add-Difference 'player-native-ordered-state' "playerNativeOrderedState.$zone" `
+            $beforeState.playerNativeOrderedState[$zone] $afterState.playerNativeOrderedState[$zone]
+    }
 }
 
 Add-Difference 'player-card-state' 'playerCardState' `
@@ -633,6 +761,10 @@ $report = [ordered]@{
         playerNativeZoneInstancesEqual = if ($beforeState.nativePlayerZonesAvailable -and $afterState.nativePlayerZonesAvailable) {
             Test-Equivalent $beforeState.nativePlayerZoneInstances $afterState.nativePlayerZoneInstances
         } else { $null }
+        playerNativeOrderedStateAvailable = $beforeState.playerNativeOrderedStateAvailable -and $afterState.playerNativeOrderedStateAvailable
+        playerNativeOrderedStateEqual = if ($beforeState.playerNativeOrderedStateAvailable -and $afterState.playerNativeOrderedStateAvailable) {
+            Test-Equivalent $beforeState.playerNativeOrderedState $afterState.playerNativeOrderedState
+        } else { $null }
         playerCardStateIncludingLocationEqual = Test-Equivalent `
             $beforeState.playerCardState $afterState.playerCardState
         playerNativeStatisticsAvailable = $beforeState.playerNativeStatisticsAvailable -and $afterState.playerNativeStatisticsAvailable
@@ -663,7 +795,9 @@ $report = [ordered]@{
         beforeRuntimeCardIdCount = @($beforeState.runtimeCardIds).Count
         afterRuntimeCardIdCount = @($afterState.runtimeCardIds).Count
         sharedRuntimeCardIdCount = $sharedIds.Count
-        note = 'Runtime GUIDs are excluded. playerZoneSequencesEqual compares metadata-sorted controller views, not draw/hand order. Native order is unknown (null) unless both inventories include all three player-zone arrays. Native attack/modifier equality is unknown (null) unless every player card in both inventories has verified native statistics; the older card-state check does not cover those fields.'
+        beforeNativeOrderedStateCoverage = $beforeState.playerNativeOrderedStateReason
+        afterNativeOrderedStateCoverage = $afterState.playerNativeOrderedStateReason
+        note = 'Runtime GUIDs are excluded from equality. playerZoneSequencesEqual compares metadata-sorted controller views, not draw/hand order. Native order is unknown (null) unless both inventories include all three player-zone arrays. Ordered runtime state requires complete native DECK/HAND/TRASH ID arrays resolving unique cards in the correct zone and instance position, with verified attack/health/counters/level and complete turn/effect observations. GUIDs only link each inventory internally; missing or invalid coverage yields null, never inferred order. Native attack/modifier equality is unknown (null) unless every player card in both inventories has verified native statistics; the older card-state check does not cover those fields.'
     }
     futureSpawnPlan = [ordered]@{
         beforeWaveCount = @($beforeState.spawner.spawnWaveHashes).Count
