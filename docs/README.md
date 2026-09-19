@@ -1,6 +1,6 @@
 # 文档索引
 
-当前入口（2026-09-20）：用户已授权继续“小关重开 + 玩家精确恢复”，重编程重开和敌人精确恢复仍搁置。v0.33.0 的手牌生命补充、场外严格门禁和当前验收进度见 [第三十二阶段](phase-32-player-hand-health.md)；最终 DLL 的实机回归进行中。继续工作时先读 [当前工作进度](WIP-current-progress-2026-09-10.md) 文首，勿沿用其下方历史调试状态。
+当前入口（2026-09-20）：继续“小关重开 + 玩家精确恢复”，重编程与敌人精确恢复保持搁置。v0.34.0 的手牌生命/计数联合恢复、兼容边界与已完成验收见 [第三十三阶段](phase-33-player-hand-counters.md)。继续工作先读 [当前工作进度](WIP-current-progress-2026-09-10.md) 文首，勿沿用下方历史版本。
 
 以下文件是后续维护时应优先更新的权威文档：
 
@@ -62,3 +62,5 @@
 - [phase-32-player-hand-health.md](phase-32-player-hand-health.md)：旧版真实手牌增益丢失、HAND HEALTH schema 1、布局依赖、场外严格门禁与同名卡原生位置动态比较。
 
 维护规则：需求发生变化时先更新 `requirements.md`；技术实验产生新证据时更新 `technical-status.md` 并补充对应阶段报告；正式选定恢复路线后在 `architecture-options.md` 记录决定与理由。
+
+- [phase-33-player-hand-counters.md](phase-33-player-hand-counters.md)：HAND generic 计数、与生命联合恢复、效果历史范围和实机验收。

@@ -1,4 +1,5 @@
 #include "CheckpointPersistence.hpp"
+#include "PlayerCounterState.hpp"
 #include "PlayerRestorePlan.hpp"
 
 #include <cstdlib>
@@ -117,6 +118,7 @@ namespace
         -> QuantumCheckpoint::ExactPlayerHandHealthCheckpoint
     {
         return {
+            .schema_version = 1,
             .captured_at_utc = route_c.captured_at_utc,
             .route_c_payload_checksum = route_c.payload_checksum,
             .game_executable_sha256 = route_c.game_executable_sha256,
@@ -1267,7 +1269,7 @@ int main()
     require(!parse_exact_player_hand_health_checkpoint(
                 serialize_exact_player_hand_health_checkpoint(invalid_hand_health), error),
             "hand-health supplement rejects an invalid card instance");
-    for (const int version : {0, 2})
+    for (const int version : {0, 3})
     {
         invalid_hand_health = hand_health;
         invalid_hand_health.schema_version = version;
@@ -1323,6 +1325,112 @@ int main()
     require(!parse_exact_player_hand_health_checkpoint(missing_hand_health, error),
             "hand-health records are mandatory in this supplement");
 
+    // A fixed schema-1 fixture guards the pre-counter wire format byte for byte.
+    auto legacy_hand_health = hand_health;
+    legacy_hand_health.route_c_payload_checksum = "0123456789ABCDEF";
+    const std::string legacy_hand_health_json = R"json({
+  "schemaVersion": 1,
+  "kind": "route-c-exact-player-hand-health",
+  "capturedAtUtc": "2026-08-31T14:00:00Z",
+  "routeCPayloadChecksum": "0123456789ABCDEF",
+  "gameExecutableSha256": "0DCF220317FA31667C14DD7FB41A6757B94FF7CDE2262E5A87337D00CCB017A6",
+  "gameExecutableSize": 82718720,
+  "sourceLevelName": "testDungeon",
+  "waveIndex": 3,
+  "playerHand": "((CardInfo=(Tag=\"naturalApple\")),(CardInfo=(Tag=\"naturalApple\")))",
+  "playerHandHealthStates": "2,3|mageOctavia_init,1,-1,0;2,2",
+  "payloadChecksum": "EC46AA3E7329C8FE"
+}
+)json";
+    require(exact_player_hand_health_payload_checksum(legacy_hand_health) == "EC46AA3E7329C8FE"
+                && serialize_exact_player_hand_health_checkpoint(legacy_hand_health) == legacy_hand_health_json,
+            "schema-1 hand health retains its original checksum and exact serialized bytes");
+    const auto parsed_legacy_hand_health = parse_exact_player_hand_health_checkpoint(legacy_hand_health_json, error);
+    require(parsed_legacy_hand_health && parsed_legacy_hand_health->schema_version == 1
+                && parsed_legacy_hand_health->player_hand_counter_states.empty()
+                && serialize_exact_player_hand_health_checkpoint(*parsed_legacy_hand_health) == legacy_hand_health_json,
+            "schema-1 parsing does not invent counter records or change its wire representation");
+    auto legacy_with_hand_counters = *parsed_legacy_hand_health;
+    legacy_with_hand_counters.player_hand_counter_states = "0;0";
+    require(!validate_exact_player_hand_health_checkpoint(legacy_with_hand_counters, error)
+                && error.find("legacy") != std::string::npos,
+            "schema-1 objects cannot claim even default counter coverage");
+    for (const std::string records : {"", "0;0"})
+    {
+        auto injected = legacy_hand_health_json;
+        injected.insert(1, "\n  \"playerHandCounterStates\": \"" + records + "\",");
+        require(!parse_exact_player_hand_health_checkpoint(injected, error)
+                    && error.find("legacy") != std::string::npos,
+                "schema-1 JSON rejects a counter property even when it is empty or all zero");
+    }
+
+    auto hand_with_counters = legacy_hand_health;
+    hand_with_counters.schema_version = 2;
+    hand_with_counters.player_hand_counter_states = "1;0";
+    const auto hand_counter_json = serialize_exact_player_hand_health_checkpoint(hand_with_counters);
+    const auto parsed_hand_counters = parse_exact_player_hand_health_checkpoint(hand_counter_json, error);
+    require(ExactPlayerHandHealthCheckpoint{}.schema_version == 2
+                && parsed_hand_counters && parsed_hand_counters->schema_version == 2
+                && parsed_hand_counters->player_hand == hand_with_counters.player_hand
+                && parsed_hand_counters->player_hand_health_states == hand_with_counters.player_hand_health_states
+                && parsed_hand_counters->player_hand_counter_states == "1;0"
+                && validate_exact_player_hand_health_checkpoint(*parsed_hand_counters, error),
+            "schema-2 preserves aligned health and generic counters for duplicate hand identities");
+    require(exact_player_hand_health_payload_checksum(hand_with_counters) == "85193C32AD2F4164"
+                && serialize_exact_player_hand_health_checkpoint(*parsed_hand_counters) == hand_counter_json,
+            "schema-2 appends counters after the original hash fields and round trips byte for byte");
+    auto swapped_hand_counters = hand_with_counters;
+    swapped_hand_counters.player_hand_counter_states = "0;1";
+    require(swapped_hand_counters.player_hand == hand_with_counters.player_hand
+                && swapped_hand_counters.player_hand_health_states == hand_with_counters.player_hand_health_states
+                && exact_player_hand_health_payload_checksum(swapped_hand_counters)
+                    != exact_player_hand_health_payload_checksum(hand_with_counters)
+                && parse_exact_player_hand_health_checkpoint(
+                    serialize_exact_player_hand_health_checkpoint(swapped_hand_counters), error).has_value(),
+            "counter assignments to duplicate hand identities remain positional and integrity checked");
+    for (const int count : {0, PlayerCounterRestoreMaximum})
+    {
+        auto bounded = hand_with_counters;
+        bounded.player_hand_counter_states = std::to_string(count) + ";" + std::to_string(count);
+        require(parse_exact_player_hand_health_checkpoint(
+                    serialize_exact_player_hand_health_checkpoint(bounded), error).has_value(),
+                "hand generic counters allow zero and the existing native replay maximum");
+    }
+    for (const auto* records : {"", "0", "0;0;0", "-1;0", "0;-1", "257;0", "0;257",
+                                "0|mdvRocket,0;0", "0|counter,1;0", "0|counter,-1;0",
+                                "01;0", "0;", "+1;0", "2147483648;0"})
+    {
+        auto invalid = hand_with_counters;
+        invalid.player_hand_counter_states = records;
+        invalid.payload_checksum = exact_player_hand_health_payload_checksum(invalid);
+        require(!validate_exact_player_hand_health_checkpoint(invalid, error)
+                    && !parse_exact_player_hand_health_checkpoint(
+                        serialize_exact_player_hand_health_checkpoint(invalid), error),
+                "valid checksums cannot authorize misaligned, special, negative, excessive or malformed hand counters");
+    }
+    auto tampered_hand_counters = hand_counter_json;
+    tampered_hand_counters.replace(tampered_hand_counters.find("1;0"), 3, "0;1");
+    require(!parse_exact_player_hand_health_checkpoint(tampered_hand_counters, error)
+                && error.find("checksum") != std::string::npos,
+            "valid counter grammar cannot conceal a swapped native hand index");
+    auto missing_hand_counters = hand_counter_json;
+    const auto hand_counter_begin = missing_hand_counters.find("  \"playerHandCounterStates\"");
+    missing_hand_counters.erase(hand_counter_begin,
+        missing_hand_counters.find('\n', hand_counter_begin) - hand_counter_begin + 1);
+    require(!parse_exact_player_hand_health_checkpoint(missing_hand_counters, error),
+            "schema-2 requires counter records rather than assuming default counts");
+    auto numeric_hand_counters = hand_counter_json;
+    numeric_hand_counters.replace(numeric_hand_counters.find("\"1;0\""), 5, "0");
+    require(!parse_exact_player_hand_health_checkpoint(numeric_hand_counters, error),
+            "schema-2 counter records use the existing canonical string grammar");
+    auto downgraded_hand_counters = hand_counter_json;
+    const auto hand_version_begin = downgraded_hand_counters.find("\"schemaVersion\": ")
+        + std::string{"\"schemaVersion\": "}.size();
+    downgraded_hand_counters.replace(hand_version_begin, 1, "1");
+    require(!parse_exact_player_hand_health_checkpoint(downgraded_hand_counters, error)
+                && error.find("legacy") != std::string::npos,
+            "downgrading a sidecar cannot hide newer hand counter claims");
+
     require(ExactPlayerZonesCheckpoint{}.schema_version == 3
                 && ExactPlayerTrashCheckpoint{}.schema_version == 4
                 && ExactPlayerFieldCheckpoint{}.schema_version == 7,
@@ -1362,6 +1470,13 @@ int main()
         require(alternate.player_hand_health_checksum != current.player_hand_health_checksum
                     && checksum(alternate) != checksum(current),
                 "different health assignments for duplicate hand cards change the layout dependency hash");
+        auto counter_layout = current;
+        counter_layout.player_hand_health_checksum = exact_player_hand_health_payload_checksum(hand_with_counters);
+        auto swapped_counter_layout = counter_layout;
+        swapped_counter_layout.player_hand_health_checksum = exact_player_hand_health_payload_checksum(swapped_hand_counters);
+        require(parse(serialize(counter_layout), error).has_value()
+                    && checksum(counter_layout) != checksum(swapped_counter_layout),
+                "existing layout dependency versions bind schema-2 hand counter assignments without a layout bump");
 
         for (const std::string marker : {"", "123456789ABCDEF", "123456789ABCDEF01", "G123456789ABCDEF"})
         {

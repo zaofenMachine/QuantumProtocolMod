@@ -2436,6 +2436,8 @@ namespace QuantumCheckpoint
         append_hash_number(hash, checkpoint.wave_index);
         append_hash_bytes(hash, checkpoint.player_hand);
         append_hash_bytes(hash, checkpoint.player_hand_health_states);
+        if (checkpoint.schema_version >= 2)
+            append_hash_bytes(hash, checkpoint.player_hand_counter_states);
 
         std::ostringstream output{};
         output << std::hex << std::uppercase << std::setw(16) << std::setfill('0') << hash;
@@ -2462,8 +2464,11 @@ namespace QuantumCheckpoint
                << "  \"waveIndex\": " << checkpoint.wave_index << ",\n"
                << "  \"playerHand\": \"" << json_escape(checkpoint.player_hand) << "\",\n"
                << "  \"playerHandHealthStates\": \""
-               << json_escape(checkpoint.player_hand_health_states) << "\",\n"
-               << "  \"payloadChecksum\": \"" << checkpoint.payload_checksum << "\"\n"
+               << json_escape(checkpoint.player_hand_health_states) << "\",\n";
+        if (checkpoint.schema_version >= 2)
+            output << "  \"playerHandCounterStates\": \""
+                   << json_escape(checkpoint.player_hand_counter_states) << "\",\n";
+        output << "  \"payloadChecksum\": \"" << checkpoint.payload_checksum << "\"\n"
                << "}\n";
         return output.str();
     }
@@ -2471,7 +2476,7 @@ namespace QuantumCheckpoint
     auto validate_exact_player_hand_health_checkpoint(
         const ExactPlayerHandHealthCheckpoint& checkpoint, std::string& error) -> bool
     {
-        if (checkpoint.schema_version != ExactPlayerHandHealthSchemaVersion)
+        if (checkpoint.schema_version != 1 && checkpoint.schema_version != 2)
         {
             error = "unsupported exact player-hand-health schema version";
             return false;
@@ -2533,6 +2538,29 @@ namespace QuantumCheckpoint
                 }
             }
         }
+        if (checkpoint.schema_version >= 2)
+        {
+            const auto counters = parse_player_counter_states(
+                checkpoint.player_hand_counter_states, state_error);
+            if (!counters || counters->size() != hand->size())
+            {
+                error = "exact player-hand counter states are invalid or misaligned: " + state_error;
+                return false;
+            }
+            for (const auto& state : *counters)
+            {
+                if (!state.special.empty())
+                {
+                    error = "exact player-hand restoration only supports generic counters";
+                    return false;
+                }
+            }
+        }
+        else if (!checkpoint.player_hand_counter_states.empty())
+        {
+            error = "legacy player-hand-health schema cannot claim counter coverage";
+            return false;
+        }
         if (checkpoint.payload_checksum != exact_player_hand_health_payload_checksum(checkpoint))
         {
             error = "exact player-hand-health payload checksum does not match";
@@ -2559,7 +2587,7 @@ namespace QuantumCheckpoint
         do { auto value = required_integer<Type>(*values, JsonName, error); if (!value) return std::nullopt; checkpoint.Field = *value; } while (false)
 
         READ_HAND_HEALTH_INTEGER(schema_version, "schemaVersion", int);
-        if (checkpoint.schema_version != ExactPlayerHandHealthSchemaVersion)
+        if (checkpoint.schema_version != 1 && checkpoint.schema_version != 2)
         {
             error = "unsupported exact player-hand-health schema version";
             return std::nullopt;
@@ -2573,6 +2601,15 @@ namespace QuantumCheckpoint
         READ_HAND_HEALTH_INTEGER(wave_index, "waveIndex", std::int32_t);
         READ_HAND_HEALTH_STRING(player_hand, "playerHand");
         READ_HAND_HEALTH_STRING(player_hand_health_states, "playerHandHealthStates");
+        if (checkpoint.schema_version >= 2)
+        {
+            READ_HAND_HEALTH_STRING(player_hand_counter_states, "playerHandCounterStates");
+        }
+        else if (values->contains("playerHandCounterStates"))
+        {
+            error = "legacy player-hand-health JSON contains a newer counter record";
+            return std::nullopt;
+        }
         READ_HAND_HEALTH_STRING(payload_checksum, "payloadChecksum");
 
 #undef READ_HAND_HEALTH_INTEGER

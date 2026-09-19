@@ -23,7 +23,7 @@ namespace QuantumCheckpoint
     inline constexpr int ExactPlayerFieldSchemaVersion = 7;
     inline constexpr std::string_view ExactPlayerFieldCheckpointKind =
         "route-c-exact-player-field";
-    inline constexpr int ExactPlayerHandHealthSchemaVersion = 1;
+    inline constexpr int ExactPlayerHandHealthSchemaVersion = 2;
     inline constexpr std::string_view ExactPlayerHandHealthCheckpointKind =
         "route-c-exact-player-hand-health";
     inline constexpr int ExactCharacterChargeSchemaVersion = 1;
@@ -182,6 +182,8 @@ namespace QuantumCheckpoint
     // duplicate card identities. This slice has only nonnegative HEALTH modifiers;
     // capture and runtime verification require current health to equal the saved
     // maximum. The existing positive base/max health bounds remain in force.
+    // Schema 2 also preserves one bounded generic-counter record per native hand
+    // index; special counters are outside this slice. Schema 1 leaves it empty.
     struct ExactPlayerHandHealthCheckpoint
     {
         int schema_version{ExactPlayerHandHealthSchemaVersion};
@@ -194,6 +196,7 @@ namespace QuantumCheckpoint
         std::int32_t wave_index{};
         std::string player_hand{};
         std::string player_hand_health_states{};
+        std::string player_hand_counter_states{};
         std::string payload_checksum{};
     };
 

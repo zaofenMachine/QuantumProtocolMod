@@ -1,27 +1,20 @@
 # QuantumCheckpoint 当前工作进度（临时续接记录）
 
-> 2026-09-20 当前续接入口：[第三十二阶段](phase-32-player-hand-health.md)。用户已授权继续推进，可自由使用电脑，仅在确需用户决定方向时停下。此前的暂停已结束；主方向仍是“小关重开 + 玩家精确恢复”，重编程与敌人精确恢复继续搁置。优先依据本节续接，下方旧调试记录中的版本、提交、部署命令和待办不代表当前状态。
+> 2026-09-20 当前续接入口：[第三十三阶段](phase-33-player-hand-counters.md)。用户授权持续推进并自由使用电脑，仅在确需决定方向时停下。下方旧调试内容只保留历史证据，不代表当前版本或待办。
 
-## 2026-09-20 续接状态
+## 2026-09-20 当前状态
 
-当前实现为 v0.33.0，本轮从 v0.32.0 / `e490152` 继续。旧版已实机复现奥克塔娃手牌 HEALTH +1 在恢复后丢失、布局却通过的问题；新实现支持受限 HAND HEALTH schema 1，并将 zones/trash/field 升至 3/4/7。新布局中的非空手牌必须关联 HAND 文件；旧格式仍可读取，但不声明新的手牌生命覆盖。
+当前 v0.34.0 已补齐受限 HAND generic 计数，与已有 HAND HEALTH 共用 schema 2 补充文件和原生位置绑定。布局 zones 3 / trash 4 / field 7 沿用原依赖校验和，无需再新增文件或升级布局；schema 1 保留原字节与校验语义，只允许零计数。HAND generic 范围 0–256、special 为空；DECK/TRASH 仍要求默认数值。
 
-所有新布局统一检查 HAND/DECK/TRASH 的原生属性、生命、计数器、等级、回合和 active。仅 HAND 接受非负 HEALTH 修正且当前生命等于上限，DECK/TRASH 仍要求默认生命。超出范围拒绝精确捕获；HAND 依赖缺失、损坏或错配时，启动前禁用玩家布局、回合和角色充能层。恢复等布局移动完成后逐张按原生位置重放，最终稳定窗口持续核验。比较工具新增原生位置动态状态检查，缺覆盖明确为未知。
+恢复在所有移动结束后，先预验全部手牌的默认起点，再分别重放 HEALTH 与 generic 原生动作；逐张真实读回，最终稳定窗口持续验证，失败仅回退一次。生产 DLL 为 `42F6F6661E4FA6E92FCEC03614F580529BD860CB62CA71544E3F3E58C033D3E1`，开发夹具关闭，4/4 CTest 通过。
 
-首版正式 DLL（SHA-256 `4824F87A240FE7AFD1444015BBF1890F217034403A019F912C9369448FF1CA06`，开发夹具关闭）已通过：
+14 组恢复（13 条 cases + 独立 one-fresh）、3 项依赖故障和稳定窗口干扰已完成。真实 Rocket 计数 1/4、生命 +1 与计数共存、混合场地、再次保存、旧格式及生成卡均验证。三组恢复后出牌实际消费计数并造成预期伤害；one/mixed 对照完整玩家状态相同。
 
-- 普通 zones 3 与默认 HAND 的实机恢复和再保存。
-- 奥克塔娃原生技能形成的同名 HAND 苹果 3/3 与 2/2，trash 4 新进程恢复及再保存恢复。
-- 带增益 HAND 苹果与普通 FIELD 苹果共存的 field 7 恢复。
-- 恢复后正常把增益苹果打到 BACK:0，与从同一混合状态直接原生出牌的对照相比，完整玩家检查一致，包括新的原生位置动态状态。
+效果历史不在本轮恢复范围。one-fresh/combined/four 仍有 Rocket TRIGGER 与 Flashbang INIT 的 COMPLETE→NONE 差异，全量比较保持 false，另有严格限定专项核对；旧 FIELD 基线缺原生 ID 顺序时保持未知。一次零计数同进程观测的 DECK 效果显示不完整，严格验收拒绝；新进程相同检查点零差异通过，原失败保留。不能把这些范围描述成全游戏精确快照。
 
-该牌组使用可丢弃合成设置引入游戏已有的奥克塔娃，不能描述成用户牌组自然获得；增益本身来自正常出牌和选目标。比较脚本 18 项本地契约测试已通过，合成夹具与实机证据分开计数。
+证据目录：`F:/Project/QuantumProtoclMod.runtime-evidence/20260920-hand-counters`。源码提交与推送状态以 `validation-summary.json` 为准。原始用户检查点已恢复，全部文件与开始备份按字节一致。
 
-缺失 HAND 文件的故障曾正确触发 `preflight-route-c`；另发现 `file_size` 异常文本含 Windows GBK，使恢复报告无法作为 UTF-8 JSON 读取，已改为 `error_code` 和 ASCII 诊断。最终正式 DLL 的 SHA-256 为 `2F385429599EAC6808D390A75F9858126CFB360CFC2C3E6CAA1AB954D56347B1`，开发夹具关闭，4/4 CTest 再次通过。该 DLL 已通过真实增益 HAND 的新进程及再保存恢复；缺失、损坏、两张同名苹果健康记录交换并重新计算内部校验和但保留布局原依赖，三种故障均正确 `preflight-route-c`，无 HAND HEALTH 动作入队、无写后失败回退，报告严格 UTF-8 有效。对应目录为 `rejection-final-{missing,corrupt,wrong-binding}`。
-
-本轮证据目录：`F:/Project/QuantumProtoclMod.runtime-evidence/20260920-off-field-state`。最终 11 组恢复全部通过，含旧/新生成卡场地、生成卡空场、全部在墓地且空手牌；3 个依赖故障、正常出牌对照、稳定窗口主动出牌导致一次语义回退也通过。最早 field schema 1 原始检查点恢复通过，整个检查点目录按字节保留。最终源码提交和推送验证以 `validation-summary.json` 为准，逐轮报告见 `cases.jsonl`。
-
-下一项已有真实样本：原生 `genericFlashbang` 正常入场自身摧毁，使 HAND 中 `mdvRocket` 的 generic counter 从 0 增为 1，special 为空。默认 0 基线可以保存精确层，1 计数时新版正确拒绝所有玩家精确布局、保留主 Route C。样本为 `natural-hand-counter-before/after.json`，可复现起点为 `checkpoint-hand-counter-before`；只需正常打出第二张闪光弹。下一步沿用原生计数动作补此切片，并验证弹幕出牌消耗计数的行为。继续缩小玩家精确恢复的真实缺口，不扩大为任意 HAND 动态或全游戏精确快照。满充能、更多生成卡、LEVEL 修正、独立生命调整、STORAGE/角色能力卡动态状态和效果动作历史仍未覆盖。
+下一项：先补原生效果列表观测，查清同进程樱桃效果显示缺口及效果删除与 CardInfo 的关系，再实机验证 sorc 回手增加动态 baseHP，推进基础生命与 HEALTH modifier 组合。已确认 mageSharedAdder 调 SET_BASE_STATS，不是 maxHP adjustment；暂不扩大 HAND ATTACK/special。满充能、更多生成卡、LEVEL 修正、独立生命调整、STORAGE/角色能力卡和效果动作历史仍有缺口。继续“小关重开 + 玩家精确恢复”，重编程和敌人精确恢复保持搁置。
 
 ## 2026-09-10 历史调试记录
 
