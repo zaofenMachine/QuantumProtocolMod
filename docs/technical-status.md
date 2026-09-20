@@ -19,7 +19,7 @@
 - 5 组新捕获已验证文件校验和、布局/HAND3 依赖及其与原生位置绑定的玩家记录；2 组版本/依赖拒绝按预期生效。
 - 早期 DEV 构建的单张与八张同时 pending MOVE 故障清理通过，原生数量全部释放并执行一次普通回退。这不是最终生产构建的故障注入测试，也不能替代队列内部异常或八秒超时覆盖。
 
-本轮原始用户检查点最终恢复为 requested passed，完整玩家对照通过；17 个 checkpoint 文件已逐字节还原，`original-checkpoint-restored.json` 验证通过。稳定窗口正常 DECK 点击后发生 HAND 漂移，`final2-stability-draw-shared-log/stability-validation.json` 确认 requested 拒绝、唯一一次普通回退通过：验证前基础生命和 HEALTH 修正各入队一次，验证后无数值重排，MOVE 逐目标释放 10/10、pending 0。点击时间只代表标准输入助手的请求/返回边界，不声明按下/松开瞬间的数值。前三次无效拖牌及一次日志不完整的抽牌尝试另存且不计通过；本次共享读取重测才具备完整负例证据。提交、推送与冻结归档仍在处理中。证据目录为 `F:/Project/QuantumProtoclMod.runtime-evidence/20260920-player-hand-base-health`，详细样本、失败与范围以 [第三十六阶段](phase-36-player-hand-base-health.md) 及最终验收清单为准。
+本轮原始用户检查点最终恢复为 requested passed，完整玩家对照通过；17 个 checkpoint 文件已逐字节还原，`original-checkpoint-restored.json` 验证通过。稳定窗口正常 DECK 点击后发生 HAND 漂移，`final2-stability-draw-shared-log/stability-validation.json` 确认 requested 拒绝、唯一一次普通回退通过：验证前基础生命和 HEALTH 修正各入队一次，验证后无数值重排，MOVE 逐目标释放 10/10、pending 0。点击时间只代表标准输入助手的请求/返回边界，不声明按下/松开瞬间的数值。前三次无效拖牌及一次日志不完整的抽牌尝试另存且不计通过；本次共享读取重测才具备完整负例证据。提交、推送与归档记录见证据目录的 validation-summary.json。证据目录为 `F:/Project/QuantumProtoclMod.runtime-evidence/20260920-player-hand-base-health`，详细样本、失败与范围以 [第三十六阶段](phase-36-player-hand-base-health.md) 及最终验收清单为准。
 
 本轮收尾后停下汇报。未来若继续推进，仍逐层缩小受限玩家状态的缺口，以正常操作来源、独立比较和恢复后玩法验证闭合各切片。第三十三阶段 Cherry 显示缺口不因本轮发现相似症状而追认同一根因。敌人精确状态、技能私有历史、更多生成卡、满充能、LEVEL 修正、独立生命调整、STORAGE/能力卡运行态精确恢复仍未覆盖；重编程路线保持搁置。
 
