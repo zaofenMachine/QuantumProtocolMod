@@ -2476,7 +2476,7 @@ namespace QuantumCheckpoint
     auto validate_exact_player_hand_health_checkpoint(
         const ExactPlayerHandHealthCheckpoint& checkpoint, std::string& error) -> bool
     {
-        if (checkpoint.schema_version != 1 && checkpoint.schema_version != 2)
+        if (checkpoint.schema_version < 1 || checkpoint.schema_version > ExactPlayerHandHealthSchemaVersion)
         {
             error = "unsupported exact player-hand-health schema version";
             return false;
@@ -2587,7 +2587,7 @@ namespace QuantumCheckpoint
         do { auto value = required_integer<Type>(*values, JsonName, error); if (!value) return std::nullopt; checkpoint.Field = *value; } while (false)
 
         READ_HAND_HEALTH_INTEGER(schema_version, "schemaVersion", int);
-        if (checkpoint.schema_version != 1 && checkpoint.schema_version != 2)
+        if (checkpoint.schema_version < 1 || checkpoint.schema_version > ExactPlayerHandHealthSchemaVersion)
         {
             error = "unsupported exact player-hand-health schema version";
             return std::nullopt;

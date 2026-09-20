@@ -1,5 +1,6 @@
 #include "CheckpointPersistence.hpp"
 #include "PlayerCounterState.hpp"
+#include "PlayerHealthState.hpp"
 #include "PlayerRestorePlan.hpp"
 
 #include <cstdlib>
@@ -1281,7 +1282,7 @@ int main()
     require(!parse_exact_player_hand_health_checkpoint(
                 serialize_exact_player_hand_health_checkpoint(invalid_hand_health), error),
             "hand-health supplement rejects an invalid card instance");
-    for (const int version : {0, 3})
+    for (const int version : {0, ExactPlayerHandHealthSchemaVersion + 1})
     {
         invalid_hand_health = hand_health;
         invalid_hand_health.schema_version = version;
@@ -1381,8 +1382,7 @@ int main()
     hand_with_counters.player_hand_counter_states = "1;0";
     const auto hand_counter_json = serialize_exact_player_hand_health_checkpoint(hand_with_counters);
     const auto parsed_hand_counters = parse_exact_player_hand_health_checkpoint(hand_counter_json, error);
-    require(ExactPlayerHandHealthCheckpoint{}.schema_version == 2
-                && parsed_hand_counters && parsed_hand_counters->schema_version == 2
+    require(parsed_hand_counters && parsed_hand_counters->schema_version == 2
                 && parsed_hand_counters->player_hand == hand_with_counters.player_hand
                 && parsed_hand_counters->player_hand_health_states == hand_with_counters.player_hand_health_states
                 && parsed_hand_counters->player_hand_counter_states == "1;0"
@@ -1442,6 +1442,64 @@ int main()
     require(!parse_exact_player_hand_health_checkpoint(downgraded_hand_counters, error)
                 && error.find("legacy") != std::string::npos,
             "downgrading a sidecar cannot hide newer hand counter claims");
+
+    require(ExactPlayerHandHealthCheckpoint{}.schema_version == 3
+                && ExactPlayerHandBaseHealthSchemaVersion == 3,
+            "new HAND captures explicitly claim the bounded base-health policy");
+    auto hand_with_base = hand_with_counters;
+    hand_with_base.schema_version = 3;
+    hand_with_base.player_hand_health_states = "3,4|mageOctavia_init,1,-1,0;2,2";
+    const auto hand_base_json = serialize_exact_player_hand_health_checkpoint(hand_with_base);
+    const auto parsed_hand_base = parse_exact_player_hand_health_checkpoint(hand_base_json, error);
+    require(parsed_hand_base && parsed_hand_base->schema_version == 3
+                && parsed_hand_base->player_hand == hand_with_base.player_hand
+                && parsed_hand_base->player_hand_health_states == hand_with_base.player_hand_health_states
+                && parsed_hand_base->player_hand_counter_states == hand_with_base.player_hand_counter_states
+                && serialize_exact_player_hand_health_checkpoint(*parsed_hand_base) == hand_base_json,
+            "HAND3 preserves duplicate positions with different bases plus HEALTH and generic counters");
+    auto swapped_hand_base = hand_with_base;
+    swapped_hand_base.player_hand_health_states = "2,2;3,4|mageOctavia_init,1,-1,0";
+    require(exact_player_hand_health_payload_checksum(swapped_hand_base)
+                != exact_player_hand_health_payload_checksum(hand_with_base)
+                && parse_exact_player_hand_health_checkpoint(
+                    serialize_exact_player_hand_health_checkpoint(swapped_hand_base), error).has_value(),
+            "duplicate base-health assignments remain positional and checksum protected");
+    auto hand3_unchanged = hand_with_counters;
+    hand3_unchanged.schema_version = 3;
+    const auto hand3_unchanged_json = serialize_exact_player_hand_health_checkpoint(hand3_unchanged);
+    auto normalized_hand3_json = hand3_unchanged_json;
+    normalized_hand3_json.replace(normalized_hand3_json.find("\"schemaVersion\": 3"),
+        std::string{"\"schemaVersion\": 3"}.size(), "\"schemaVersion\": 2");
+    normalized_hand3_json.replace(normalized_hand3_json.find(exact_player_hand_health_payload_checksum(hand3_unchanged)),
+        16, exact_player_hand_health_payload_checksum(hand_with_counters));
+    require(normalized_hand3_json == hand_counter_json,
+            "HAND3 adds no payload fields and changes only the version and checksum for equal state");
+    for (const auto& original : {hand_counter_json, hand3_unchanged_json})
+    {
+        auto tampered = original;
+        const auto offset = tampered.find("\"schemaVersion\": ") + std::string{"\"schemaVersion\": "}.size();
+        tampered[offset] = tampered[offset] == '2' ? '3' : '2';
+        require(!parse_exact_player_hand_health_checkpoint(tampered, error)
+                    && error.find("checksum") != std::string::npos,
+                "HAND2/3 version-only promotion or demotion cannot forge base-health coverage");
+    }
+    auto legacy_grown_base = hand_with_base;
+    legacy_grown_base.schema_version = 2;
+    const auto parsed_legacy_grown = parse_exact_player_hand_health_checkpoint(
+        serialize_exact_player_hand_health_checkpoint(legacy_grown_base), error);
+    require(parsed_legacy_grown.has_value(),
+            "wire parsing remains separate from the runtime immutable-definition policy");
+    const auto legacy_grown_states = parse_player_health_states(parsed_legacy_grown->player_hand_health_states, error);
+    require(legacy_grown_states && !validate_player_hand_health_for_definition(
+                legacy_grown_states->front(), 2, parsed_legacy_grown->schema_version, error)
+                && validate_player_hand_health_for_definition(legacy_grown_states->front(), 2, 3, error),
+            "a recomputed legacy checksum still cannot authorize nondefault base health");
+    auto missing_hand3_counters = hand_base_json;
+    const auto hand3_counter_begin = missing_hand3_counters.find("  \"playerHandCounterStates\"");
+    missing_hand3_counters.erase(hand3_counter_begin,
+        missing_hand3_counters.find('\n', hand3_counter_begin) - hand3_counter_begin + 1);
+    require(!parse_exact_player_hand_health_checkpoint(missing_hand3_counters, error),
+            "HAND3 still requires aligned counter coverage from schema 2");
 
     require(ExactPlayerZonesCheckpoint{}.schema_version == 4
                 && ExactPlayerTrashCheckpoint{}.schema_version == 5
@@ -1569,6 +1627,16 @@ int main()
                 "membership-attested layouts round trip with their existing HAND dependency");
         require(checksum(attested) != checksum(layout),
                 "the membership attestation version participates in each layout payload checksum");
+        auto base_layout = attested;
+        base_layout.player_hand = parsed_hand_base->player_hand;
+        base_layout.player_hand_health_checksum = parsed_hand_base->payload_checksum;
+        const auto parsed_base_layout = parse(serialize(base_layout), error);
+        auto swapped_base_layout = base_layout;
+        swapped_base_layout.player_hand_health_checksum = exact_player_hand_health_payload_checksum(swapped_hand_base);
+        require(parsed_base_layout && parsed_base_layout->schema_version == attested_version
+                    && parsed_base_layout->player_hand_health_checksum == parsed_hand_base->payload_checksum
+                    && checksum(base_layout) != checksum(swapped_base_layout),
+                "existing attested Z4/T5/F8 layouts bind per-index HAND3 base health without another layout bump");
 
         const auto change_version = [](std::string json, int version) {
             const auto begin = json.find("\"schemaVersion\": ") + std::string{"\"schemaVersion\": "}.size();

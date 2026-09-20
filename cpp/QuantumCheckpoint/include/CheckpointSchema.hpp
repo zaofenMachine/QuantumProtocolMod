@@ -30,7 +30,9 @@ namespace QuantumCheckpoint
     inline constexpr int ExactPlayerFieldSchemaVersion = 8;
     inline constexpr std::string_view ExactPlayerFieldCheckpointKind =
         "route-c-exact-player-field";
-    inline constexpr int ExactPlayerHandHealthSchemaVersion = 2;
+    // Fixed minimum for replaying HAND base-HP gains; keep older schemas default-only.
+    inline constexpr int ExactPlayerHandBaseHealthSchemaVersion = 3;
+    inline constexpr int ExactPlayerHandHealthSchemaVersion = 3;
     inline constexpr std::string_view ExactPlayerHandHealthCheckpointKind =
         "route-c-exact-player-hand-health";
     inline constexpr int ExactCharacterChargeSchemaVersion = 1;
@@ -191,6 +193,8 @@ namespace QuantumCheckpoint
     // maximum. The existing positive base/max health bounds remain in force.
     // Schema 2 also preserves one bounded generic-counter record per native hand
     // index; special counters are outside this slice. Schema 1 leaves it empty.
+    // Schema 3 reuses base_health to preserve nonnegative base-HP gains relative
+    // to the selected immutable definition. Schemas 1/2 require definition base HP.
     struct ExactPlayerHandHealthCheckpoint
     {
         int schema_version{ExactPlayerHandHealthSchemaVersion};

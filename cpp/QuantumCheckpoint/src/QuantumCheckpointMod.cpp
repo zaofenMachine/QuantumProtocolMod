@@ -71,6 +71,8 @@ namespace QuantumCheckpoint
 #if defined(QUANTUM_CHECKPOINT_RUNTIME_TEST_FIXTURES)
         std::atomic_int g_player_hand_fixture_destination{-1};
         std::atomic_int g_player_stat_fixture_action{0};
+        std::atomic_bool g_pending_move_test_environment_read{false};
+        std::atomic_int g_pending_move_test_failure_minimum{0};
 #endif
         std::atomic_bool g_route_c_save_requested{false};
         std::atomic_bool g_route_c_load_requested{false};
@@ -136,6 +138,15 @@ namespace QuantumCheckpoint
             bool target_turn_active{};
             bool turn_active_written{};
             bool effects_suppressed{};
+        };
+
+        struct PendingNativeRestoreMove
+        {
+            PendingNativeFieldMove effects{};
+            const void* engine_state{};
+            const void* shared_controller{};
+            std::uint8_t destination{};
+            std::chrono::steady_clock::time_point queued_at{};
         };
 
         struct PendingRouteCRestore
@@ -243,6 +254,8 @@ namespace QuantumCheckpoint
             std::string hand_health_reason{};
             std::vector<PlayerHealthState> hand_health_prefix{};
             std::vector<PendingNativeTrashMove> hand_health_targets{};
+            std::vector<std::int32_t> hand_definition_base_health{};
+            std::size_t hand_base_health_actions_queued{};
             std::optional<std::size_t> hand_health_pending_card{};
             PlayerHealthState hand_health_before_queue{};
             std::chrono::steady_clock::time_point hand_health_queued_at{};
@@ -257,6 +270,9 @@ namespace QuantumCheckpoint
             std::string player_effect_membership_status{"not-applicable-no-player-layout"};
             std::string player_effect_membership_reason{};
             std::string player_effect_membership_saved_proof{"not-applicable-no-player-layout"};
+            std::vector<PendingNativeRestoreMove> move_effect_suppressions{};
+            std::size_t move_effects_suppressed{}, move_effects_restored{};
+            std::vector<PendingNativeTrashMove> move_overlay_targets{};
         };
 
         struct PendingRouteCCapture
@@ -3160,12 +3176,23 @@ namespace QuantumCheckpoint
             std::string tag{};
             std::uint8_t type{};
             std::string factory_key{};
+            const void* object{};
+            const void* controller{};
+            std::array<std::uint8_t, 16> guid{};
+
+            auto operator==(const NativeEffectDescriptor&) const -> bool = default;
         };
 
         struct NativeCardEffects
         {
             std::int32_t count{}, capacity{};
             std::vector<NativeEffectDescriptor> descriptors{};
+            const void* state{};
+            const void* object{};
+            const void* controller{};
+            const void* array{};
+
+            auto operator==(const NativeCardEffects&) const -> bool = default;
         };
 
         auto read_native_card_effects(UObject* card_engine, UObject* object,
@@ -3228,7 +3255,8 @@ namespace QuantumCheckpoint
                 || (capacity > 0 && !data)
                 || (count > 0 && !address_is_readable(data, count * sizeof(NativeSharedPointerPair))))
                 throw std::runtime_error{"native effect array exceeds diagnostic bounds"};
-            NativeCardEffects observed{.count = count, .capacity = capacity};
+            NativeCardEffects observed{.count = count, .capacity = capacity,
+                .state = state, .object = card, .controller = owner, .array = data};
             for (std::int32_t index{}; index < count; ++index)
             {
                 const auto offset = static_cast<std::size_t>(index) * sizeof(NativeSharedPointerPair);
@@ -3276,7 +3304,10 @@ namespace QuantumCheckpoint
                     || read_native_value<std::int32_t>(effect, 0x60) != factory_count
                     || read_native_value<std::int32_t>(effect, 0x64) != factory_capacity)
                     throw std::runtime_error{"native effect entry changed during observation"};
-                observed.descriptors.push_back({tag, type, std::move(factory_key)});
+                NativeEffectDescriptor descriptor{tag, type, std::move(factory_key), effect, effect_owner};
+                std::memcpy(descriptor.guid.data(), static_cast<const std::byte*>(effect) + 0x18,
+                            descriptor.guid.size());
+                observed.descriptors.push_back(std::move(descriptor));
             }
             if (read_native_value<const void*>(object, InGameCardStatePointerOffset) != state
                 || read_native_value<const void*>(state, CardStateSharedObjectOffset) != card
@@ -3768,6 +3799,8 @@ namespace QuantumCheckpoint
                 return;
             try
             {
+                if (!restore.move_effect_suppressions.empty())
+                    throw std::runtime_error{"global effect membership was requested during controlled MOVE suppression"};
                 if (std::any_of(restore.exact_player_field_targets.begin(), restore.exact_player_field_targets.end(),
                         [](const auto& target) { return target.effects_suppressed; }))
                     throw std::runtime_error{"global effect membership was requested during controlled FIELD suppression"};
@@ -3791,7 +3824,7 @@ namespace QuantumCheckpoint
         };
 
         auto validate_off_field_statistics(const RouteCBattleObjects& objects, bool allow_hand_health,
-                                           bool allow_hand_counters)
+                                           bool allow_hand_counters, int hand_health_schema = 1)
             -> OffFieldPlayerStatistics
         {
             OffFieldPlayerStatistics result{};
@@ -3808,7 +3841,8 @@ namespace QuantumCheckpoint
                         [](const auto& value) { return value.name == "nativeLevel:status" && value.value == "verified-native-level"; });
                     if (level_verified == level.properties.end()
                         || read_native_value<std::int32_t>(card.state,0x110) != definition.level
-                        || attack.base_attack != definition.attack || health.base_health != definition.health
+                        || attack.base_attack != definition.attack
+                        || ((location != 0 || !allow_hand_health) && health.base_health != definition.health)
                         || !attack.modifiers.empty() || attack.current_attack != attack.base_attack
                         || parse_int32(required_getter_text(card.card,STR("getCurrentHealth"))) != health.max_health
                         || ((location != 0 || !allow_hand_counters) && counters.generic != 0)
@@ -3825,9 +3859,9 @@ namespace QuantumCheckpoint
                     }
                     else
                     {
-                        for (const auto& modifier : health.modifiers)
-                            if (modifier.amount < 0)
-                                throw std::runtime_error{"HAND health only supports nonnegative modifiers"};
+                        std::string error{};
+                        if (!validate_player_hand_health_for_definition(health, definition.health, hand_health_schema, error))
+                            throw std::runtime_error{"HAND health is outside the selected schema/definition policy: " + error};
                         result.hand_health.push_back(health);
                     }
                     if (location == 0) result.hand_counters.push_back(counters);
@@ -4025,7 +4059,7 @@ namespace QuantumCheckpoint
             {
                 if (!player_effect_membership_rejection.empty())
                     throw std::runtime_error{player_effect_membership_rejection};
-                const auto states = validate_off_field_statistics(objects, true, true);
+                const auto states = validate_off_field_statistics(objects, true, true, ExactPlayerHandHealthSchemaVersion);
                 if (!states.hand_health.empty())
                 {
                     ExactPlayerHandHealthCheckpoint exact{};
@@ -4218,6 +4252,10 @@ namespace QuantumCheckpoint
                         throw std::runtime_error{
                             "a player FIELD card exposed invalid health or turn-active state"};
                     }
+                    const auto health_state = capture_player_health_state(card.card);
+                    const auto definition = defined_player_card_statistics(nullptr, card.card, false);
+                    if (health_state.base_health != definition.health)
+                        throw std::runtime_error{"FIELD dynamic base health is outside the supported definition baseline"};
                     captured_cards.push_back(CapturedFieldCard{
                         .placement = *placement,
                         .instance = required_getter_text(
@@ -4225,7 +4263,7 @@ namespace QuantumCheckpoint
                         .health = *health,
                         .turn_active = turn_active == "True",
                         .attack = capture_player_attack_state(card.card,true),
-                        .health_state = capture_player_health_state(card.card),
+                        .health_state = health_state,
                         .counter_state = capture_player_counter_state(card.card),
                     });
                 }
@@ -4651,6 +4689,8 @@ namespace QuantumCheckpoint
                    << json_escape(restore.hand_health_status) << "\",\n"
                    << "  \"exactPlayerHandHealthReason\": \""
                    << json_escape(restore.hand_health_reason) << "\",\n"
+                   << "  \"exactPlayerHandBaseHealthActionsQueued\": "
+                   << restore.hand_base_health_actions_queued << ",\n"
                    << "  \"exactPlayerHandCounterStatus\": \""
                    << json_escape(restore.hand_counter_status) << "\",\n"
                    << "  \"exactPlayerHandCounterReason\": \""
@@ -4665,7 +4705,10 @@ namespace QuantumCheckpoint
                    << (restore.off_field_statistics_covered ? "true" : "false") << ",\n"
                    << "  \"playerOffFieldStatisticsScope\": \""
                    << (restore.off_field_statistics_covered
-                           ? (restore.exact_player_hand_health && restore.exact_player_hand_health->schema_version >= 2
+                           ? (restore.exact_player_hand_health
+                                   && restore.exact_player_hand_health->schema_version >= ExactPlayerHandBaseHealthSchemaVersion
+                               ? "DECK/TRASH default numeric state; HAND native-index base HEALTH at least the selected immutable definition, nonnegative HEALTH modifiers, current=max and generic counters 0..256 with no special entries; default attack, level and turns verified; effect/action history excluded"
+                               : restore.exact_player_hand_health && restore.exact_player_hand_health->schema_version >= 2
                                ? "DECK/TRASH default numeric state; HAND native-index HEALTH nonnegative modifiers with current=max and generic counters 0..256 with no special entries; definition base stats, level and default turns verified; effect/action history excluded"
                                : "DECK/TRASH default numeric state; HAND native-index HEALTH nonnegative modifiers with current=max and default zero counters; definition base stats, level and default turns verified; effect/action history excluded")
                            : "legacy or semantic layout: off-field statistics not covered") << "\",\n"
@@ -4788,6 +4831,11 @@ namespace QuantumCheckpoint
                    << ",\n  \"fallbackReason\": \"" << json_escape(restore.fallback_reason) << "\""
                    << ",\n  \"playerHandStagingStatus\": \"" << json_escape(restore.hand_staging_status) << "\""
                    << ",\n  \"playerHandStagingCompletedMoves\": " << restore.hand_staging_move_index
+                   << ",\n  \"restoreMoveEffectsSuppressed\": " << restore.move_effects_suppressed
+                   << ",\n  \"restoreMoveEffectsRestored\": " << restore.move_effects_restored
+                   << ",\n  \"restoreMoveEffectsPending\": "
+                   << std::count_if(restore.move_effect_suppressions.begin(), restore.move_effect_suppressions.end(),
+                          [](const auto& move) { return move.effects.effects_suppressed; })
                    << ",\n  \"playerHandLimit\": " << restore.native_hand_limit
                    << ",\n  \"playerHandCardDeferredForField\": "
                    << (restore.deferred_hand_field_layout ? "true" : "false")
@@ -4829,6 +4877,91 @@ namespace QuantumCheckpoint
                     ? std::to_string(read_native_value<std::uint8_t>(owner, 0x414)) : "?");
         }
 
+        auto native_restore_actions_settled(const void* state) -> bool
+        {
+            if (GetCurrentThreadId() != g_game_thread_id.load(std::memory_order_acquire)
+                || !state || !address_is_readable(state, 0x40))
+                throw std::runtime_error{"restore MOVE queue observation requires a live game-thread engine state"};
+            const auto module_base = reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr));
+            const auto signature = [&](std::uintptr_t rva, const auto& bytes) {
+                const auto* address = reinterpret_cast<const std::uint8_t*>(module_base + rva);
+                if (!address_is_readable(address, bytes.size()) || !std::equal(bytes.begin(), bytes.end(), address))
+                    throw std::runtime_error{"restore MOVE pending-action traversal signature changed"};
+            };
+            // E288B0 counts non-COMPLETE actions after E1A1D0/E1A000 flatten
+            // the priority arrays and their children. Completed actions remain
+            // in those arrays: their Num fields are not pending-action counts.
+            signature(0xE1A230, std::array<std::uint8_t, 20>{0x49,0x8B,0x07,0x4C,0x8B,0xE9,0x48,0x89,0x4C,0x24,0x20,0x41,0x8B,0x6C,0x06,0x08,0x49,0x8B,0x1C,0x06});
+            signature(0xE1A3DA, std::array<std::uint8_t, 4>{0x41,0x3B,0x77,0x08});
+            signature(0xE1A050, std::array<std::uint8_t, 18>{0x48,0x8B,0x49,0x40,0x48,0x8D,0x54,0x24,0x20,0x49,0x8B,0x0C,0x0F,0xE8,0x9E,0xFF,0xFF,0xFF});
+            signature(0xE1A0FD, std::array<std::uint8_t, 7>{0x49,0x83,0xC7,0x10,0x3B,0x69,0x48});
+            signature(0xE288E0, std::array<std::uint8_t, 17>{0x48,0x8B,0x02,0x8D,0x4D,0x01,0x48,0x8D,0x52,0x10,0x80,0x78,0x29,0x08,0x0F,0x44,0xCD});
+            signature(0xE54582, std::array<std::uint8_t, 15>{0x49,0x8B,0x6C,0x24,0x38,0x48,0x8B,0x45,0x18,0x48,0x8B,0x10,0x48,0x85,0xD2});
+            signature(0xE0F9F5, std::array<std::uint8_t, 14>{0x49,0x8B,0x46,0x10,0x49,0x89,0x4E,0x10,0x0F,0xAE,0xF8,0x48,0x89,0x08});
+            const auto* manager = read_native_value<const void*>(state, 0x38);
+            if (!manager || !address_is_readable(manager, 0x20))
+                throw std::runtime_error{"restore MOVE action manager is unreadable"};
+            const auto* root = read_native_value<const void*>(manager, 0);
+            const auto priorities = read_native_value<std::int32_t>(manager, 8);
+            const auto priority_capacity = read_native_value<std::int32_t>(manager, 12);
+            if (priorities != 3 || priority_capacity < priorities || priority_capacity > 64
+                || !root || !address_is_readable(root, 3 * 16))
+                throw std::runtime_error{"restore MOVE action priority arrays exceed guarded bounds"};
+            const auto* head = read_native_value<const void*>(manager, 0x10);
+            const auto* tail = read_native_value<const void*>(manager, 0x18);
+            if (!head || !tail || !address_is_readable(tail, sizeof(void*)))
+                throw std::runtime_error{"restore MOVE deferred action queue is unreadable"};
+            // The native driver drains tail->next only after the action tree is
+            // complete. Both the tree and the deferred queue must be settled.
+            if (head != tail || read_native_value<const void*>(tail, 0) != nullptr) return false;
+            bool complete = true;
+            std::size_t edge_count{};
+            std::set<const void*> visited{}, visiting{};
+            const auto visit_array = [&](const void* header, auto&& visitor) {
+                if (!address_is_readable(header, 16))
+                    throw std::runtime_error{"restore MOVE action array header is unreadable"};
+                const auto* data = read_native_value<const void*>(header, 0);
+                const auto count = read_native_value<std::int32_t>(header, 8);
+                const auto capacity = read_native_value<std::int32_t>(header, 12);
+                if (count < 0 || count > 4096 || capacity < count || capacity > 16384
+                    || (capacity > 0 && !data)
+                    || (count > 0 && !address_is_readable(data, static_cast<std::size_t>(count) * 16))
+                    || edge_count + static_cast<std::size_t>(count) > 16384)
+                    throw std::runtime_error{"restore MOVE action array exceeds guarded traversal bounds"};
+                edge_count += static_cast<std::size_t>(count);
+                for (std::int32_t index{}; index < count; ++index)
+                {
+                    const auto offset = static_cast<std::size_t>(index) * 16;
+                    visitor(read_native_value<const void*>(data, offset),
+                            read_native_value<const void*>(data, offset + sizeof(void*)));
+                }
+            };
+            const auto visit_action = [&](auto&& self, const void* action, const void* owner, std::size_t depth) -> void {
+                if (!action || !owner || !address_is_readable(action, 0x50)
+                    || !address_is_readable(owner, 0x10)
+                    || read_native_value<std::int32_t>(owner, 8) <= 0
+                    || read_native_value<std::int32_t>(owner, 8) > 1'000'000
+                    || depth > 64 || visiting.contains(action))
+                    throw std::runtime_error{"restore MOVE action ownership or child graph is invalid"};
+                if (visited.contains(action)) return;
+                if (visited.size() + visiting.size() >= 4096)
+                    throw std::runtime_error{"restore MOVE action graph exceeds guarded traversal bounds"};
+                visiting.insert(action);
+                const auto action_state = read_native_value<std::uint8_t>(action, 0x29);
+                if (action_state > 8)
+                    throw std::runtime_error{"restore MOVE action state exceeds the native enum"};
+                complete = (action_state == 8) && complete;
+                visit_array(static_cast<const std::byte*>(action) + 0x40,
+                    [&](const void* child, const void* child_owner) { self(self, child, child_owner, depth + 1); });
+                visiting.erase(action);
+                visited.insert(action);
+            };
+            for (std::int32_t priority{}; priority < priorities; ++priority)
+                visit_array(static_cast<const std::byte*>(root) + priority * 16,
+                    [&](const void* action, const void* owner) { visit_action(visit_action, action, owner, 0); });
+            return complete;
+        }
+
         auto retain_native_card_argument(const void* object, const void* controller)
             -> NativeSharedPointerPair
         {
@@ -4849,6 +4982,61 @@ namespace QuantumCheckpoint
             // releases this temporary. A borrowed pair would steal a live reference.
             write_native_value(controller, sizeof(void*), count + 1);
             return {object, controller};
+        }
+
+        auto queue_native_player_hand_base_health(UObject* engine, const NativeCardReference& card,
+                                                   std::int32_t base_health) -> void
+        {
+            if (GetCurrentThreadId() != g_game_thread_id.load(std::memory_order_acquire)
+                || !engine || engine->IsUnreachable()
+                || engine->HasAnyFlags(static_cast<EObjectFlags>(RF_BeginDestroyed | RF_FinishDestroyed))
+                || !card.card || card.card->IsUnreachable()
+                || card.card->HasAnyFlags(static_cast<EObjectFlags>(RF_BeginDestroyed | RF_FinishDestroyed))
+                || !engine->GetWorld() || card.card->GetWorld() != engine->GetWorld()
+                || !address_is_readable(static_cast<const std::byte*>(static_cast<const void*>(card.card))
+                    + InGameCardStatePointerOffset, sizeof(void*)))
+                throw std::runtime_error{"HAND base health requires a live target on the game thread"};
+            const auto api = validated_native_move_card_api(engine);
+            if (read_native_value<const void*>(card.card, InGameCardStatePointerOffset) != card.state
+                || native_card_location(api.engine_state, card.state, api.get_card_location) != 0)
+                throw std::runtime_error{"HAND base-health target ownership or location changed"};
+            const auto hand = read_native_player_zone_cards(engine, 0);
+            if (std::count_if(hand.begin(), hand.end(), [&](const auto& live) {
+                    return live.card == card.card && live.state == card.state;
+                }) != 1)
+                throw std::runtime_error{"HAND base-health target is not uniquely owned by the player hand"};
+            std::string error{};
+            if (!validate_player_health_state({base_health, base_health, {}}, error))
+                throw std::runtime_error{"HAND base-health target exceeds scalar bounds: " + error};
+            const auto before = capture_player_health_state(card.card);
+            if (before.base_health >= base_health || before.max_health != before.base_health
+                || !before.modifiers.empty()
+                || parse_int32(required_getter_text(card.card, STR("getCurrentHealth"))) != before.max_health)
+                throw std::runtime_error{"HAND base health must increase a fresh, unmodified full-health target"};
+            const auto module_base = reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr));
+            const auto signature = [&](std::uintptr_t rva, const auto& bytes) {
+                const auto* address = reinterpret_cast<const std::uint8_t*>(module_base + rva);
+                if (!address_is_readable(address, bytes.size()) || !std::equal(bytes.begin(), bytes.end(), address))
+                    throw std::runtime_error{"native HAND base-health action signature changed"};
+            };
+            signature(0xE51CB0, std::array<std::uint8_t,8>{0x48,0x8B,0xC4,0x53,0x48,0x83,0xEC,0x60});
+            signature(0xDFC4ED, std::array<std::uint8_t,4>{0xC6,0x47,0x28,0x2A});
+            signature(0xDFC55A, std::array<std::uint8_t,14>{0x8B,0x84,0x24,0xA0,0,0,0,0x89,0x47,0x6C,0x40,0x88,0x6F,0x68});
+            signature(0xE45C34, std::array<std::uint8_t,24>{0x8B,0x43,0x6C,0x89,0x82,0x18,0x01,0,0,0xB2,0x02,0x48,0x8B,0x4B,0x70,0x8B,0x43,0x6C,0x89,0x81,0x1C,0x01,0,0});
+            signature(0xE45C59, std::array<std::uint8_t,9>{0x48,0x8B,0x4B,0x70,0xE8,0xAE,0x7F,0xFF,0xFF});
+            if (!address_is_writable(static_cast<const std::byte*>(card.state) + 0x118, 8)
+                || !address_is_writable(static_cast<const std::byte*>(card.state) + 0x130, 0x50))
+                throw std::runtime_error{"HAND base-health storage is unavailable"};
+            const auto* shared = read_native_value<const void*>(card.state, CardStateSharedObjectOffset);
+            const auto* owner = read_native_value<const void*>(card.state, CardStateSharedControllerOffset);
+            // SET_BASE_STATS consumes a retained shared target, resets current
+            // HP to the absolute base, and clears HEALTH modifiers. Replay it
+            // before every modifier, never as a repair after verification.
+            const auto target = retain_native_card_argument(shared, owner);
+            const NativeSharedPointerPair empty{};
+            using Set = void (*)(const void*, const NativeSharedPointerPair*, const NativeSharedPointerPair*,
+                                 std::uint8_t, std::int32_t);
+            reinterpret_cast<Set>(module_base + 0xE51CB0)(api.engine_state, &empty, &target, 2, base_health);
         }
 
         auto queue_native_player_counter(UObject* engine, const NativeCardReference& card,
@@ -4993,7 +5181,8 @@ namespace QuantumCheckpoint
             reinterpret_cast<Add>(module_base + 0xE0F640)(api.engine_state, &empty, &target, owned.data());
         }
 
-        auto restore_field_card_effects(PendingNativeFieldMove& target) -> bool
+        auto restore_field_card_effects(PendingNativeFieldMove& target,
+                                        bool field_trace = true) -> bool
         {
             if (!target.effects_suppressed)
             {
@@ -5034,8 +5223,572 @@ namespace QuantumCheckpoint
                 return false;
             }
             target.effects_suppressed = false;
-            append_route_c_trace(
-                "restore.exact-player-field.effects.restored");
+            if (field_trace)
+                append_route_c_trace("restore.exact-player-field.effects.restored");
+            return true;
+        }
+
+        auto restore_move_card_effects(PendingRouteCRestore& restore,
+                                       PendingNativeRestoreMove& move) -> bool
+        {
+            if (!move.effects.effects_suppressed) return true;
+            if (!restore_field_card_effects(move.effects, false)) return false;
+            ++restore.move_effects_restored;
+            append_route_c_trace_failure("restore.move.effects.restored",
+                "actor=" + to_string(move.effects.card->GetName())
+                    + " destination=" + std::to_string(move.destination)
+                    + " count=" + std::to_string(move.effects.effect_list_count));
+            return true;
+        }
+
+        auto queue_restore_native_move(PendingRouteCRestore& restore, UObject* engine,
+                                       const NativeMoveCardApi& api, const NativeCardReference& card,
+                                       std::uint8_t destination) -> void
+        {
+            // This wrapper is deliberately restore-only. Ordinary gameplay,
+            // probes, and fixtures retain the native MOVE effect semantics.
+            if (!engine || engine->GetWorld() != restore.intercepted_world || destination > 2
+                || restore.move_effect_suppressions.size() >= 128
+                || std::any_of(restore.move_effect_suppressions.begin(), restore.move_effect_suppressions.end(),
+                    [&](const auto& move) { return move.effects.card == card.card || move.effects.state == card.state; })
+                || std::any_of(restore.exact_player_field_targets.begin(), restore.exact_player_field_targets.end(),
+                    [](const auto& target) { return target.effects_suppressed; }))
+                throw std::runtime_error{"restore MOVE suppression target, batch, or world is invalid"};
+            const auto current_api = validated_native_move_card_api(engine);
+            if (current_api.engine_state != api.engine_state || current_api.queue_move_card != api.queue_move_card
+                || current_api.get_card_location != api.get_card_location)
+                throw std::runtime_error{"restore MOVE native engine changed before queueing"};
+            try
+            {
+                validate_player_card_effect_membership(engine, card.card);
+            }
+            catch (const std::exception& error)
+            {
+                restore.player_effect_membership_status = "failed";
+                restore.player_effect_membership_reason = error.what();
+                append_route_c_trace_failure("restore.player-effect-membership.failed", error.what());
+                throw;
+            }
+            if (read_native_value<const void*>(card.card, InGameCardStatePointerOffset) != card.state)
+                throw std::runtime_error{"restore MOVE card state changed before suppression"};
+            const auto origin = native_card_location(api.engine_state, card.state, api.get_card_location);
+            if (!origin || *origin > 2)
+                throw std::runtime_error{"restore MOVE target is outside HAND, DECK, and TRASH"};
+            const auto* native_card = read_native_value<const void*>(card.state, CardStateSharedObjectOffset);
+            const auto* controller = read_native_value<const void*>(card.state, CardStateSharedControllerOffset);
+            if (!native_card || !controller
+                || !address_is_readable(static_cast<const std::byte*>(native_card) + NativeCardEffectListPointerOffset,
+                                        sizeof(void*) + sizeof(std::int32_t) * 2)
+                || !address_is_writable(static_cast<const std::byte*>(native_card) + NativeCardEffectListCountOffset,
+                                        sizeof(std::int32_t)))
+                throw std::runtime_error{"restore MOVE effect header is not readable and writable"};
+            const auto* pointer = read_native_value<const void*>(native_card, NativeCardEffectListPointerOffset);
+            const auto count = read_native_value<std::int32_t>(native_card, NativeCardEffectListCountOffset);
+            const auto capacity = read_native_value<std::int32_t>(native_card, NativeCardEffectListCapacityOffset);
+            if (count < 0 || count > 64 || capacity < count || capacity > 256
+                || (capacity > 0 && !pointer)
+                || (count > 0 && !address_is_readable(pointer, count * sizeof(NativeSharedPointerPair))))
+                throw std::runtime_error{"restore MOVE effect array exceeds guarded bounds"};
+            restore.move_effect_suppressions.push_back({
+                .effects = {.card = card.card, .state = card.state, .origin = *origin,
+                    .native_card_object = native_card, .effect_list_pointer = pointer,
+                    .effect_list_count = count, .effect_list_capacity = capacity},
+                .engine_state = api.engine_state, .shared_controller = controller,
+                .destination = destination, .queued_at = std::chrono::steady_clock::now(),
+            });
+            auto& move = restore.move_effect_suppressions.back();
+            write_native_value(native_card, NativeCardEffectListCountOffset, std::int32_t{});
+            move.effects.effects_suppressed = true;
+            ++restore.move_effects_suppressed;
+            try
+            {
+                if (read_native_value<std::int32_t>(native_card, NativeCardEffectListCountOffset) != 0)
+                    throw std::runtime_error{"restore MOVE effect suppression did not verify"};
+                append_route_c_trace_failure("restore.move.effects.suppressed",
+                    "actor=" + to_string(card.card->GetName()) + " origin=" + std::to_string(*origin)
+                        + " destination=" + std::to_string(destination) + " count=" + std::to_string(count));
+                queue_native_move_card_action(api, card, destination);
+            }
+            catch (...)
+            {
+                // Release this target immediately; terminal cleanup independently
+                // releases all earlier members of a partially queued batch.
+                if (!restore_move_card_effects(restore, move))
+                    append_route_c_trace("restore.move.effects.queue-exception-cleanup-failed");
+                throw;
+            }
+        }
+
+        auto verify_restore_move_effect_owner(UObject* engine, const NativeMoveCardApi& api,
+                                              const PendingNativeRestoreMove& move,
+                                              const std::vector<NativeCardReference>& live_cards) -> std::uint8_t
+        {
+            const auto& target = move.effects;
+            if (api.engine_state != move.engine_state
+                || std::count_if(live_cards.begin(), live_cards.end(), [&](const auto& card) {
+                    return card.card == target.card && card.state == target.state;
+                }) != 1
+                || target.card->GetWorld() != engine->GetWorld()
+                || read_native_value<const void*>(target.state, CardStateSharedObjectOffset) != target.native_card_object
+                || read_native_value<const void*>(target.state, CardStateSharedControllerOffset) != move.shared_controller)
+                throw std::runtime_error{"restore MOVE effect owner no longer matches its retained target"};
+            const auto location = native_card_location(api.engine_state, target.state, api.get_card_location);
+            if (!location || *location > 4
+                || !address_is_readable(static_cast<const std::byte*>(target.native_card_object)
+                        + NativeCardEffectListPointerOffset, sizeof(void*) + sizeof(std::int32_t) * 2)
+                || !address_is_writable(static_cast<const std::byte*>(target.native_card_object)
+                        + NativeCardEffectListCountOffset, sizeof(std::int32_t))
+                || read_native_value<const void*>(target.native_card_object, NativeCardEffectListPointerOffset)
+                    != target.effect_list_pointer
+                || read_native_value<std::int32_t>(target.native_card_object, NativeCardEffectListCountOffset) != 0
+                || read_native_value<std::int32_t>(target.native_card_object, NativeCardEffectListCapacityOffset)
+                    != target.effect_list_capacity)
+                throw std::runtime_error{"restore MOVE suppressed effect array changed while the action was pending"};
+            return *location;
+        }
+
+        using ReconcileEffectOverlays = void(__fastcall*)(UObject*);
+
+        auto validated_native_overlay_reconciler() -> ReconcileEffectOverlays
+        {
+            const auto module_base = reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr));
+            const auto signature = [&](std::uintptr_t rva, const auto& bytes) {
+                const auto* address = reinterpret_cast<const std::uint8_t*>(module_base + rva);
+                if (!address_is_readable(address, bytes.size()) || !std::equal(bytes.begin(), bytes.end(), address))
+                    throw std::runtime_error{"restore MOVE overlay reconciler signature changed"};
+            };
+            // FB94F0 is the native Tick reconciliation path. It preserves GUID
+            // matches, binds new displays to existing shared effects, and emits
+            // visual creation events; it never queues or resolves card actions.
+            signature(0xFB94F0, std::array<std::uint8_t, 19>{0x4C,0x8B,0xDC,0x55,0x56,0x49,0x8D,0xAB,0x38,0xFF,0xFF,0xFF,0x48,0x81,0xEC,0xB8,0x01,0,0});
+            signature(0xFB9511, std::array<std::uint8_t, 19>{0x48,0x8B,0xF1,0x48,0x8B,0x89,0x28,0x02,0,0,0x48,0x85,0xC9,0x0F,0x84,0xD3,0x08,0,0});
+            signature(0xFB954B, std::array<std::uint8_t, 5>{0xE8,0xC0,0xC3,0xE6,0xFF});
+            signature(0xFB96D2, std::array<std::uint8_t, 33>{0x48,0x8B,0x86,0x70,0x02,0,0,0x4A,0x8B,0x0C,0x30,0x48,0x8B,0x89,0xC0,0x02,0,0,0x48,0x85,0xC9,0x74,0x13,0x48,0x8D,0x54,0x24,0x40,0xE8,0xDD,0xD3,0xE6,0xFF});
+            signature(0xFB98A5, std::array<std::uint8_t, 9>{0x48,0x85,0xD2,0x0F,0x85,0x9B,0x01,0,0});
+            signature(0xFB9935, std::array<std::uint8_t, 27>{0xE8,0x66,0xE1,0xB6,0x01,0x48,0x8B,0xD6,0x4C,0x8B,0xF0,0x48,0x8B,0x08,0x4C,0x8B,0x81,0x50,0x04,0,0,0x48,0x8B,0xC8,0x41,0xFF,0xD0});
+            signature(0xFB9955, std::array<std::uint8_t, 22>{0x49,0x8D,0x86,0xC0,0x02,0,0,0x49,0x8B,0x5C,0x0F,0x08,0x49,0x8B,0x14,0x0F,0x48,0x8B,0xFB,0x48,0x8B,0xC8});
+            signature(0xFB9A2D, std::array<std::uint8_t, 28>{0x48,0x8B,0x86,0x70,0x02,0,0,0x4C,0x89,0x34,0xF8,0x44,0x38,0xAE,0xF9,0x02,0,0,0x74,0x08,0x49,0x8B,0xCE,0xE8,0x67,0x20,0x06,0});
+            signature(0xF8A161, std::array<std::uint8_t, 16>{0x48,0x8B,0xCE,0xE8,0x87,0xF3,0x02,0,0x48,0x8B,0xCE,0xE8,0x1F,0xF0,0x02,0});
+            signature(0x10181DA, std::array<std::uint8_t, 17>{0x48,0x8D,0x05,0xDF,0xAC,0xA3,0x02,0xC6,0x83,0x50,0x02,0,0,0,0x48,0x89,0x03});
+            signature(0x27ED350, std::array<std::uint8_t, 26>{0x48,0x89,0x5C,0x24,0x18,0x57,0x48,0x83,0xEC,0x20,0x4C,0x8B,0x81,0xE0,0,0,0,0x48,0x8B,0xFA,0x48,0x8B,0xD9,0x4C,0x3B,0xC2});
+            signature(0xF9B3D0, std::array<std::uint8_t, 19>{0x48,0x8B,0x89,0xD0,0x02,0,0,0x48,0x85,0xC9,0x0F,0x85,0x50,0x6A,0xE9,0xFF,0x32,0xC0,0xC3});
+            signature(0xE31E30, std::array<std::uint8_t, 5>{0x0F,0xB6,0x41,0x29,0xC3});
+            signature(0xFB9BD0, std::array<std::uint8_t, 20>{0x48,0x8B,0x86,0x70,0x02,0,0,0x4C,0x8B,0x14,0x07,0x4D,0x85,0xD2,0x0F,0x84,0x7E,0,0,0});
+            signature(0xFB9C48, std::array<std::uint8_t, 26>{0x49,0x8B,0xCA,0xF3,0x0F,0x59,0x86,0x40,0x04,0,0,0xF3,0x0F,0x5C,0xC6,0xF3,0x0F,0x11,0x44,0x24,0x40,0xE8,0x8E,0x21,0x83,0x01});
+            signature(0xFB9C62, std::array<std::uint8_t, 18>{0xFF,0xC3,0x48,0x83,0xC7,0x08,0x3B,0x9E,0x78,0x02,0,0,0x0F,0x8C,0x5C,0xFF,0xFF,0xFF});
+            return reinterpret_cast<ReconcileEffectOverlays>(module_base + 0xFB94F0);
+        }
+
+        struct RestoreEffectOverlay
+        {
+            std::size_t native_ordinal{};
+            UObject* actor{};
+            UObject* widget{};
+            const void* action{};
+            const void* action_controller{};
+            std::string action_state{}, highlighted{}, effect_type{}, blockers{};
+
+            auto operator==(const RestoreEffectOverlay&) const -> bool = default;
+        };
+
+        enum class RestoreOverlayReadMode { OrderedPrefix, UniqueNativeSubset };
+
+        struct RestoreOverlayArrayStorage
+        {
+            void* header{};
+            void* data{};
+            std::int32_t count{}, capacity{};
+        };
+
+        auto registered_overlay_objects() -> std::set<UObject*>
+        {
+            std::set<UObject*> result{};
+            UObjectGlobals::ForEachUObject([&](UObject* object, int32_t, int32_t) {
+                if (object) result.insert(object);
+                return LoopAction::Continue;
+            });
+            return result;
+        }
+
+        auto require_live_overlay_object(UObject* object, const void* world,
+                                         const std::set<UObject*>& registered) -> void
+        {
+            if (!object || !registered.contains(object) || object->IsUnreachable()
+                || object->HasAnyFlags(static_cast<EObjectFlags>(RF_BeginDestroyed | RF_FinishDestroyed))
+                || (world && object->GetWorld() != world))
+                throw std::runtime_error{"restore MOVE overlay UObject is no longer live in its expected world"};
+        }
+
+        auto overlay_object_property(UObject* owner, StringViewType name) -> UObject*
+        {
+            auto* property = owner->GetPropertyByNameInChain(name.data());
+            const auto* storage = property ? property->ContainerPtrToValuePtr<void>(owner) : nullptr;
+            if (!property || !property->IsA<FObjectProperty>() || !address_is_readable(storage, sizeof(void*)))
+                throw std::runtime_error{"restore MOVE overlay object property is unavailable"};
+            // Validate registration before dereferencing the returned object.
+            return read_native_value<UObject*>(storage, 0);
+        }
+
+        // Normal/final reads remain ordered. Only the repair's input and
+        // post-fill inspections may accept a unique native subset, so a later
+        // UI-only pointer permutation can preserve every surviving instance.
+        auto read_restore_effect_overlays(UObject* card, const NativeCardEffects& native,
+                                          const void* world, const std::set<UObject*>& registered,
+                                          RestoreOverlayReadMode mode = RestoreOverlayReadMode::OrderedPrefix,
+                                          RestoreOverlayArrayStorage* storage = nullptr)
+            -> std::vector<RestoreEffectOverlay>
+        {
+            require_live_overlay_object(card, world, registered);
+            static_cast<void>(validated_native_overlay_reconciler());
+            if (read_native_value<const void*>(card, InGameCardStatePointerOffset) != native.state
+                || native.state != native.object)
+                throw std::runtime_error{"restore MOVE overlay state does not match the native self-owned card"};
+            auto* property = card->GetPropertyByNameInChain(STR("cardOverlayEffects"));
+            auto* inner = property && property->IsA<FArrayProperty>()
+                ? static_cast<FArrayProperty*>(property)->GetInner() : nullptr;
+            auto* header = property ? property->ContainerPtrToValuePtr<void>(card) : nullptr;
+            if (!inner || !inner->IsA<FObjectProperty>() || inner->GetElementSize() != sizeof(void*)
+                || header != static_cast<const std::byte*>(static_cast<const void*>(card)) + 0x270
+                || !address_is_readable(header, 16))
+                throw std::runtime_error{"restore MOVE overlay reflected array layout changed"};
+            auto* data = read_native_value<void*>(header, 0);
+            const auto count = read_native_value<std::int32_t>(header, 8);
+            const auto capacity = read_native_value<std::int32_t>(header, 12);
+            if (count < 0 || count > native.count || capacity < count || capacity > 256
+                || (capacity > 0 && !data)
+                || (count > 0 && !address_is_readable(data, static_cast<std::size_t>(count) * sizeof(void*))))
+                throw std::runtime_error{"restore MOVE overlay array is not a bounded native subset"};
+            std::set<std::array<std::uint8_t, 16>> effect_ids{};
+            std::set<const void*> effect_objects{};
+            for (const auto& effect : native.descriptors)
+                if (std::all_of(effect.guid.begin(), effect.guid.end(), [](auto value) { return value == 0; })
+                    || !effect_ids.insert(effect.guid).second || !effect_objects.insert(effect.object).second)
+                    throw std::runtime_error{"restore MOVE native effect identities are empty or duplicated"};
+            std::set<UObject*> display_objects{}, widget_objects{};
+            std::set<std::size_t> observed_ordinals{};
+            std::vector<RestoreEffectOverlay> result{};
+            constexpr std::array<std::string_view, 15> effect_types{
+                "TRIGGER", "IGNITION", "EXEC", "INIT", "ON_DESTROYED", "SUMMON_CONDITION", "PASSIVE",
+                "VOLATILE", "DEFENSE", "QUICK", "DRAGOON", "SINGLE_USE", "ARTIFACT", "STORAGE_ARTIFACT", "NONE"};
+            constexpr std::array<std::string_view, 9> action_states{
+                "NONE", "WAITING", "DECLARED", "PAID", "CHAINED", "RESOLVED", "TRIGGERED", "CHILDREN_COMPLETE", "COMPLETE"};
+            for (std::int32_t index{}; index < count; ++index)
+            {
+                auto* display = read_native_value<UObject*>(data, static_cast<std::size_t>(index) * sizeof(void*));
+                require_live_overlay_object(display, world, registered);
+                if (!display_objects.insert(display).second || object_class_name(display) != "BP_CardEffectDisplay_C"
+                    || !address_is_readable(display, 0x2E0)
+                    || overlay_object_property(display, STR("Owner")) != card)
+                    throw std::runtime_error{"restore MOVE overlay display class, owner, or identity is invalid"};
+                const auto* effect_object = read_native_value<const void*>(display, 0x2C0);
+                const auto* effect_controller = read_native_value<const void*>(display, 0x2C8);
+                const auto match = std::find_if(native.descriptors.begin(), native.descriptors.end(),
+                    [&](const auto& effect) { return effect.object == effect_object && effect.controller == effect_controller; });
+                if (match == native.descriptors.end())
+                    throw std::runtime_error{"restore MOVE overlay binds a foreign native effect"};
+                const auto ordinal = static_cast<std::size_t>(match - native.descriptors.begin());
+                const auto& expected = *match;
+                if (!observed_ordinals.insert(ordinal).second
+                    || (mode == RestoreOverlayReadMode::OrderedPrefix && ordinal != static_cast<std::size_t>(index))
+                    || std::memcmp(static_cast<const std::byte*>(expected.object) + 0x18,
+                                   expected.guid.data(), expected.guid.size()) != 0)
+                    throw std::runtime_error{"restore MOVE overlay binding is duplicated, changed, or outside required native order"};
+                auto* widget = overlay_object_property(display, STR("mCardEffectWidget"));
+                require_live_overlay_object(widget, world, registered);
+                if (!widget_objects.insert(widget).second || object_class_name(widget) != "UMG_CardEffectDisplay_C")
+                    throw std::runtime_error{"restore MOVE overlay widget identity is invalid"};
+                RestoreEffectOverlay observed{.native_ordinal = ordinal, .actor = display, .widget = widget,
+                    .action = read_native_value<const void*>(display, 0x2D0),
+                    .action_controller = read_native_value<const void*>(display, 0x2D8)};
+                if ((observed.action == nullptr) != (observed.action_controller == nullptr)
+                    || (observed.action && (!address_is_readable(observed.action, 0x2A)
+                        || !address_is_readable(observed.action_controller, 16)
+                        || read_native_value<std::int32_t>(observed.action_controller, 8) <= 0
+                        || read_native_value<std::int32_t>(observed.action_controller, 8) > 1'000'000
+                        || read_native_value<std::uint8_t>(observed.action, 0x29) > 8)))
+                    throw std::runtime_error{"restore MOVE overlay action history is unreadable"};
+                observed.action_state = required_getter_text(display, STR("getEffectActionState"));
+                observed.highlighted = required_text(export_property_text(display, STR("isAutomationHighlighted")), "overlay highlight");
+                observed.effect_type = required_text(export_property_text(widget, STR("EffectType")), "overlay type");
+                if (expected.type >= effect_types.size() || observed.effect_type != effect_types[expected.type]
+                    || (observed.highlighted != "True" && observed.highlighted != "False")
+                    || std::find(action_states.begin(), action_states.end(), observed.action_state) == action_states.end()
+                    || observed.action_state != action_states[observed.action
+                        ? read_native_value<std::uint8_t>(observed.action, 0x29) : 0])
+                    throw std::runtime_error{"restore MOVE overlay visible state is unavailable or inconsistent"};
+                auto* blockers = widget->GetPropertyByNameInChain(STR("activationBlockers"));
+                auto* blocker_inner = blockers && blockers->IsA<FArrayProperty>()
+                    ? static_cast<FArrayProperty*>(blockers)->GetInner() : nullptr;
+                const auto* blocker_header = blockers ? blockers->ContainerPtrToValuePtr<void>(widget) : nullptr;
+                if (!blocker_inner || blocker_inner->GetElementSize() != 1 || !address_is_readable(blocker_header, 16))
+                    throw std::runtime_error{"restore MOVE overlay blocker layout is unavailable"};
+                const auto* blocker_data = read_native_value<const void*>(blocker_header, 0);
+                const auto blocker_count = read_native_value<std::int32_t>(blocker_header, 8);
+                const auto blocker_capacity = read_native_value<std::int32_t>(blocker_header, 12);
+                if (blocker_count < 0 || blocker_count > 64 || blocker_capacity < blocker_count || blocker_capacity > 256
+                    || (blocker_capacity > 0 && !blocker_data)
+                    || (blocker_count > 0 && !address_is_readable(blocker_data, blocker_count)))
+                    throw std::runtime_error{"restore MOVE overlay blocker array is invalid"};
+                for (std::int32_t blocker{}; blocker < blocker_count; ++blocker)
+                    if (read_native_value<std::uint8_t>(blocker_data, blocker) > 12)
+                        throw std::runtime_error{"restore MOVE overlay blocker enum is unknown"};
+                const auto blockers_text = export_property_text(widget, STR("activationBlockers"));
+                if (!blockers_text)
+                    throw std::runtime_error{"restore MOVE overlay blockers are unavailable"};
+                observed.blockers = *blockers_text; // A verified empty array exports empty text.
+                result.push_back(std::move(observed));
+            }
+            if (read_native_value<void*>(header, 0) != data
+                || read_native_value<std::int32_t>(header, 8) != count
+                || read_native_value<std::int32_t>(header, 12) != capacity)
+                throw std::runtime_error{"restore MOVE overlay array changed during inspection"};
+            for (std::size_t index{}; index < result.size(); ++index)
+                if (read_native_value<UObject*>(data, index * sizeof(void*)) != result[index].actor)
+                    throw std::runtime_error{"restore MOVE overlay pointer sequence changed during inspection"};
+            if (storage) *storage = {header, data, count, capacity};
+            return result;
+        }
+
+        auto restore_overlay_ordinals(const std::vector<RestoreEffectOverlay>& overlays) -> std::string
+        {
+            std::string result{"["};
+            for (const auto& overlay : overlays)
+            {
+                if (result.size() > 1) result += ',';
+                result += std::to_string(overlay.native_ordinal);
+            }
+            return result + ']';
+        }
+
+        auto restore_overlays_in_native_order(const std::vector<RestoreEffectOverlay>& overlays) -> bool
+        {
+            for (std::size_t index{}; index < overlays.size(); ++index)
+                if (overlays[index].native_ordinal != index) return false;
+            return true;
+        }
+
+        auto require_preserved_restore_overlays(const std::vector<RestoreEffectOverlay>& before,
+                                                const std::vector<RestoreEffectOverlay>& after) -> void
+        {
+            for (const auto& original : before)
+            {
+                const auto found = std::find_if(after.begin(), after.end(), [&](const auto& current) {
+                    return current.native_ordinal == original.native_ordinal;
+                });
+                if (found == after.end() || *found != original)
+                    throw std::runtime_error{"restore MOVE existing overlay actor, widget, or history changed"};
+            }
+        }
+
+        auto permute_restore_overlay_pointers(UObject* card, const NativeCardEffects& native,
+                                              const std::vector<RestoreEffectOverlay>& filled,
+                                              const RestoreOverlayArrayStorage& storage) -> void
+        {
+            const auto bytes = filled.size() * sizeof(UObject*);
+            if (GetCurrentThreadId() != g_game_thread_id.load(std::memory_order_acquire)
+                || filled.empty() || filled.size() > 64 || filled.size() != native.descriptors.size()
+                || storage.count != native.count || storage.count != static_cast<std::int32_t>(filled.size())
+                || storage.capacity < storage.count || storage.capacity > 256
+                || storage.header != static_cast<const std::byte*>(static_cast<const void*>(card)) + 0x270
+                || !address_is_readable(storage.header, 16)
+                || !storage.data || reinterpret_cast<std::uintptr_t>(storage.data) % alignof(UObject*) != 0
+                || !address_is_readable(storage.data, bytes) || !address_is_writable(storage.data, bytes))
+                throw std::runtime_error{"restore MOVE overlay permutation storage is not bounded and writable"};
+            const auto header_unchanged = [&] {
+                return read_native_value<void*>(storage.header, 0) == storage.data
+                    && read_native_value<std::int32_t>(storage.header, 8) == storage.count
+                    && read_native_value<std::int32_t>(storage.header, 12) == storage.capacity;
+            };
+            if (!header_unchanged())
+                throw std::runtime_error{"restore MOVE overlay array changed before pointer permutation"};
+            std::vector<UObject*> ordered(filled.size(), nullptr);
+            for (std::size_t index{}; index < filled.size(); ++index)
+            {
+                const auto& overlay = filled[index];
+                if (!overlay.actor || overlay.native_ordinal >= ordered.size() || ordered[overlay.native_ordinal]
+                    || read_native_value<UObject*>(storage.data, index * sizeof(UObject*)) != overlay.actor)
+                    throw std::runtime_error{"restore MOVE overlay permutation is not the inspected unique identity set"};
+                ordered[overlay.native_ordinal] = overlay.actor;
+            }
+            // This is only a permutation of the existing reflected UI pointer
+            // array. Num/Max, actor ownership, native shared effects, and every
+            // display/widget/action instance remain untouched.
+            std::memcpy(storage.data, ordered.data(), bytes);
+            if (!header_unchanged() || std::memcmp(storage.data, ordered.data(), bytes) != 0)
+                throw std::runtime_error{"restore MOVE overlay pointer permutation did not read back exactly"};
+        }
+
+        auto overlay_gameplay_observation(UObject* card) -> std::string
+        {
+            ObjectSnapshot state{};
+            append_native_card_statistics(state, card);
+            append_native_card_health_statistics(state, card);
+            append_native_card_level(state, card);
+            append_native_card_counters(state, card, false);
+            for (const auto& [name, value] : {
+                std::pair{"nativeStats:status", "verified-native-attack"},
+                std::pair{"nativeHealth:status", "verified-native-health"},
+                std::pair{"nativeLevel:status", "verified-native-level"},
+                std::pair{"nativeCounters:status", "verified-native-counters"}})
+                if (std::none_of(state.properties.begin(), state.properties.end(), [&](const auto& property) {
+                    return property.name == name && property.value == value;
+                })) throw std::runtime_error{"restore MOVE overlay gameplay observation is unverified"};
+            for (const auto getter : {STR("getCardInfoInstance"), STR("getId"), STR("getCardLocation"),
+                                     STR("getCurrentTurnCounter"), STR("getCurrentHealth"), STR("isTurnActive")})
+                state.properties.push_back({to_string(getter), required_getter_text(card, getter)});
+            std::string result{};
+            for (const auto& property : state.properties)
+                result += std::to_string(property.name.size()) + ":" + property.name
+                    + std::to_string(property.value.size()) + ":" + property.value;
+            return result;
+        }
+
+        auto reconcile_restore_move_overlays(UObject* engine, const PendingNativeRestoreMove& move) -> void
+        {
+            if (GetCurrentThreadId() != g_game_thread_id.load(std::memory_order_acquire)
+                || move.effects.effects_suppressed
+                || required_text(export_property_text(engine, STR("currentGameState")), "overlay engine state") != "OPEN")
+                throw std::runtime_error{"restore MOVE overlay reconciliation requires released effects on the OPEN game thread"};
+            const auto api = validated_native_move_card_api(engine);
+            if (api.engine_state != move.engine_state || !native_restore_actions_settled(api.engine_state))
+                throw std::runtime_error{"restore MOVE overlay reconciliation requires the settled owning engine"};
+            auto* card = move.effects.card;
+            const auto native = read_native_card_effects(engine, card);
+            if (native.state != move.effects.state || native.object != move.effects.native_card_object
+                || native.controller != move.shared_controller || native.array != move.effects.effect_list_pointer
+                || native.count != move.effects.effect_list_count || native.capacity != move.effects.effect_list_capacity
+                || native_card_location(api.engine_state, native.state, api.get_card_location) != move.destination)
+                throw std::runtime_error{"restore MOVE overlay target changed after raw release"};
+            auto registered = registered_overlay_objects();
+            auto* world = engine->GetWorld();
+            const auto before = read_restore_effect_overlays(card, native, world, registered,
+                RestoreOverlayReadMode::UniqueNativeSubset);
+            if (before.size() == native.descriptors.size() && restore_overlays_in_native_order(before)) return;
+
+            auto* display_class = overlay_object_property(card, STR("effectDisplayClass"));
+            auto* attach_point = overlay_object_property(card, STR("effectListAttachPoint"));
+            require_live_overlay_object(display_class, nullptr, registered);
+            require_live_overlay_object(attach_point, world, registered);
+            if (to_string(display_class->GetFullName()) != "BlueprintGeneratedClass /Game/Cards/ui/face/effects/BP_CardEffectDisplay.BP_CardEffectDisplay_C"
+                || !address_is_readable(card, 0x444)
+                || read_native_value<UObject*>(card, 0x438) != display_class
+                || read_native_value<UObject*>(card, 0x398) != attach_point)
+                throw std::runtime_error{"restore MOVE overlay display class or attachment layout changed"};
+            const auto gameplay = overlay_gameplay_observation(card);
+            const auto verify_gameplay = [&] {
+                if (read_native_card_effects(engine, card) != native || overlay_gameplay_observation(card) != gameplay
+                    || !native_restore_actions_settled(api.engine_state)
+                    || required_text(export_property_text(engine, STR("currentGameState")), "overlay engine state") != "OPEN")
+                    throw std::runtime_error{"restore MOVE overlay reconciliation changed native gameplay state"};
+            };
+            append_route_c_trace_failure("restore.move.overlays.input",
+                "actor=" + to_string(card->GetName()) + " ordinals=" + restore_overlay_ordinals(before)
+                    + " nativeCount=" + std::to_string(native.count));
+            if (before.size() != native.descriptors.size())
+                validated_native_overlay_reconciler()(card);
+            verify_gameplay();
+            registered = registered_overlay_objects();
+            // The native fill may reallocate the TArray. Retain only this fresh
+            // post-fill header/data snapshot for a possible pointer permutation.
+            RestoreOverlayArrayStorage storage{};
+            const auto filled = read_restore_effect_overlays(card, native, world, registered,
+                RestoreOverlayReadMode::UniqueNativeSubset, &storage);
+            if (filled.size() != native.descriptors.size())
+                throw std::runtime_error{"restore MOVE native reconciliation left missing effect displays"};
+            require_preserved_restore_overlays(before, filled);
+            append_route_c_trace_failure("restore.move.overlays.filled",
+                "actor=" + to_string(card->GetName()) + " ordinals=" + restore_overlay_ordinals(filled)
+                    + " preserved=" + std::to_string(before.size()));
+            const auto reordered = !restore_overlays_in_native_order(filled);
+            if (reordered)
+            {
+                verify_gameplay();
+                permute_restore_overlay_pointers(card, native, filled, storage);
+                const auto ordered = read_restore_effect_overlays(card, native, world, registered);
+                if (ordered.size() != native.descriptors.size())
+                    throw std::runtime_error{"restore MOVE overlay permutation is incomplete"};
+                require_preserved_restore_overlays(filled, ordered);
+                // All native GUIDs now have their existing displays. This call
+                // only updates positions/clickability in the corrected order.
+                validated_native_overlay_reconciler()(card);
+                verify_gameplay();
+                registered = registered_overlay_objects();
+            }
+            const auto after = read_restore_effect_overlays(card, native, world, registered);
+            if (after.size() != native.descriptors.size())
+                throw std::runtime_error{"restore MOVE overlays remain incomplete after native layout"};
+            require_preserved_restore_overlays(filled, after);
+            append_route_c_trace_failure("restore.move.overlays.reconciled",
+                "actor=" + to_string(card->GetName()) + " before=" + std::to_string(before.size())
+                    + " after=" + std::to_string(after.size()) + " ordinals=" + restore_overlay_ordinals(after)
+                    + " reordered=" + (reordered ? "true" : "false"));
+        }
+
+        auto verify_restore_move_overlays(const PendingRouteCRestore& restore, UObject* engine) -> void
+        {
+            if (restore.move_overlay_targets.empty()) return;
+            const auto registered = registered_overlay_objects();
+            for (const auto& target : restore.move_overlay_targets)
+            {
+                require_live_overlay_object(target.card, engine->GetWorld(), registered);
+                const auto native = read_native_card_effects(engine, target.card);
+                if (native.state != target.state
+                    || read_restore_effect_overlays(target.card, native, engine->GetWorld(), registered).size()
+                        != native.descriptors.size())
+                    throw std::runtime_error{"restore MOVE overlays drifted or became unavailable during final stability window"};
+            }
+        }
+
+        auto complete_restore_move_effects(PendingRouteCRestore& restore,
+                                           const RouteCBattleObjects& objects) -> bool
+        {
+            if (restore.move_effect_suppressions.empty()) return true;
+            if (!objects.card_engine || objects.card_engine->GetWorld() != restore.intercepted_world)
+                throw std::runtime_error{"restore MOVE effect owner world is no longer live"};
+            const auto api = validated_native_move_card_api(objects.card_engine);
+            // Caller has observed OPEN. Require all native action trees COMPLETE
+            // and the deferred queue empty, so location assignment alone cannot
+            // release effects before MOVE has completed its trigger dispatch.
+            if (!native_restore_actions_settled(api.engine_state)) return false;
+            std::vector<NativeCardReference> live_cards{};
+            for (const auto location : {0, 1, 2, 3, 4})
+            {
+                const auto cards = native_cards_at_location(objects.card_engine, api, location);
+                live_cards.insert(live_cards.end(), cards.begin(), cards.end());
+            }
+            bool destinations_reached = true;
+            for (const auto& move : restore.move_effect_suppressions)
+                destinations_reached = (verify_restore_move_effect_owner(objects.card_engine, api, move, live_cards)
+                    == move.destination) && destinations_reached;
+            if (!destinations_reached) return false;
+            // Preflight every member, restore every raw count, then validate
+            // definitions. A failed definition must not strand later targets.
+            for (auto& move : restore.move_effect_suppressions)
+                if (!restore_move_card_effects(restore, move))
+                    throw std::runtime_error{"restore MOVE effect count could not be restored"};
+            try
+            {
+                for (const auto& move : restore.move_effect_suppressions)
+                    validate_player_card_effect_membership(objects.card_engine, move.effects.card);
+            }
+            catch (const std::exception& error)
+            {
+                restore.player_effect_membership_status = "failed";
+                restore.player_effect_membership_reason = error.what();
+                append_route_c_trace_failure("restore.player-effect-membership.failed", error.what());
+                throw;
+            }
+            // Raw release and definition verification for the entire batch
+            // precede visual work. Cleanup paths deliberately never call this.
+            for (const auto& move : restore.move_effect_suppressions)
+            {
+                reconcile_restore_move_overlays(objects.card_engine, move);
+                if (std::none_of(restore.move_overlay_targets.begin(), restore.move_overlay_targets.end(),
+                    [&](const auto& target) { return target.card == move.effects.card; }))
+                    restore.move_overlay_targets.push_back({move.effects.card, move.effects.state, move.destination});
+            }
+            restore.move_effect_suppressions.clear();
+            append_route_c_trace("restore.move.effects.batch-verified");
             return true;
         }
 
@@ -5051,6 +5804,35 @@ namespace QuantumCheckpoint
 
             // Every terminal path, including timeout and unexpected exceptions,
             // must release temporary effect suppression before discarding targets.
+            for (auto& move : completed.move_effect_suppressions)
+            {
+                if (!move.effects.effects_suppressed) continue;
+                try
+                {
+                    const auto live = find_route_c_objects();
+                    if (!live.card_engine || live.card_engine->GetWorld() != completed.intercepted_world)
+                        throw std::runtime_error{"MOVE effect owner world is no longer live"};
+                    const auto api = validated_native_move_card_api(live.card_engine);
+                    std::vector<NativeCardReference> live_cards{};
+                    for (const auto location : {0, 1, 2, 3, 4})
+                    {
+                        const auto cards = native_cards_at_location(live.card_engine, api, location);
+                        live_cards.insert(live_cards.end(), cards.begin(), cards.end());
+                    }
+                    // Timeout/exception cleanup may still find the card at its
+                    // origin. Only ownership and the saved array header matter.
+                    verify_restore_move_effect_owner(live.card_engine, api, move, live_cards);
+                    if (!restore_move_card_effects(completed, move))
+                        throw std::runtime_error{"MOVE suppressed effect count could not be restored"};
+                }
+                catch (const std::exception& error)
+                {
+                    completed.status = "failed";
+                    completed.reason += "; MOVE effect cleanup: " + std::string{error.what()};
+                    completed.player_effect_membership_status = "failed";
+                    completed.player_effect_membership_reason = "MOVE effect cleanup: " + std::string{error.what()};
+                }
+            }
             for (auto& target : completed.exact_player_field_targets)
             {
                 if (!target.effects_suppressed)
@@ -5263,6 +6045,21 @@ namespace QuantumCheckpoint
                         invalid_hand_health_dependency = true;
                         hand_health_status = "rejected-before-startup";
                         hand_health_reason = "required HAND HEALTH checksum, full hand order, or Route C linkage failed; " + hand_health_reason;
+                        hand_counter_status = "rejected-before-startup";
+                        hand_counter_reason = hand_health_reason;
+                        exact_player_hand_health.reset();
+                    }
+                    else if (exact_player_hand_health->schema_version >= ExactPlayerHandBaseHealthSchemaVersion
+                        && !(exact_player_field
+                            ? exact_player_field->schema_version >= ExactPlayerFieldEffectMembershipSchemaVersion
+                            : exact_player_trash
+                                ? exact_player_trash->schema_version >= ExactPlayerTrashEffectMembershipSchemaVersion
+                                : exact_player_zones
+                                    && exact_player_zones->schema_version >= ExactPlayerZonesEffectMembershipSchemaVersion))
+                    {
+                        invalid_hand_health_dependency = true;
+                        hand_health_status = "rejected-before-startup";
+                        hand_health_reason = "HAND base-health schema requires the selected layout to attest capture-time effect membership";
                         hand_counter_status = "rejected-before-startup";
                         hand_counter_reason = hand_health_reason;
                         exact_player_hand_health.reset();
@@ -6285,8 +7082,8 @@ namespace QuantumCheckpoint
                 append_route_c_trace("restore.exact-player-trash.queue.begin");
                 for (const auto& target : targets)
                 {
-                    queue_native_move_card_action(
-                        api,
+                    queue_restore_native_move(
+                        restore, objects.card_engine, api,
                         NativeCardReference{.card = target.card, .state = target.state},
                         2);
                 }
@@ -6314,8 +7111,8 @@ namespace QuantumCheckpoint
                         api.engine_state, target.state, api.get_card_location);
                     if (location && *location == 2)
                     {
-                        queue_native_move_card_action(
-                            api,
+                        queue_restore_native_move(
+                            restore, objects.card_engine, api,
                             NativeCardReference{
                                 .card = target.card,
                                 .state = target.state,
@@ -6367,6 +7164,9 @@ namespace QuantumCheckpoint
             if (!restore.off_field_statistics_covered) return true;
             const bool counters_covered = restore.exact_player_hand_health
                 && restore.exact_player_hand_health->schema_version >= 2;
+            const auto hand_schema = restore.exact_player_hand_health
+                ? restore.exact_player_hand_health->schema_version : 1;
+            const bool base_covered = hand_schema >= ExactPlayerHandBaseHealthSchemaVersion;
             std::string_view failure_layer{"shared"};
             try
             {
@@ -6374,7 +7174,9 @@ namespace QuantumCheckpoint
                 // runs again throughout the final stability window. HEALTH and
                 // generic counters share one fixed native HAND target sequence.
                 // Moving a card after this layer would reset its dynamic state.
-                const auto statistics = validate_off_field_statistics(objects, true, counters_covered);
+                if (base_covered && restore.player_effect_membership_saved_proof != "attested-by-layout-schema")
+                    throw std::runtime_error{"HAND base health lacks accepted capture-time effect membership proof"};
+                const auto statistics = validate_off_field_statistics(objects, true, counters_covered, hand_schema);
                 const auto& observed = statistics.hand_health;
                 const auto& observed_counters = statistics.hand_counters;
                 if (!restore.exact_player_hand_health)
@@ -6416,17 +7218,22 @@ namespace QuantumCheckpoint
                     failure_layer = "health";
                     for (std::size_t index{}; index < observed.size(); ++index)
                     {
-                        if (observed[index].base_health != (*desired)[index].base_health
+                        const auto definition = defined_player_card_statistics(objects.game_instance, cards[index].card);
+                        if (!validate_player_hand_health_for_definition((*desired)[index], definition.health,
+                                                                       hand_schema, error))
+                            throw std::runtime_error{"saved HAND health violates schema/definition policy: " + error};
+                        if (observed[index].base_health != definition.health
                             || observed[index].max_health != observed[index].base_health
                             || !observed[index].modifiers.empty())
                             throw std::runtime_error{"fresh HAND health differs from the supported default state"};
+                        restore.hand_definition_base_health.push_back(definition.health);
                     }
                     for (std::size_t index{}; index < observed.size(); ++index)
                         restore.hand_health_targets.push_back({cards[index].card, cards[index].state, 0});
                     restore.hand_health_prefix = observed;
                     restore.hand_counter_prefix = observed_counters;
                     restore.hand_health_status = "applying";
-                    restore.hand_health_reason = "replaying native HEALTH actions after final card placement";
+                    restore.hand_health_reason = "replaying HAND base health before HEALTH modifiers after final card placement";
                     if (counters_covered)
                     {
                         restore.hand_counter_status = "applying";
@@ -6447,7 +7254,7 @@ namespace QuantumCheckpoint
                             && observed[index] == restore.hand_health_before_queue
                             && now - restore.hand_health_queued_at <= std::chrono::seconds{8})
                             waiting = true;
-                        else throw std::runtime_error{"native HAND health changed or a queued modifier did not verify: index="
+                        else throw std::runtime_error{"native HAND health changed or a queued health action did not verify: index="
                             + std::to_string(index) + " expected=" + serialize_player_health_states({restore.hand_health_prefix.at(index)})
                             + " observed=" + serialize_player_health_states({observed[index]})};
                     }
@@ -6467,6 +7274,27 @@ namespace QuantumCheckpoint
                 restore.hand_health_pending_card.reset();
                 restore.hand_counter_pending_card.reset();
                 failure_layer = "health";
+                for (std::size_t index{}; index < observed.size(); ++index)
+                {
+                    auto& prefix = restore.hand_health_prefix[index];
+                    const auto& saved = (*desired)[index];
+                    if (prefix.base_health == saved.base_health) continue;
+                    if (!base_covered || restore.hand_health_status == "verified-native-health"
+                        || prefix.base_health != restore.hand_definition_base_health.at(index)
+                        || prefix.max_health != prefix.base_health || !prefix.modifiers.empty()
+                        || saved.base_health <= prefix.base_health)
+                        throw std::runtime_error{"HAND base health changed after verification or has an invalid replay prefix"};
+                    restore.hand_health_before_queue = prefix;
+                    queue_native_player_hand_base_health(objects.card_engine, cards[index], saved.base_health);
+                    prefix = {saved.base_health, saved.base_health, {}};
+                    restore.hand_health_pending_card = index;
+                    restore.hand_health_queued_at = now;
+                    ++restore.hand_base_health_actions_queued;
+                    append_route_c_trace_failure("restore.exact-player-hand-base-health.queued",
+                        "index=" + std::to_string(index) + " base=" + std::to_string(saved.base_health));
+                    resume_native_restore_actions(objects.card_engine);
+                    return false;
+                }
                 for (std::size_t index{}; index < observed.size(); ++index)
                 {
                     auto& prefix = restore.hand_health_prefix[index];
@@ -6491,7 +7319,9 @@ namespace QuantumCheckpoint
                 if (restore.hand_health_status != "verified-native-health")
                     append_route_c_trace("restore.exact-player-hand-health.verified-native-health");
                 restore.hand_health_status = "verified-native-health";
-                restore.hand_health_reason = "native HAND order, definitions, HEALTH modifiers and current=max verified";
+                restore.hand_health_reason = base_covered
+                    ? "native HAND order, definitions, base-HP gains, HEALTH modifiers and current=max verified"
+                    : "native HAND order, definitions, HEALTH modifiers and current=max verified";
                 if (!counters_covered) return true;
                 failure_layer = "counter";
                 for (std::size_t index{}; index < desired_counters.size(); ++index)
@@ -7321,8 +8151,8 @@ namespace QuantumCheckpoint
                     throw std::runtime_error{
                         "field target was outside DECK and HAND before staging"};
                 }
-                queue_native_move_card_action(
-                    api.location,
+                queue_restore_native_move(
+                    restore, objects.card_engine, api.location,
                     NativeCardReference{.card = target.card, .state = target.state},
                     0);
                 resume_native_restore_actions(objects.card_engine);
@@ -7341,8 +8171,8 @@ namespace QuantumCheckpoint
                 {
                     throw std::runtime_error{"trash target left its staged origin before moving"};
                 }
-                queue_native_move_card_action(
-                    api.location,
+                queue_restore_native_move(
+                    restore, objects.card_engine, api.location,
                     NativeCardReference{.card = target.card, .state = target.state}, 2);
                 resume_native_restore_actions(objects.card_engine);
                 restore.exact_player_field_status = "moving-field-trash";
@@ -7912,7 +8742,7 @@ namespace QuantumCheckpoint
             if (actual_deck != restore.hand_staging_deck || actual_hand != restore.hand_staging_hand)
                 throw std::runtime_error{"native card order changed before a hand staging action"};
             const auto& target = restore.hand_staging_cards.at(move.candidate);
-            queue_native_move_card_action(api, {target.card, target.state}, move.destination);
+            queue_restore_native_move(restore, objects.card_engine, api, {target.card, target.state}, move.destination);
             resume_native_restore_actions(objects.card_engine);
             restore.hand_staging_move_queued = true;
             restore.hand_staging_move_started_at = now;
@@ -8123,6 +8953,69 @@ namespace QuantumCheckpoint
             append_route_c_trace("restore.exact-turn-progress.apply.complete");
         }
 
+#if defined(QUANTUM_CHECKPOINT_RUNTIME_TEST_FIXTURES)
+        auto inject_pending_move_test_failure(PendingRouteCRestore& restore) -> void
+        {
+            // Read the explicit process-start test setting only once. Production
+            // builds contain neither this environment lookup nor the fault path.
+            if (!g_pending_move_test_environment_read.exchange(true, std::memory_order_acq_rel))
+            {
+                std::array<wchar_t, 16> setting{};
+                const auto length = GetEnvironmentVariableW(
+                    L"QUANTUM_CHECKPOINT_TEST_FAIL_PENDING_MOVE", setting.data(),
+                    static_cast<DWORD>(setting.size()));
+                if (length > 0)
+                {
+                    int minimum{};
+                    if (length < setting.size())
+                    {
+                        const std::wstring_view value{setting.data(), length};
+                        if (value == L"single") minimum = 1;
+                        else if (value == L"batch") minimum = 2;
+                    }
+                    if (minimum == 0)
+                    {
+                        append_route_c_trace("test.restore.pending-move-failure.invalid-setting");
+                    }
+                    else
+                    {
+                        g_pending_move_test_failure_minimum.store(minimum, std::memory_order_release);
+                        append_route_c_trace_failure("test.restore.pending-move-failure.armed",
+                            std::string{"mode="} + (minimum == 1 ? "single" : "batch")
+                                + " minimumSuppressed=" + std::to_string(minimum));
+                    }
+                }
+            }
+            const auto minimum = g_pending_move_test_failure_minimum.load(std::memory_order_acquire);
+            if (minimum == 0 || restore.semantic_fallback) return;
+            const auto suppressed = std::count_if(
+                restore.move_effect_suppressions.begin(), restore.move_effect_suppressions.end(),
+                [](const auto& move) { return move.effects.effects_suppressed; });
+            if (suppressed < minimum) return;
+
+            // This runs on a later update, after the restore caller has queued
+            // and resumed its native MOVE batch. Consume before logging/throwing
+            // so terminal cleanup and the single semantic fallback cannot rearm.
+            if (g_pending_move_test_failure_minimum.exchange(0, std::memory_order_acq_rel) == 0) return;
+            std::string targets{};
+            for (const auto& move : restore.move_effect_suppressions)
+                if (move.effects.effects_suppressed)
+                {
+                    if (!targets.empty()) targets += ';';
+                    // Describe the real suppressed batch without dereferencing
+                    // target actors or changing any native state in the hook.
+                    targets += "destination=" + std::to_string(move.destination)
+                        + ",count=" + std::to_string(move.effects.effect_list_count);
+                }
+            const auto mode = minimum == 1 ? "single" : "batch";
+            append_route_c_trace_failure("test.restore.pending-move-failure.injected",
+                std::string{"mode="} + mode + " suppressed=" + std::to_string(suppressed)
+                    + " targets=" + targets);
+            throw std::runtime_error{std::string{"DEV injected pending MOVE failure after native queueing ("}
+                + mode + ")"};
+        }
+#endif
+
         auto update_route_c_restore() -> void
         {
             if (!g_pending_route_c_restore)
@@ -8143,6 +9036,15 @@ namespace QuantumCheckpoint
             try
             {
                 auto& restore = *g_pending_route_c_restore;
+#if defined(QUANTUM_CHECKPOINT_RUNTIME_TEST_FIXTURES)
+                inject_pending_move_test_failure(restore);
+#endif
+                for (const auto& move : restore.move_effect_suppressions)
+                    if (now - move.queued_at > std::chrono::seconds{8})
+                    {
+                        append_route_c_trace("restore.move.effects.timeout");
+                        throw std::runtime_error{"restore MOVE did not settle within eight seconds while effects were suppressed"};
+                    }
                 if (!restore.interception_error.empty())
                 {
                     throw std::runtime_error{restore.interception_error};
@@ -8345,6 +9247,7 @@ namespace QuantumCheckpoint
                         restore.stability_deadline = now + std::chrono::seconds{3};
                     return;
                 }
+                if (!complete_restore_move_effects(restore, objects)) return;
                 if (!wave || *wave != restore.checkpoint.wave_index)
                 {
                     if (*wave < restore.checkpoint.wave_index
@@ -8571,6 +9474,10 @@ namespace QuantumCheckpoint
                     return;
                 }
 
+                // Recreated displays populate blockers through ordinary ticks.
+                // Never finish with missing/unreadable UI state even when the
+                // native membership and numeric restore have already verified.
+                verify_restore_move_overlays(restore, objects.card_engine);
                 const auto final_zones = find_route_c_player_zone_objects(
                     static_cast<const void*>(objects.card_engine->GetWorld()));
                 const auto verify_final_zones = [&](const auto& exact) {
@@ -12393,9 +13300,9 @@ namespace QuantumCheckpoint
         QuantumCheckpointMod()
         {
             ModName = STR("QuantumCheckpoint");
-            ModVersion = STR("0.36.0");
+            ModVersion = STR("0.37.0");
 #if defined(QUANTUM_CHECKPOINT_RUNTIME_TEST_FIXTURES)
-            ModVersion = STR("0.36.0-test-fixtures");
+            ModVersion = STR("0.37.0-test-fixtures");
 #endif
             ModDescription = STR("Route C checkpoint with optional exact-state supplements");
             ModAuthors = STR("zaofenMachine and contributors");

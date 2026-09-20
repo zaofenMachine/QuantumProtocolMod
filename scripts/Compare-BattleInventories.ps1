@@ -594,6 +594,12 @@ function ConvertTo-NormalizedInventory {
     $canonicalZones = [ordered]@{}
     foreach ($key in @($zones.Keys | Sort-Object)) { $canonicalZones[$key] = $zones[$key] }
     $zones = $canonicalZones
+    $playerZones = [ordered]@{}
+    foreach ($key in $zones.Keys) {
+        if ($key.EndsWith('/PLAYER', [System.StringComparison]::Ordinal)) {
+            $playerZones[$key] = $zones[$key]
+        }
+    }
 
     $engine = $inventory.objects | Where-Object role -eq 'BP_CardEngine_C' | Select-Object -First 1
     $bottomBar = $inventory.objects | Where-Object role -eq 'BP_BottomBar_C' | Select-Object -First 1
@@ -667,6 +673,7 @@ function ConvertTo-NormalizedInventory {
             spawnWaveHashes = $spawnWaveHashes
         }
         zones = $zones
+        playerZones = $playerZones
         nativePlayerZones = $nativePlayerZones
         nativePlayerZoneInstances = $nativePlayerZoneInstances
         nativePlayerZonesAvailable = $nativePlayerZones.Count -eq 3
@@ -859,7 +866,7 @@ $report = [ordered]@{
         spawnerRuntimeScalarsEqual = Test-Equivalent $spawnerScalarBefore $spawnerScalarAfter
         futureSpawnPlanEqual = Test-Equivalent `
             $beforeState.spawner.spawnWaveHashes $afterState.spawner.spawnWaveHashes
-        playerZoneSequencesEqual = Test-Equivalent $beforeState.zones $afterState.zones
+        playerZoneSequencesEqual = Test-Equivalent $beforeState.playerZones $afterState.playerZones
         playerNativeZoneOrderAvailable = $beforeState.nativePlayerZonesAvailable -and $afterState.nativePlayerZonesAvailable
         playerNativeZoneSequencesEqual = if ($beforeState.nativePlayerZonesAvailable -and $afterState.nativePlayerZonesAvailable) {
             Test-Equivalent $beforeState.nativePlayerZones $afterState.nativePlayerZones
@@ -910,7 +917,7 @@ $report = [ordered]@{
         beforeNativeEffectMembershipCoverage = $beforeState.playerNativeEffectMembershipReason
         afterNativeEffectMembershipCoverage = $afterState.playerNativeEffectMembershipReason
         nativeEffectMembershipNote = 'Native effect membership compares ordered tag/type/factoryKey arrays without UI or action-history inference. DECK/HAND/TRASH use verified native ID-to-instance bindings; FIELD uses unique resolved player slots. Full CardInfoInstance text is compared in every position. STORAGE and CHARACTER ability cards are outside this D/H/T/F scope; other player zones, including PENDING, make coverage unknown. Empty arrays are valid; missing or invalid native coverage yields null and does not alter older checks.'
-        note = 'Runtime GUIDs are excluded from equality. playerZoneSequencesEqual compares metadata-sorted controller views, not draw/hand order. Native order is unknown (null) unless both inventories include all three player-zone arrays. Ordered runtime state requires complete native DECK/HAND/TRASH ID arrays resolving unique cards in the correct zone and instance position, with verified attack/health/counters/level and complete turn/effect observations. GUIDs only link each inventory internally; missing or invalid coverage yields null, never inferred order. Native attack/modifier equality is unknown (null) unless every player card in both inventories has verified native statistics; the older card-state check does not cover those fields.'
+        note = 'Runtime GUIDs are excluded from equality. playerZoneSequencesEqual compares metadata-sorted PLAYER controller views, not draw/hand order; all controller sides remain in the raw zones differences and semanticEqual. Native order is unknown (null) unless both inventories include all three player-zone arrays. Ordered runtime state requires complete native DECK/HAND/TRASH ID arrays resolving unique cards in the correct zone and instance position, with verified attack/health/counters/level and complete turn/effect observations. GUIDs only link each inventory internally; missing or invalid coverage yields null, never inferred order. Native attack/modifier equality is unknown (null) unless every player card in both inventories has verified native statistics; the older card-state check does not cover those fields.'
     }
     futureSpawnPlan = [ordered]@{
         beforeWaveCount = @($beforeState.spawner.spawnWaveHashes).Count

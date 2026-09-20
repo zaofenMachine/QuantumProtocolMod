@@ -2,9 +2,9 @@
 
 《Quantum Protocol》局内检查点 Mod 的可行性研究与实验原型。
 
-当前 v0.36.0 沿用路线 C“普通地牢小关语义重开”，叠加受限的玩家精确恢复：原生牌序、手牌数量、场格、生命与攻击修正、计数器、抽牌进度，以及春生成的一张额外苹果。恢复在游戏线程执行，精确层失败后重新加载一次纯 Route C。
+当前 v0.37.0 沿用路线 C“普通地牢小关语义重开”，叠加受限的玩家精确恢复：原生牌序、手牌数量、场格、生命与攻击修正、计数器、抽牌进度，以及春生成的一张额外苹果。恢复在游戏线程执行，精确层失败后重新加载一次纯 Route C。
 
-本轮补齐原生技能成员的保存与恢复检查，防止删去技能后仍被误判为可精确保存。新布局标明保存时验证，旧版明确报告证明未知；技能执行历史仍未恢复。
+本轮支持手牌基础生命增长与 HEALTH 修正、generic 计数联合恢复，并修复恢复搬牌重复触发成长及技能显示缺项、乱序的问题。原生技能成员门禁继续生效；技能执行历史仍未恢复。
 
 ## 当前结论
 
@@ -17,7 +17,13 @@
 
 2026-09-20 用户授权恢复推进“小关重开 + 玩家精确恢复”，继续搁置“重编程重开”和敌人精确恢复。此前已验证真实牌序、空牌区、六／七张手牌、满手牌暂存，以及场地攻击、生命、计数器和一张生成苹果的恢复。生成卡仍保留战斗 9 张／永久牌组 8 张；LEVEL 修正、非零独立生命调整和效果动作历史仍不恢复。
 
-HAND schema 2 按原生下标保存生命修正与 generic 计数，旧 HAND schema 1 保持兼容。v0.36.0 的 zones 4 / trash 5 / field 8 增加保存时技能成员证明；恢复采用原生动作并逐帧核验，不通过时仅回退一次普通 Route C。正式 DLL 关闭开发夹具，4/4 CTest 与新旧布局实机回归已通过。旧版删除技能漏洞已有真实操作复现，新版会拒绝这类精确捕获。下一步验证 sorc 回手的动态基础生命；技能动作历史与同进程 Cherry 显示缺口仍未闭合。详见：
+HAND schema 3 按原生下标保存基础生命、HEALTH 修正与 generic 计数，只允许相对定义基础生命的非负增长、非负 HEALTH 修正且当前生命等于上限。旧 HAND 1/2 继续要求定义基础生命；zones 4 / trash 5 / field 8 的保存时技能成员证明与依赖关系保持不变。
+
+焰火正常回手后的基础生命 1→2、叠加 HEALTH +1，以及两张同定义卡的不同基础生命均已完成恢复对照。恢复专用 MOVE 抑制目标自身技能，完成后补齐并对齐技能显示；最终仍严格比较原生成员、显示状态和玩家数值，不豁免缺失或未知状态。正式构建关闭开发夹具，4/4 CTest 与多组生产实机对照已通过。
+
+本轮原始用户检查点已完成最终恢复，17 个文件逐字节还原；14 组生产恢复完成全部 25 项玩家对照，另外 2 组历史清单按原有可用范围验证后，已通过重存建立完整原生基线。稳定窗口正常抽牌触发状态漂移后，严格验证确认仅回退一次普通 Route C，未重新排入数值修复。提交与归档信息见本阶段证据目录的 validation-summary.json。按用户最新要求，本轮收尾后停下汇报，不启动新功能；既定方向仍是逐层缩小受限玩家恢复的缺口。敌人精确状态、技能私有历史、LEVEL 修正、独立生命调整及 STORAGE/能力卡运行态精确恢复仍不覆盖。详见：
+
+- [手牌基础生命与生命修正联合恢复](docs/phase-36-player-hand-base-health.md)
 
 - [玩家技能成员的保存与恢复门禁](docs/phase-35-player-effect-membership-guards.md)
 
@@ -116,7 +122,7 @@ C++ 构建前提、已验证工具链和反射结构提取方法见 [C++ 开发�
 
 安装器会把 DLL 部署为 `Mods\QuantumCheckpoint\dlls\main.dll`，在现有 `mods.txt` 中加入 `QuantumCheckpoint : 1`，并把精确回滚材料保存在被 Git 忽略的 `backups/cpp` 与 `runtime` 目录。若旧 Lua 研究探针存在，安装器会在本次 C++ 部署中将其禁用；回滚时会恢复部署前配置。
 
-v0.36.0 路线 C 与精确补充切片的热键和输出：
+v0.37.0 路线 C 与精确补充切片的热键和输出：
 
 - `Ctrl+Shift+F5`：在受支持的稳定普通小关手动保存；每次正常波次生成后也会自动保存。
 - `Ctrl+Shift+F6`：读取唯一检查点并执行语义重开。
@@ -125,7 +131,7 @@ v0.36.0 路线 C 与精确补充切片的热键和输出：
 - 精确补充：`Mods\QuantumCheckpoint\Checkpoint\route-c-exact-spawn-plan.json`；与主检查点校验和绑定，缺失或失败时安全降级为路线 C。
 - 牌库/手牌补充：`Mods\QuantumCheckpoint\Checkpoint\route-c-exact-player-zones.json`；schema 4 要求所有活动玩家卡位于牌库/手牌且总集合完全匹配，按原生顺序恢复手牌数量，并核验游戏公开容量。
 - 墓地补充：`Mods\QuantumCheckpoint\Checkpoint\route-c-exact-player-trash.json`；schema 5 要求受支持卡牌完整分布于牌库、手牌和墓地，场上/待处理区为空。支持已验证的一张额外苹果，通过原生 `DEFAULT` MoveCard 重建并严格复核三区顺序。
-- 手牌生命/计数补充：`Mods\QuantumCheckpoint\Checkpoint\route-c-exact-player-hand-health.json`；schema 2 按原生 HAND 位置记录完整 HEALTH 修正及 generic 计数（0–256），special 计数须为空。当前仅支持默认基础生命、非负 HEALTH 修正且当前生命等于上限；新布局中非空手牌必须关联此文件。旧 schema 1 继续兼容。
+- 手牌生命/计数补充：`Mods\QuantumCheckpoint\Checkpoint\route-c-exact-player-hand-health.json`；schema 3 按原生 HAND 位置记录基础生命、完整 HEALTH 修正及 generic 计数（0–256），special 计数须为空。基础生命须为正且有界，只允许相对所选定义非负增长，HEALTH 修正非负、无独立生命调整且当前生命等于上限。HAND 3 必须依赖具有保存时技能成员证明的 Z4/T5/F8 布局；旧 HAND 1/2 兼容读取，仍要求定义基础生命。
 - 角色充能补充：`Mods\QuantumCheckpoint\Checkpoint\route-c-exact-character-charge.json`；只保存低于满充阈值的值，恢复时通过公开增量 API 写回并由 Getter 复核。
 - 玩家场地补充：`Mods\QuantumCheckpoint\Checkpoint\route-c-exact-player-field.json`；schema 8 限受支持卡牌、空 PENDING，统一恢复墓地、场格、生命、攻击和计数器。按真实牌序分配同名副本，允许空牌库/手牌和已验证的一张额外苹果；完整集合和原生暂存规划仍须通过验证。
 - 回合进度补充：`Mods\QuantumCheckpoint\Checkpoint\route-c-exact-turn-progress.json`；schema 2 成组保存全局回合、抽牌基础倒计时与修正量、累计威胁；同时核验游戏自行计算的抽牌缓存。旧 schema 1 只用于读取诊断，需重新保存以启用战斗补充。
