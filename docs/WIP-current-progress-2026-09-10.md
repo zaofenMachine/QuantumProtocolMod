@@ -1,8 +1,18 @@
 # QuantumCheckpoint 当前工作进度（临时续接记录）
 
-> 2026-09-30 已按用户新指示恢复推进；沿“小关重开＋玩家精确恢复”，周额度剩余约 10% 时收尾并汇报。下方 9 月 20 日的停工指示已被本次继续指示替代。
+> 2026-09-30 本轮沿“小关重开＋玩家精确恢复”继续，按用户要求在周额度剩余约 10% 时收尾。当前入口为第三十八阶段；下方均保留各阶段发生时的记录，不代表最新部署和停机状态。
 
-## 2026-09-30 第三十七阶段已验收，继续下一观测切片
+## 2026-09-30 第三十八阶段：资格缺口已复现，本轮已收尾
+
+当前 v0.39.0，生产 DLL `0F514C38A637D6A26D6497886A658FF86E632F8A6CC5A6D3263AA7C27A646881`，实际编译 Mod 源码 `3167A2FB4671020B0960FAAC16682E9C1C151D7D1C86DEE572204AC7B6F617D7`。本阶段只加入独立 F1 `nativeEffectQualification:` 观测，没有改保存、恢复、持久化或动作写入。生产 OFF 构建 4/4 CTest，开发夹具标记关闭，源码经独立范围审计。
+
+实机已确认：长弓 ONCE 发动后通过普通上升涡流返手仍为 used=1；正常操作进入合法 T6/HAND3 保存范围后，恢复出的对应卡却为 used=0，flags 始终 [0]。重建 Bow 普通出牌并点击技能后再次 used0→1，UI NONE→COMPLETE/USED_ONCE。当前报告 requested/passed 不能代表完整资格恢复；未修改的 25 项比较中三项玩家历史相关检查仍失败，未放宽为通过。两个超范围保存和一次误拖苹果均保留，不计正例。
+
+证据根 `F:/Project/QuantumProtoclMod.runtime-evidence/20260930-effect-qualification`。入口为 `validation-summary.json`、`freeze-revalidation-index.json` 和 `phase38-final-tooling`；跨恢复资格缺口与再次使用以修正后冻结工具复验为准，初版工具对前一结论文件信任过强的缺陷及原结果均保留。原用户检查点在最终观察版通过既有全 25 项检查；原 17 个检查点文件与 4 个 SaveGames 已逐字节还原，主校验和 `81095982711C71E2`。游戏正常关闭，临时最小化的 Genesis 窗口已还原，最终记录为 `session-cleanup-final.json`。首次纯预检失败的 `session-cleanup.json` 未改游戏/存档，不能当最终状态。完整范围见[第三十八阶段](phase-38-effect-qualification-observation.md)。第三十七阶段已提交推送 `eeafdff6cec00d219d051ba7729e792a31c42912`，54 个冻结工具文件及 16 组复验索引保存在其独立证据根。
+
+下次优先处理资格覆盖声明和保守门禁，再单独推进受限 ONCE 恢复；具体设计随本阶段工具归档的 `runtime/phase38-next-qualification-plan.md`。先验证默认 flags 的明确 factory/profile，未知或动态变化不能按 used0 当作安全；旧检查点缺资格来源就保留 unknown，不能从重建值倒推。随后只在完整身份/签名/队列守卫下试验基础 Bow 的一次 used0→1，禁止调用 reset/false 或直接写 flags。补未用、同名两张、真正刷新、动态 ONCE+used0，以及恢复后普通尝试确实被阻止的对照。其余技能私有历史、LEVEL、独立生命调整、STORAGE/能力卡仍不扩域，重编程和敌人精确恢复继续搁置。
+
+## 2026-09-30 第三十七阶段里程碑（历史记录）
 
 v0.38.0 已实现 Z5/T6/F9 的 DECK/TRASH 非负基础生命增长与隐藏 CardFace 数值同步，HAND3 保持独立。最终生产 DLL `345C7D029506F7E1817FD04BC20D65914D535042B654B8E372DE8EC07DAD47BB`，Mod 源码 `7B932C51EE8EC912817978585113F7FC2E78F3EAA13BA545AC1C9784057F1179`；ON/OFF 各 4/4 CTest，生产测试标记关闭。八组最终构建恢复通过全 25 项玩家对照及适用 UI 检查，覆盖牌堆成长、同名副本、场地／墓地、生成卡、全墓地、旧 HAND2、重存 HAND3/F9 和原用户检查点；另有 AAD 五组与 CDEA 三组按各自 DLL 保留。
 

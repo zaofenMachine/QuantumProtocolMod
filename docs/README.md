@@ -1,8 +1,8 @@
 # 文档索引
 
-当前入口（2026-09-20）：既定方向为“小关重开 + 玩家精确恢复”，重编程与敌人精确恢复保持搁置。v0.37.0 的 HAND3 基础生命、HEALTH 修正与 generic 计数联合恢复，以及恢复 MOVE 的成长抑制和技能显示补齐、排序见 [第三十六阶段](phase-36-player-hand-base-health.md)。HAND 1/2 与 Z4/T5/F8 保存证明的边界继续保留；私有效果历史、LEVEL 修正、独立生命调整与 STORAGE 运行态精确恢复仍不覆盖。
+当前入口（2026-09-30）：方向为“小关重开 + 玩家精确恢复”，重编程与敌人精确恢复保持搁置。[第三十七阶段](phase-37-player-zone-base-health.md)完成 DECK/TRASH 基础生命与稳定捕获；[第三十八阶段](phase-38-effect-qualification-observation.md)在 v0.39.0 加入只读资格观测，实机确认已用 ONCE 在恢复后丢失并可再次发动。该缺口尚未修复，不能把恢复报告 passed 当完整玩家状态证明。
 
-原始用户检查点已完成最终恢复和 17 文件逐字节核对；14 组生产完整玩家对照与 2 组历史可用范围验证分开记录，后者已重存建立完整原生基线。稳定窗口正常抽牌导致状态漂移后的一次普通回退已通过独立验证，无重复数值修复。提交与归档信息见本阶段证据目录的 validation-summary.json；按用户要求在本轮完成后停下汇报。续接先读 [当前工作进度](WIP-current-progress-2026-09-10.md) 文首和 [当前技术状态](technical-status.md)，勿沿用下方历史阶段的待办。
+原用户检查点在最终观察版上通过既有全 25 项对照；原始备份、文件还原、游戏关闭与提交记录见新阶段证据目录的 validation-summary.json 和 session-cleanup-final.json。续接先读 [当前工作进度](WIP-current-progress-2026-09-10.md) 文首和 [当前技术状态](technical-status.md)，勿沿用下方历史阶段的待办。
 
 以下文件是后续维护时应优先更新的权威文档：
 
@@ -72,3 +72,6 @@
 - [phase-35-player-effect-membership-guards.md](phase-35-player-effect-membership-guards.md)：技能成员捕获/恢复门禁、布局证明版本与旧补充失效。
 
 - [phase-36-player-hand-base-health.md](phase-36-player-hand-base-health.md)：HAND3 基础生命与 HEALTH/generic 联合恢复、正常出牌重置、同名卡位置绑定、MOVE 防重复成长、技能显示补缺与子集排序，以及版本拒绝和实机范围。
+
+- [phase-37-player-zone-base-health.md](phase-37-player-zone-base-health.md)：牌库／墓地基础生命、隐藏卡数值同步、捕获安定检查和自动保存重试。
+- [phase-38-effect-qualification-observation.md](phase-38-effect-qualification-observation.md)：只读 ONCE/flags 观测、普通返手保留资格，以及恢复后资格丢失并可再次发动的实机证据。

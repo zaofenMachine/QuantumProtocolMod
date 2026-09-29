@@ -3551,6 +3551,258 @@ namespace QuantumCheckpoint
             }
         }
 
+        // Phase 38 observation prototype only. Keep this independent of the
+        // persisted effect descriptor and all exact capture/restore predicates.
+        struct NativeEffectQualificationEntry
+        {
+            const void* address{};
+            std::array<std::uint8_t, 12> bytes{};
+            auto operator==(const NativeEffectQualificationEntry&) const -> bool = default;
+        };
+
+        struct NativeEffectQualification
+        {
+            std::uint8_t used_once{};
+            std::array<std::uint8_t, 0x50> flags_header{};
+            std::vector<std::uint32_t> allocation_words{};
+            std::vector<NativeEffectQualificationEntry> entries{};
+            std::vector<std::uint8_t> flags{};
+            std::uint8_t flags_mask{};
+            auto operator==(const NativeEffectQualification&) const -> bool = default;
+        };
+
+        auto read_native_effect_qualification(const NativeEffectDescriptor& effect)
+            -> NativeEffectQualification
+        {
+            if (GetCurrentThreadId() != g_game_thread_id.load(std::memory_order_acquire))
+                throw std::runtime_error{"effect qualification observation requires the game thread"};
+            // The caller has just validated descriptor ownership and signatures.
+            // Extend its 0x91 read bound to include used+91 and the complete
+            // flags set header at +98. Never follow or invoke hash bucket links.
+            if (!effect.object || !address_is_readable(effect.object, 0xE8))
+                throw std::runtime_error{"native effect qualification fields are unreadable"};
+            const auto* storage = static_cast<const std::byte*>(effect.object) + 0x98;
+            NativeEffectQualification value{};
+            value.used_once = read_native_value<std::uint8_t>(effect.object, 0x91);
+            if (value.used_once > 1)
+                throw std::runtime_error{"native effect usedOnce byte is outside 0..1"};
+            std::memcpy(value.flags_header.data(), storage, value.flags_header.size());
+            const auto elements = read_native_sparse_elements(storage, 12);
+            if (elements.size() > 8
+                || std::memcmp(value.flags_header.data(), storage, value.flags_header.size()) != 0)
+                throw std::runtime_error{"native effect flags header changed or exceeds eight members"};
+            const auto slots = read_native_value<std::int32_t>(value.flags_header.data(), 8);
+            // Explicitly bound the copied header before deriving a byte count.
+            if (slots < 0 || slots > 128)
+                throw std::runtime_error{"native effect flags copied slot count is invalid"};
+            const auto* words = read_native_value<const void*>(value.flags_header.data(), 0x20);
+            if (!words) words = storage + 0x10;
+            const auto word_count = static_cast<std::size_t>((slots + 31) / 32);
+            if (word_count && !address_is_readable(words, word_count * sizeof(std::uint32_t)))
+                throw std::runtime_error{"native effect flags allocation words are unreadable"};
+            value.allocation_words.resize(word_count);
+            if (word_count)
+                std::memcpy(value.allocation_words.data(), words, word_count * sizeof(std::uint32_t));
+            for (const auto* entry : elements)
+            {
+                if (!address_is_readable(entry, 12))
+                    throw std::runtime_error{"native effect flags entry is unreadable"};
+                NativeEffectQualificationEntry observed{.address = entry};
+                std::memcpy(observed.bytes.data(), entry, observed.bytes.size());
+                const auto flag = observed.bytes[0];
+                if (flag > 7 || (value.flags_mask & (std::uint8_t{1} << flag)))
+                    throw std::runtime_error{"native effect flags contain an invalid or repeated key"};
+                value.flags_mask = static_cast<std::uint8_t>(value.flags_mask | (std::uint8_t{1} << flag));
+                value.flags.push_back(flag);
+                value.entries.push_back(observed);
+            }
+            std::sort(value.flags.begin(), value.flags.end());
+            if (!address_is_readable(effect.object, 0xE8)
+                || read_native_value<std::uint8_t>(effect.object, 0x91) != value.used_once
+                || std::memcmp(value.flags_header.data(), storage, value.flags_header.size()) != 0
+                || (word_count && (!address_is_readable(words, word_count * sizeof(std::uint32_t))
+                    || std::memcmp(value.allocation_words.data(), words,
+                        word_count * sizeof(std::uint32_t)) != 0))
+                || read_native_sparse_elements(storage, 12) != elements)
+                throw std::runtime_error{"native effect qualification header or allocation changed during observation"};
+            for (const auto& entry : value.entries)
+                if (!address_is_readable(entry.address, entry.bytes.size())
+                    || std::memcmp(entry.bytes.data(), entry.address, entry.bytes.size()) != 0)
+                    throw std::runtime_error{"native effect qualification entry changed during observation"};
+            return value;
+        }
+
+        auto append_native_effect_qualification(ObjectSnapshot& snapshot, UObject* object) -> void
+        {
+            try
+            {
+                if (GetCurrentThreadId() != g_game_thread_id.load(std::memory_order_acquire))
+                    throw std::runtime_error{"effect qualification observation requires the game thread"};
+                const auto live = find_route_c_objects();
+                const auto api = validated_native_move_card_api(live.card_engine);
+                const auto membership = read_native_card_effects(live.card_engine, object);
+                const auto module_base = reinterpret_cast<std::uintptr_t>(GetModuleHandleW(L"Quantum-Win64-Shipping.exe"));
+                const auto signature = [&](std::uintptr_t rva, const auto& bytes) {
+                    const auto* address = reinterpret_cast<const std::uint8_t*>(module_base + rva);
+                    if (!address_is_readable(address, bytes.size())
+                        || !std::equal(bytes.begin(), bytes.end(), address))
+                        throw std::runtime_error{"native effect qualification layout signature changed"};
+                };
+                // Pure used-byte getter; signatures prove fields, not calls.
+                signature(0xE32AE0, std::array<std::uint8_t, 8>{0x0F,0xB6,0x81,0x91,0,0,0,0xC3});
+                signature(0xE18510, std::array<std::uint8_t, 18>{
+                    0x8B,0x81,0xA0,0,0,0,0x44,0x0F,0xB6,0xDA,0x3B,0x81,0xCC,0,0,0,0x74,0x46});
+                // Hash size+E0 and inline hash+ D0 delimit the 0x50 set
+                // header. Its raw bytes are rechecked, never traversed.
+                signature(0xE18522, std::array<std::uint8_t, 14>{
+                    0x4C,0x63,0x81,0xE0,0,0,0,0x4C,0x8D,0x91,0xD0,0,0,0});
+                signature(0xE1854A, std::array<std::uint8_t, 18>{
+                    0x4C,0x8B,0x81,0x98,0,0,0,0x48,0x63,0xC8,0x48,0x8D,0x14,0x49,0x45,0x38,0x1C,0x90});
+
+                // Bind the full reflected CardInfoInstance and public card ID
+                // with the same established read-only getters used by F1.
+                // Require native pure zero-input struct getters, and keep their
+                // function/return layouts fixed across both observations.
+                const auto require_getter = [&](StringViewType name, std::size_t size) {
+                    auto* function = object->GetFunctionByNameInChain(name.data());
+                    auto* result = function ? function->GetReturnProperty() : nullptr;
+                    const auto address = function ? reinterpret_cast<std::uintptr_t>(function->GetFuncPtr()) : 0;
+                    if (!function || !function->HasAllFunctionFlags(
+                            static_cast<EFunctionFlags>(FUNC_Native | FUNC_BlueprintPure))
+                        || !result || !result->IsA<FStructProperty>()
+                        || function->GetParmsSize() != size || result->GetElementSize() != size
+                        || address < module_base || address - module_base >= ExpectedGameExecutableSize
+                        || !address_is_readable(reinterpret_cast<const void*>(address), 1))
+                        throw std::runtime_error{"effect qualification card getter contract changed"};
+                    for (auto* property : function->ForEachProperty())
+                        if (property->HasAnyPropertyFlags(CPF_Parm)
+                            && !property->HasAnyPropertyFlags(CPF_ReturnParm))
+                            throw std::runtime_error{"effect qualification card getter has input parameters"};
+                    if (name == STR("getCardInfoInstance"))
+                    {
+                        auto* type = static_cast<FStructProperty*>(result)->GetStruct();
+                        auto* info = type ? type->GetPropertyByNameInChain(STR("CardInfo")) : nullptr;
+                        auto* upgrade = type ? type->GetPropertyByNameInChain(STR("upgradeLevel")) : nullptr;
+                        if (!info || !info->IsA<FStructProperty>() || info->GetElementSize() != 0xB0
+                            || !upgrade || upgrade->GetElementSize() != 4)
+                            throw std::runtime_error{"effect qualification CardInfoInstance fields changed"};
+                    }
+                    return function;
+                };
+                auto* info_getter = require_getter(STR("getCardInfoInstance"), 0xB8);
+                auto* id_getter = require_getter(STR("getId"), 16);
+                const auto info_getter_address = info_getter->GetFuncPtr();
+                const auto id_getter_address = id_getter->GetFuncPtr();
+                const auto getter_text = [&](StringViewType name) {
+                    const auto value = export_zero_argument_getter(object, name);
+                    if (!value || value->value.empty() || value->value.size() > 1024 * 1024)
+                        throw std::runtime_error{"effect qualification card identity getter is unavailable"};
+                    return value->value;
+                };
+                const auto card_info = getter_text(STR("getCardInfoInstance"));
+                const auto card_id = getter_text(STR("getId"));
+                const auto location = native_card_location(api.engine_state, membership.state, api.get_card_location);
+                if (!location || !address_is_readable(static_cast<const std::byte*>(membership.object) + 0x18, 16)
+                    || read_native_card_effects(live.card_engine, object) != membership)
+                    throw std::runtime_error{"effect qualification card identity changed before reading fields"};
+                std::array<std::uint8_t, 16> card_guid{};
+                std::memcpy(card_guid.data(), static_cast<const std::byte*>(membership.object) + 0x18, card_guid.size());
+                // FGuid text exports its A/B/C/D uint32 values as four
+                // uppercase eight-digit groups; raw GuidBytes below instead
+                // preserves memory byte order. Bind the actor getter to the
+                // native card GUID, not merely two independently stable IDs.
+                std::ostringstream native_card_id{};
+                native_card_id << std::hex << std::uppercase << std::setfill('0');
+                for (std::size_t part{}; part < 4; ++part)
+                    native_card_id << std::setw(8) << read_native_value<std::uint32_t>(card_guid.data(), part * 4);
+                if (native_card_id.str() != card_id)
+                    throw std::runtime_error{"effect qualification actor ID differs from the native card GUID"};
+                std::vector<NativeEffectQualification> values{};
+                for (const auto& effect : membership.descriptors)
+                    values.push_back(read_native_effect_qualification(effect));
+                if (read_native_card_effects(live.card_engine, object) != membership)
+                    throw std::runtime_error{"native effect qualification membership changed after reading fields"};
+                for (std::size_t index{}; index < values.size(); ++index)
+                    if (read_native_effect_qualification(membership.descriptors[index]) != values[index])
+                        throw std::runtime_error{"native effect qualification fields changed between reads"};
+                if (require_getter(STR("getCardInfoInstance"), 0xB8) != info_getter
+                    || require_getter(STR("getId"), 16) != id_getter
+                    || info_getter->GetFuncPtr() != info_getter_address || id_getter->GetFuncPtr() != id_getter_address
+                    || getter_text(STR("getCardInfoInstance")) != card_info || getter_text(STR("getId")) != card_id
+                    || read_native_card_effects(live.card_engine, object) != membership
+                    || native_card_location(api.engine_state, membership.state, api.get_card_location) != location
+                    || !address_is_readable(static_cast<const std::byte*>(membership.object) + 0x18, card_guid.size())
+                    || std::memcmp(card_guid.data(), static_cast<const std::byte*>(membership.object) + 0x18, card_guid.size()) != 0)
+                    throw std::runtime_error{"native effect qualification final identity binding changed"};
+                // The final getters precede one last field read: even an
+                // unexpected getter side effect must not publish stale fields.
+                for (std::size_t index{}; index < values.size(); ++index)
+                    if (read_native_effect_qualification(membership.descriptors[index]) != values[index])
+                        throw std::runtime_error{"native effect qualification fields changed during final identity getters"};
+                if (read_native_card_effects(live.card_engine, object) != membership)
+                    throw std::runtime_error{"native effect qualification final membership changed"};
+
+                const auto guid_bytes = [](const auto& bytes) {
+                    std::ostringstream text{};
+                    text << std::hex << std::uppercase << std::setfill('0');
+                    for (const auto byte : bytes) text << std::setw(2) << static_cast<unsigned int>(byte);
+                    return text.str();
+                };
+                std::string ordered{"["};
+                for (std::size_t index{}; index < values.size(); ++index)
+                {
+                    const auto& effect = membership.descriptors[index];
+                    const auto& value = values[index];
+                    if (index) ordered += ',';
+                    ordered += "{\"ordinal\":" + std::to_string(index)
+                        + ",\"cardGuidBytes\":\"" + guid_bytes(card_guid)
+                        + "\",\"effectGuidBytes\":\"" + guid_bytes(effect.guid)
+                        + "\",\"effectObject\":\"" + format_address(reinterpret_cast<std::uintptr_t>(effect.object))
+                        + "\",\"effectController\":\"" + format_address(reinterpret_cast<std::uintptr_t>(effect.controller))
+                        + "\",\"tag\":\"" + json_escape(effect.tag) + "\",\"type\":" + std::to_string(effect.type)
+                        + ",\"factoryKey\":\"" + json_escape(effect.factory_key)
+                        + "\",\"usedOnceRaw\":" + std::to_string(value.used_once) + ",\"flags\":[";
+                    for (std::size_t flag_index{}; flag_index < value.flags.size(); ++flag_index)
+                    {
+                        if (flag_index) ordered += ',';
+                        ordered += std::to_string(value.flags[flag_index]);
+                    }
+                    const bool once = (value.flags_mask & 1) != 0;
+                    ordered += "],\"flagsMask\":" + std::to_string(value.flags_mask)
+                        + ",\"oncePresent\":" + (once ? "true" : "false")
+                        + ",\"derivedOnceConsumed\":" + (once && value.used_once == 1 ? "true" : "false") + '}';
+                }
+                ordered += ']';
+                // Publish only after the entire observation has passed. These
+                // strings are diagnostics, never persisted recovery authority.
+                const std::vector<PropertySnapshot> properties{
+                    {"nativeEffectQualification:schemaVersion", "1"},
+                    {"nativeEffectQualification:layout", "qp-shipping-effect-91-98-v1"},
+                    {"nativeEffectQualification:executableSha256", std::string{ExpectedGameExecutableSha256}},
+                    {"nativeEffectQualification:cardId", card_id},
+                    {"nativeEffectQualification:cardGuidBytes", guid_bytes(card_guid)},
+                    {"nativeEffectQualification:cardInfoInstance", card_info},
+                    {"nativeEffectQualification:cardInfoGetterRva", format_address(
+                        reinterpret_cast<std::uintptr_t>(info_getter_address) - module_base)},
+                    {"nativeEffectQualification:cardIdGetterRva", format_address(
+                        reinterpret_cast<std::uintptr_t>(id_getter_address) - module_base)},
+                    {"nativeEffectQualification:nativeLocation", std::to_string(*location)},
+                    {"nativeEffectQualification:cardState", format_address(reinterpret_cast<std::uintptr_t>(membership.state))},
+                    {"nativeEffectQualification:cardObject", format_address(reinterpret_cast<std::uintptr_t>(membership.object))},
+                    {"nativeEffectQualification:cardController", format_address(reinterpret_cast<std::uintptr_t>(membership.controller))},
+                    {"nativeEffectQualification:effectArray", format_address(reinterpret_cast<std::uintptr_t>(membership.array))},
+                    {"nativeEffectQualification:ordered", std::move(ordered)},
+                    {"nativeEffectQualification:status", "verified-native-effect-qualification"},
+                };
+                snapshot.properties.insert(snapshot.properties.end(), properties.begin(), properties.end());
+            }
+            catch (const std::exception& error)
+            {
+                snapshot.properties.push_back({"nativeEffectQualification:status", "unavailable"});
+                snapshot.properties.push_back({"nativeEffectQualification:readError", error.what()});
+            }
+        }
+
         // Call only after a native observer has validated the state owner and layout.
         auto decode_player_stat_modifiers(const void* state, std::uint8_t wanted, bool allow_health)
             -> std::vector<PlayerStatModifier>
@@ -11266,6 +11518,7 @@ namespace QuantumCheckpoint
                     append_native_card_level(snapshot, object);
                     append_native_card_counters(snapshot, object);
                     append_native_card_effects(snapshot, object);
+                    append_native_effect_qualification(snapshot, object);
                     append_getters(snapshot, object, InGameCardGetters);
                     append_function_pointers(
                         snapshot, object, InGameCardDiagnosticFunctions);
@@ -14416,9 +14669,9 @@ namespace QuantumCheckpoint
         QuantumCheckpointMod()
         {
             ModName = STR("QuantumCheckpoint");
-            ModVersion = STR("0.38.0");
+            ModVersion = STR("0.39.0");
 #if defined(QUANTUM_CHECKPOINT_RUNTIME_TEST_FIXTURES)
-            ModVersion = STR("0.38.0-test-fixtures");
+            ModVersion = STR("0.39.0-test-fixtures");
 #endif
             ModDescription = STR("Route C checkpoint with optional exact-state supplements");
             ModAuthors = STR("zaofenMachine and contributors");
