@@ -21,13 +21,18 @@ namespace QuantumCheckpoint
     inline constexpr int ExactPlayerZonesEffectMembershipSchemaVersion = 4;
     inline constexpr int ExactPlayerTrashEffectMembershipSchemaVersion = 5;
     inline constexpr int ExactPlayerFieldEffectMembershipSchemaVersion = 8;
-    inline constexpr int ExactPlayerZonesSchemaVersion = 4;
+    // Fixed minima for native-index DECK/TRASH base-HP records in the selected
+    // layout. Older schemas retain their default-only off-field numeric policy.
+    inline constexpr int ExactPlayerZonesBaseHealthSchemaVersion = 5;
+    inline constexpr int ExactPlayerTrashBaseHealthSchemaVersion = 6;
+    inline constexpr int ExactPlayerFieldBaseHealthSchemaVersion = 9;
+    inline constexpr int ExactPlayerZonesSchemaVersion = 5;
     inline constexpr std::string_view ExactPlayerZonesCheckpointKind =
         "route-c-exact-player-zones";
-    inline constexpr int ExactPlayerTrashSchemaVersion = 5;
+    inline constexpr int ExactPlayerTrashSchemaVersion = 6;
     inline constexpr std::string_view ExactPlayerTrashCheckpointKind =
         "route-c-exact-player-trash";
-    inline constexpr int ExactPlayerFieldSchemaVersion = 8;
+    inline constexpr int ExactPlayerFieldSchemaVersion = 9;
     inline constexpr std::string_view ExactPlayerFieldCheckpointKind =
         "route-c-exact-player-field";
     // Fixed minimum for replaying HAND base-HP gains; keep older schemas default-only.
@@ -131,6 +136,9 @@ namespace QuantumCheckpoint
         std::string player_hand{};
         // Latest schemas require the linked hand-health payload for nonempty HAND.
         std::string player_hand_health_checksum{};
+        // One base=max, modifier-free HEALTH record per native DECK index.
+        // An empty zone has an empty record string. Legacy schemas leave it empty.
+        std::string player_deck_base_health_states{};
         std::string payload_checksum{};
     };
 
@@ -151,6 +159,8 @@ namespace QuantumCheckpoint
         std::string player_hand{};
         std::string player_trash{};
         std::string player_hand_health_checksum{};
+        std::string player_deck_base_health_states{};
+        std::string player_trash_base_health_states{};
         std::string payload_checksum{};
     };
 
@@ -184,6 +194,8 @@ namespace QuantumCheckpoint
         std::string player_field_health_states{};
         std::string player_field_counter_states{};
         std::string player_hand_health_checksum{};
+        std::string player_deck_base_health_states{};
+        std::string player_trash_base_health_states{};
         std::string payload_checksum{};
     };
 

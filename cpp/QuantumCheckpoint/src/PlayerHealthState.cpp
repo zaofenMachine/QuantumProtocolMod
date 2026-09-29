@@ -55,6 +55,60 @@ namespace QuantumCheckpoint
         return true;
     }
 
+    auto validate_player_off_field_base_health_for_definition(const PlayerHealthState& state,
+        std::int32_t definition_health, std::string& error) -> bool
+    {
+        error.clear();
+        if (!validate_player_health_state({definition_health, definition_health, {}}, error))
+        {
+            error = "DECK/TRASH definition health is outside supported positive bounds: " + error;
+            return false;
+        }
+        if (!validate_player_health_state(state, error)) return false;
+        if (state.base_health != state.max_health || !state.modifiers.empty())
+        {
+            error = "DECK/TRASH base-health records require base=max with no HEALTH modifiers";
+            return false;
+        }
+        if (state.base_health < definition_health)
+        {
+            error = "DECK/TRASH base HP below its selected definition is unsupported";
+            return false;
+        }
+        return true;
+    }
+
+    auto parse_player_off_field_base_health_states(std::string_view text, std::string& error)
+        -> std::optional<std::vector<PlayerHealthState>>
+    {
+        error.clear();
+        if (text.size() > 65536)
+        {
+            error = "DECK/TRASH base-health records exceed the size bound";
+            return std::nullopt;
+        }
+        std::vector<PlayerHealthState> result{};
+        if (text.empty()) return result;
+        for (;;)
+        {
+            if (result.size() >= 128)
+            {
+                error = "DECK/TRASH base-health records exceed 128 cards";
+                return std::nullopt;
+            }
+            const auto separator = text.find(';');
+            const auto record = parse_player_health_states(text.substr(0, separator), error);
+            if (!record || record->size() != 1) return std::nullopt;
+            // Definition 1 checks the common positive lower bound only; callers
+            // must still compare against each selected immutable card definition.
+            if (!validate_player_off_field_base_health_for_definition(record->front(), 1, error))
+                return std::nullopt;
+            result.push_back(record->front());
+            if (separator == std::string_view::npos) return result;
+            text.remove_prefix(separator + 1);
+        }
+    }
+
     auto serialize_player_health_states(const std::vector<PlayerHealthState>& states) -> std::string
     {
         std::vector<PlayerAttackState> records{};

@@ -43,6 +43,7 @@
 #include <Unreal/AActor.hpp>
 #include <Unreal/FProperty.hpp>
 #include <Unreal/FOutputDevice.hpp>
+#include <Unreal/FWeakObjectPtr.hpp>
 #include <Unreal/Hooks.hpp>
 #include <Unreal/Property/FArrayProperty.hpp>
 #include <Unreal/Property/FObjectProperty.hpp>
@@ -53,6 +54,7 @@
 #include <Unreal/UFunction.hpp>
 #include <Unreal/UFunctionStructs.hpp>
 #include <Unreal/UObject.hpp>
+#include <Unreal/UObjectArray.hpp>
 #include <Unreal/UObjectGlobals.hpp>
 
 namespace QuantumCheckpoint
@@ -266,6 +268,22 @@ namespace QuantumCheckpoint
             PlayerCounterState hand_counter_before_queue{};
             std::chrono::steady_clock::time_point hand_counter_queued_at{};
             bool off_field_statistics_covered{};
+            bool zone_base_health_initialized{};
+            std::string zone_base_health_status{"legacy-default-only"};
+            std::string zone_base_health_reason{};
+            std::vector<PlayerHealthState> zone_base_health_prefix{};
+            std::vector<PendingNativeTrashMove> zone_base_health_targets{};
+            std::optional<std::size_t> zone_base_health_pending_card{};
+            PlayerHealthState zone_base_health_before_queue{};
+            std::chrono::steady_clock::time_point zone_base_health_queued_at{};
+            std::size_t zone_base_health_actions_queued{};
+            // UI references and shared owners are pinned before any D/T write.
+            // Only the first completed numeric pass may synchronize stale UI.
+            std::vector<std::array<UObject*, 7>> zone_base_health_ui_objects{};
+            std::vector<const void*> zone_base_health_owners{};
+            std::vector<std::string> zone_base_health_ids{};
+            bool zone_base_health_ui_verified{};
+            std::size_t zone_base_health_ui_synchronizations{};
             bool player_effect_membership_startup_checked{};
             std::string player_effect_membership_status{"not-applicable-no-player-layout"};
             std::string player_effect_membership_reason{};
@@ -275,11 +293,124 @@ namespace QuantumCheckpoint
             std::vector<PendingNativeTrashMove> move_overlay_targets{};
         };
 
+        struct RouteCCaptureObjectIdentity
+        {
+            UObject* object{};
+            std::int32_t internal_index{};
+            std::string full_name{};
+            FWeakObjectPtr weak{};
+            bool weak_verified{};
+        };
+
+        // The SDK has no serial allocator. Its public deletion listener supplies
+        // a lifetime witness for the normally serial-less spawner. Global
+        // deletions invalidate only the pinning window; an established pin is
+        // invalidated only by deletion of its one watched spawner. No callback
+        // dereferences a UObject or touches pending state. This is a deletion
+        // notification witness, not a GC lock or concurrent UObject access API.
+        // This mod requires HotReloadSystem=0 and process restart to replace its
+        // DLL: the SDK's array lock does not provide a hot-unload callback barrier.
+        struct RouteCCaptureDeleteListener final : FUObjectDeleteListener
+        {
+            std::atomic<std::uint64_t> epoch{1};
+            std::atomic<const UObjectBase*> watched_spawner{};
+            std::atomic<std::uint64_t> target_epoch{1};
+            std::atomic_bool ready{}, registered{}, shutdown{}, failed{};
+
+            struct ArrayLock
+            {
+                UObjectArray array{};
+                ArrayLock() { array.LockGUObjectArray(); }
+                ~ArrayLock() { array.UnlockGUObjectArray(); }
+                ArrayLock(const ArrayLock&) = delete;
+                auto operator=(const ArrayLock&) -> ArrayLock& = delete;
+            };
+
+            void NotifyUObjectDeleted(const UObjectBase* object, int32) noexcept override
+            {
+                epoch.fetch_add(1, std::memory_order_seq_cst);
+                if (object == watched_spawner.load(std::memory_order_seq_cst))
+                    target_epoch.fetch_add(1, std::memory_order_seq_cst);
+            }
+
+            // Only called while the array is alive and its SDK lock is held.
+            // Retain registered=true on failure so teardown can retry removal;
+            // the listener always has a stable static address, never a request's.
+            auto remove_locked() -> void
+            {
+                if (!registered.load(std::memory_order_acquire)) return;
+                UObjectArray::RemoveUObjectDeleteListener(this);
+                registered.store(false, std::memory_order_release);
+            }
+
+            void OnUObjectArrayShutdown() noexcept override
+            {
+                ready.store(false, std::memory_order_seq_cst);
+                watched_spawner.store(nullptr, std::memory_order_seq_cst);
+                epoch.fetch_add(1, std::memory_order_seq_cst);
+                target_epoch.fetch_add(1, std::memory_order_seq_cst);
+                if (shutdown.exchange(true, std::memory_order_acq_rel)) return;
+                // The SDK's own listeners remove themselves in this callback.
+                // Once it returns, all other paths must avoid GUObjectArray.
+                try { ArrayLock lock{}; remove_locked(); }
+                catch (...) { failed.store(true, std::memory_order_release); }
+            }
+
+            auto stop_before_mod_destruction() noexcept -> void
+            {
+                ready.store(false, std::memory_order_seq_cst);
+                watched_spawner.store(nullptr, std::memory_order_seq_cst);
+                epoch.fetch_add(1, std::memory_order_seq_cst);
+                target_epoch.fetch_add(1, std::memory_order_seq_cst);
+                if (shutdown.load(std::memory_order_acquire)
+                    || !registered.load(std::memory_order_acquire)) return;
+                try
+                {
+                    ArrayLock lock{};
+                    if (!shutdown.load(std::memory_order_acquire)) remove_locked();
+                }
+                catch (...) { failed.store(true, std::memory_order_release); }
+            }
+        };
+        RouteCCaptureDeleteListener g_route_c_capture_delete_listener{};
+
         struct PendingRouteCCapture
         {
             UObject* spawner{};
             std::int32_t wave_index{};
             std::chrono::steady_clock::time_point ready_at{};
+            std::chrono::steady_clock::time_point deadline{};
+            std::uint64_t request_id{};
+            std::size_t busy_retries{};
+            std::size_t open_waits{};
+            std::uint64_t delete_epoch{};
+            std::uint64_t target_epoch{};
+            bool delete_epoch_verified{};
+            RouteCCaptureObjectIdentity spawner_identity{}, world_identity{}, engine_identity{};
+            std::string source_level_name{}, active_stage_info{};
+        };
+
+        // Only these two pre-write native idle gates request queue-busy retry.
+        // Structural errors and all invalidation/write errors remain terminal.
+        enum class RouteCCaptureBusyPhase { BeforeRead, BeforeWrite };
+        class RouteCCaptureNativeActionsBusy : public std::runtime_error
+        {
+        public:
+            RouteCCaptureBusyPhase phase;
+            explicit RouteCCaptureNativeActionsBusy(RouteCCaptureBusyPhase value)
+                : std::runtime_error{value == RouteCCaptureBusyPhase::BeforeRead
+                    ? "Route C capture requires completed native actions and an empty deferred queue"
+                    : "native actions changed during capture; checkpoint files were not replaced"}, phase{value} {}
+        };
+
+        // Only automatic capture may wait for ordinary PROCESSING, before any
+        // checkpoint payload getters. Prompt/other states and pre-write state
+        // changes remain terminal; this is separate from native queue busy.
+        class RouteCCaptureProcessingWait : public std::runtime_error
+        {
+        public:
+            RouteCCaptureProcessingWait()
+                : std::runtime_error{"ordinary battle is PROCESSING without a prompt; automatic capture may wait"} {}
         };
 
         struct RouteCWaveObservation
@@ -299,6 +430,7 @@ namespace QuantumCheckpoint
         std::optional<PendingRouteCFallback> g_pending_route_c_fallback{};
         std::optional<RouteCCheckpoint> g_last_completed_route_c_checkpoint{};
         std::optional<PendingRouteCCapture> g_pending_route_c_capture{};
+        std::uint64_t g_route_c_capture_request_id{};
         std::optional<RouteCWaveObservation> g_route_c_wave_observation{};
         std::chrono::steady_clock::time_point g_next_route_c_wave_poll{};
         bool g_adopt_next_route_c_wave_without_capture{};
@@ -906,6 +1038,11 @@ namespace QuantumCheckpoint
         };
 
         auto validated_native_move_card_api(UObject* card_engine) -> NativeMoveCardApi;
+        auto native_restore_actions_settled(const void* state, std::string* observation = nullptr) -> bool;
+        auto registered_overlay_objects() -> std::set<UObject*>;
+        auto require_live_overlay_object(UObject* object, const void* world,
+                                         const std::set<UObject*>& registered) -> void;
+        auto update_route_c_capture() -> void;
         auto native_card_location(const void* engine_state,
                                   const void* card_state,
                                   NativeGetCardLocationFunction get_card_location)
@@ -3821,10 +3958,12 @@ namespace QuantumCheckpoint
         {
             std::vector<PlayerHealthState> hand_health{};
             std::vector<PlayerCounterState> hand_counters{};
+            std::vector<PlayerHealthState> deck_base_health{}, trash_base_health{};
         };
 
         auto validate_off_field_statistics(const RouteCBattleObjects& objects, bool allow_hand_health,
-                                           bool allow_hand_counters, int hand_health_schema = 1)
+                                           bool allow_hand_counters, int hand_health_schema = 1,
+                                           bool allow_zone_base_health = false)
             -> OffFieldPlayerStatistics
         {
             OffFieldPlayerStatistics result{};
@@ -3842,7 +3981,8 @@ namespace QuantumCheckpoint
                     if (level_verified == level.properties.end()
                         || read_native_value<std::int32_t>(card.state,0x110) != definition.level
                         || attack.base_attack != definition.attack
-                        || ((location != 0 || !allow_hand_health) && health.base_health != definition.health)
+                        || ((location == 0 ? !allow_hand_health : !allow_zone_base_health)
+                            && health.base_health != definition.health)
                         || !attack.modifiers.empty() || attack.current_attack != attack.base_attack
                         || parse_int32(required_getter_text(card.card,STR("getCurrentHealth"))) != health.max_health
                         || ((location != 0 || !allow_hand_counters) && counters.generic != 0)
@@ -3856,6 +3996,14 @@ namespace QuantumCheckpoint
                     {
                         if (!health.modifiers.empty() || health.max_health != health.base_health)
                             throw std::runtime_error{"DECK/TRASH or uncovered HAND requires default health"};
+                        if (location != 0)
+                        {
+                            std::string error{};
+                            if (allow_zone_base_health
+                                && !validate_player_off_field_base_health_for_definition(health, definition.health, error))
+                                throw std::runtime_error{"DECK/TRASH base health is outside the selected definition policy: " + error};
+                            (location == 1 ? result.deck_base_health : result.trash_base_health).push_back(health);
+                        }
                     }
                     else
                     {
@@ -3867,6 +4015,198 @@ namespace QuantumCheckpoint
                     if (location == 0) result.hand_counters.push_back(counters);
                 }
             return result;
+        }
+
+        auto ensure_route_c_capture_delete_listener() -> bool
+        {
+            auto& listener = g_route_c_capture_delete_listener;
+            if (listener.shutdown.load(std::memory_order_acquire)
+                || listener.failed.load(std::memory_order_acquire)
+                || UE4SSProgram::settings_manager.General.EnableHotReloadSystem
+                || GetCurrentThreadId() != g_game_thread_id.load(std::memory_order_acquire)) return false;
+            if (listener.ready.load(std::memory_order_acquire)) return true;
+            try
+            {
+                RouteCCaptureDeleteListener::ArrayLock lock{};
+                if (listener.shutdown.load(std::memory_order_acquire)) return false;
+                // Mark before Add: even a partial registration failure must use
+                // this same static listener for cleanup, and must never retry Add.
+                listener.registered.store(true, std::memory_order_release);
+                try { UObjectArray::AddUObjectDeleteListener(&listener); }
+                catch (...)
+                {
+                    listener.failed.store(true, std::memory_order_release);
+                    listener.remove_locked();
+                    throw;
+                }
+                listener.ready.store(true, std::memory_order_release);
+            }
+            catch (...)
+            {
+                listener.ready.store(false, std::memory_order_release);
+                listener.failed.store(true, std::memory_order_release);
+                append_route_c_trace("auto-capture.delete-listener.failed");
+                return false;
+            }
+            append_route_c_trace("auto-capture.delete-listener.ready");
+            return true;
+        }
+
+        auto route_c_capture_delete_epoch_matches(const PendingRouteCCapture& capture) -> bool
+        {
+            const auto& listener = g_route_c_capture_delete_listener;
+            return capture.delete_epoch_verified && !listener.shutdown.load(std::memory_order_seq_cst)
+                && listener.ready.load(std::memory_order_seq_cst)
+                && listener.watched_spawner.load(std::memory_order_seq_cst) == capture.spawner
+                && listener.target_epoch.load(std::memory_order_seq_cst) == capture.target_epoch;
+        }
+
+        auto pin_route_c_capture_object(UObject* object, const void* world,
+                                        const std::set<UObject*>& registered) -> RouteCCaptureObjectIdentity
+        {
+            require_live_overlay_object(object, world, registered);
+            RouteCCaptureObjectIdentity result{};
+            result.object = object;
+            result.internal_index = object->GetInternalIndex();
+            result.full_name = to_string(object->GetFullName());
+            // UE4SS reads an existing serial here; it does not allocate one.
+            // A serial-less spawner needs a separate deletion-epoch witness.
+            result.weak = object;
+            result.weak_verified = result.weak.Get() == object;
+            return result;
+        }
+
+        auto same_route_c_capture_object(const RouteCCaptureObjectIdentity& saved, UObject* current,
+                                         const void* world, const std::set<UObject*>& registered) -> bool
+        {
+            if (saved.object != current || !current || !registered.contains(current)) return false;
+            require_live_overlay_object(current, world, registered);
+            return current->GetInternalIndex() == saved.internal_index
+                && to_string(current->GetFullName()) == saved.full_name
+                && (!saved.weak_verified || saved.weak.Get() == current);
+        }
+
+        auto route_c_capture_retry_identity_available(const PendingRouteCCapture& capture) -> bool
+        {
+            return capture.world_identity.weak_verified && capture.engine_identity.weak_verified
+                && capture.world_identity.weak.Get() == capture.world_identity.object
+                && capture.engine_identity.weak.Get() == capture.engine_identity.object
+                && (capture.spawner_identity.weak_verified
+                    ? capture.spawner_identity.weak.Get() == capture.spawner
+                    : route_c_capture_delete_epoch_matches(capture));
+        }
+
+        auto route_c_capture_lifetime_identity(const PendingRouteCCapture& capture) -> std::string
+        {
+            if (!route_c_capture_retry_identity_available(capture)) return "unavailable";
+            return capture.spawner_identity.weak_verified ? "verified-weak-serial"
+                : "verified-weak-world-engine-spawner-delete";
+        }
+
+        auto make_pending_route_c_capture(UObject* spawner, std::int32_t wave,
+                                          std::chrono::steady_clock::time_point ready_at) -> PendingRouteCCapture
+        {
+            if (GetCurrentThreadId() != g_game_thread_id.load(std::memory_order_acquire)
+                || wave < 0 || wave > 1000)
+                throw std::runtime_error{"automatic capture scheduling requires a valid wave on the game thread"};
+            const bool listener_ready = ensure_route_c_capture_delete_listener();
+            auto& listener = g_route_c_capture_delete_listener;
+            // G brackets publishing the watch and every liveness/identity read.
+            // Publishing a different request always advances T. Same-wave
+            // coalescing must validate the old request before calling make.
+            const auto delete_epoch = listener.epoch.load(std::memory_order_seq_cst);
+            if (listener_ready)
+            {
+                listener.watched_spawner.store(spawner, std::memory_order_seq_cst);
+                listener.target_epoch.fetch_add(1, std::memory_order_seq_cst);
+            }
+            const auto target_epoch = listener.target_epoch.load(std::memory_order_seq_cst);
+            const auto registered = registered_overlay_objects();
+            require_live_overlay_object(spawner, nullptr, registered);
+            auto* world = reinterpret_cast<UObject*>(spawner->GetWorld());
+            require_live_overlay_object(world, nullptr, registered);
+            const auto objects = find_route_c_objects(world);
+            if (objects.spawner != spawner || !objects.card_engine || !objects.game_instance
+                || reflected_object_property(objects.card_engine, STR("mEnemySpawnController")) != spawner)
+                throw std::runtime_error{"automatic capture scheduling has no matching battle identity"};
+            PendingRouteCCapture result{};
+            result.spawner = spawner;
+            result.wave_index = wave;
+            result.ready_at = ready_at;
+            result.deadline = ready_at + std::chrono::seconds{30};
+            result.request_id = ++g_route_c_capture_request_id;
+            result.spawner_identity = pin_route_c_capture_object(spawner, world, registered);
+            result.world_identity = pin_route_c_capture_object(world, nullptr, registered);
+            result.engine_identity = pin_route_c_capture_object(objects.card_engine, world, registered);
+            result.source_level_name = required_text(export_property_text(objects.game_instance, STR("sourceLevelName")), "sourceLevelName");
+            result.active_stage_info = required_text(export_property_text(objects.game_instance, STR("activeStageInfo")), "activeStageInfo");
+            result.delete_epoch = delete_epoch;
+            result.target_epoch = target_epoch;
+            result.delete_epoch_verified = listener_ready;
+            if (listener_ready && (listener.epoch.load(std::memory_order_seq_cst) != delete_epoch
+                || !route_c_capture_delete_epoch_matches(result)))
+                throw std::runtime_error{"UObject deletion or shutdown occurred while pinning the automatic capture identity"};
+            return result;
+        }
+
+        auto validate_pending_route_c_capture(const PendingRouteCCapture& expected,
+                                              const RouteCBattleObjects& objects) -> void
+        {
+            if (!objects.spawner || !objects.card_engine || !objects.game_instance || !objects.bottom_bar)
+                throw std::runtime_error{"automatic capture lost its complete active battle"};
+            if (!expected.spawner_identity.weak_verified && expected.delete_epoch_verified
+                && !route_c_capture_delete_epoch_matches(expected))
+                throw std::runtime_error{"automatic capture spawner lifetime invalidated by target deletion, watch replacement or array shutdown"};
+            const auto registered = registered_overlay_objects();
+            auto* world = reinterpret_cast<UObject*>(objects.spawner->GetWorld());
+            if (!same_route_c_capture_object(expected.world_identity, world, nullptr, registered)
+                || !same_route_c_capture_object(expected.spawner_identity, objects.spawner, world, registered)
+                || !same_route_c_capture_object(expected.engine_identity, objects.card_engine, world, registered)
+                || ((expected.busy_retries != 0 || expected.open_waits != 0)
+                    && !route_c_capture_retry_identity_available(expected)))
+                throw std::runtime_error{"automatic capture battle identity changed or its retry lifetime is unverified"};
+            if (reflected_object_property(objects.card_engine, STR("mEnemySpawnController")) != objects.spawner)
+                throw std::runtime_error{"automatic capture spawner is no longer the engine's authoritative reference"};
+            const auto wave = parse_int32(required_text(export_property_text(objects.spawner, STR("currentWaveIndex")), "currentWaveIndex"));
+            if (!wave || *wave != expected.wave_index)
+                throw std::runtime_error{"Spawner wave changed before automatic capture"};
+            if (required_text(export_property_text(objects.game_instance, STR("sourceLevelName")), "sourceLevelName") != expected.source_level_name
+                || required_text(export_property_text(objects.game_instance, STR("activeStageInfo")), "activeStageInfo") != expected.active_stage_info)
+                throw std::runtime_error{"automatic capture source level or stage changed"};
+            if (!expected.spawner_identity.weak_verified && expected.delete_epoch_verified
+                && !route_c_capture_delete_epoch_matches(expected))
+                throw std::runtime_error{"automatic capture spawner lifetime changed during identity validation"};
+        }
+
+        auto schedule_route_c_capture(UObject* spawner, std::int32_t wave,
+                                       std::chrono::steady_clock::time_point ready_at, std::string_view event) -> void
+        {
+            try
+            {
+                if (g_pending_route_c_capture && g_pending_route_c_capture->spawner == spawner
+                    && g_pending_route_c_capture->wave_index == wave)
+                {
+                    // Native spawn hooks and OPEN polling may observe the same
+                    // wave. Validate the original W/T before make can publish a
+                    // new watch. An invalid old identity must never be repinned.
+                    validate_pending_route_c_capture(*g_pending_route_c_capture, find_route_c_objects());
+                    append_route_c_trace("auto-capture.schedule.coalesced");
+                    return;
+                }
+                auto next = make_pending_route_c_capture(spawner, wave, ready_at);
+                g_pending_route_c_capture = std::move(next);
+                append_route_c_trace(event);
+            }
+            catch (const std::exception& error)
+            {
+                g_pending_route_c_capture.reset();
+                append_route_c_trace_failure("auto-capture.schedule.refused", error.what());
+            }
+            catch (...)
+            {
+                g_pending_route_c_capture.reset();
+                append_route_c_trace_failure("auto-capture.schedule.refused", "unknown non-standard scheduling exception");
+            }
         }
 
         auto capture_route_c_checkpoint(std::optional<PendingRouteCCapture> expected = std::nullopt)
@@ -3899,10 +4239,7 @@ namespace QuantumCheckpoint
             {
                 throw std::runtime_error{"A complete active battle was not found"};
             }
-            if (expected && expected->spawner != objects.spawner)
-            {
-                throw std::runtime_error{"The wave-start spawner was replaced before capture"};
-            }
+            if (expected) validate_pending_route_c_capture(*expected, objects);
             if (const auto unsafe_companion = find_route_c_unsafe_companion())
             {
                 throw std::runtime_error{
@@ -3913,7 +4250,7 @@ namespace QuantumCheckpoint
             const auto game_state = required_text(
                 export_property_text(objects.card_engine, STR("currentGameState")),
                 "CardEngine.currentGameState");
-            if (game_state != "OPEN")
+            if (game_state != "OPEN" && !(expected && game_state == "PROCESSING"))
             {
                 throw std::runtime_error{"The battle is not in the stable OPEN state"};
             }
@@ -3953,6 +4290,22 @@ namespace QuantumCheckpoint
                 throw std::runtime_error{
                     "Route C supports ordinary DUNGEON battles only"};
             }
+            // Read the bounded native graph even for PROCESSING: malformed
+            // structure is terminal, never converted into an animation wait.
+            const bool native_settled = native_restore_actions_settled(
+                validated_native_move_card_api(objects.card_engine).engine_state);
+            if (game_state == "PROCESSING")
+            {
+                append_route_c_trace_failure("capture.processing.waitable",
+                    "request=" + std::to_string(expected->request_id)
+                        + " wave=" + std::to_string(expected->wave_index)
+                        + " state=PROCESSING selection=None placement=None nativeStructure=valid settled="
+                        + (native_settled ? "true" : "false"));
+                throw RouteCCaptureProcessingWait{};
+            }
+            if (!native_settled)
+                throw RouteCCaptureNativeActionsBusy{RouteCCaptureBusyPhase::BeforeRead};
+            append_route_c_trace("capture.native-actions.settled");
 
             append_route_c_trace("capture.get-active-decklist.begin");
             checkpoint.active_decklist = route_c_startup_decklist(
@@ -4055,11 +4408,14 @@ namespace QuantumCheckpoint
             }
             std::optional<ExactPlayerHandHealthCheckpoint> exact_player_hand_health{};
             std::string off_field_rejection{player_effect_membership_rejection}, hand_health_checksum{};
+            std::string deck_base_health_states{}, trash_base_health_states{};
             try
             {
                 if (!player_effect_membership_rejection.empty())
                     throw std::runtime_error{player_effect_membership_rejection};
-                const auto states = validate_off_field_statistics(objects, true, true, ExactPlayerHandHealthSchemaVersion);
+                const auto states = validate_off_field_statistics(objects, true, true, ExactPlayerHandHealthSchemaVersion, true);
+                deck_base_health_states = serialize_player_health_states(states.deck_base_health);
+                trash_base_health_states = serialize_player_health_states(states.trash_base_health);
                 if (!states.hand_health.empty())
                 {
                     ExactPlayerHandHealthCheckpoint exact{};
@@ -4120,6 +4476,7 @@ namespace QuantumCheckpoint
                     objects.card_engine, zones.hand, 0, exact.schema_version);
                 append_route_c_trace("capture.exact-player-zones.get-hand.complete");
                 exact.player_hand_health_checksum = hand_health_checksum;
+                exact.player_deck_base_health_states = deck_base_health_states;
                 exact.payload_checksum = exact_player_zones_payload_checksum(exact);
                 std::string exact_validation_error{};
                 if (!validate_exact_player_zones_checkpoint(exact, exact_validation_error))
@@ -4177,6 +4534,8 @@ namespace QuantumCheckpoint
                 exact.player_trash = required_player_zone_order(
                     objects.card_engine, zones.trash, 2, exact.schema_version);
                 exact.player_hand_health_checksum = hand_health_checksum;
+                exact.player_deck_base_health_states = deck_base_health_states;
+                exact.player_trash_base_health_states = trash_base_health_states;
                 exact.payload_checksum = exact_player_trash_payload_checksum(exact);
                 std::string exact_validation_error{};
                 if (!validate_exact_player_trash_checkpoint(exact, exact_validation_error))
@@ -4321,6 +4680,8 @@ namespace QuantumCheckpoint
                 exact.player_field_health_states = serialize_player_health_states(health_states);
                 exact.player_field_counter_states = serialize_player_counter_states(counter_states);
                 exact.player_hand_health_checksum = hand_health_checksum;
+                exact.player_deck_base_health_states = deck_base_health_states;
+                exact.player_trash_base_health_states = trash_base_health_states;
                 exact.payload_checksum = exact_player_field_payload_checksum(exact);
                 std::string exact_validation_error{};
                 if (!validate_exact_player_field_checkpoint(
@@ -4462,6 +4823,35 @@ namespace QuantumCheckpoint
             const auto main_contents = serialize_route_c_checkpoint(checkpoint);
             if (main_contents.empty() || main_contents.size() > RouteCMaximumFileBytes)
                 throw std::runtime_error{"Route C checkpoint exceeds the 2 MiB safety limit"};
+            const auto final_objects = find_route_c_objects();
+            if (final_objects.spawner != objects.spawner || final_objects.card_engine != objects.card_engine
+                || final_objects.game_instance != objects.game_instance || final_objects.bottom_bar != objects.bottom_bar)
+                throw std::runtime_error{"battle objects changed during capture; checkpoint files were not replaced"};
+            if (expected)
+            {
+                validate_pending_route_c_capture(*expected, final_objects);
+                if (std::chrono::steady_clock::now() >= expected->deadline)
+                    throw std::runtime_error{"automatic capture exceeded its fixed deadline before file replacement"};
+            }
+            const auto final_wave = parse_int32(required_text(export_property_text(objects.spawner, STR("currentWaveIndex")), "currentWaveIndex"));
+            if (!final_wave || *final_wave != checkpoint.wave_index
+                || required_text(export_property_text(objects.card_engine, STR("currentGameState")), "currentGameState") != "OPEN"
+                || required_text(export_property_text(objects.card_engine, STR("mActiveCardSelectionPrompt")), "selection prompt") != "None"
+                || required_text(export_property_text(objects.card_engine, STR("mActiveCardPlacementPrompt")), "placement prompt") != "None")
+                throw std::runtime_error{"wave, OPEN state, or prompts changed during capture; checkpoint files were not replaced"};
+            if (!native_restore_actions_settled(validated_native_move_card_api(objects.card_engine).engine_state))
+                throw RouteCCaptureNativeActionsBusy{RouteCCaptureBusyPhase::BeforeWrite};
+            if (expected && !expected->spawner_identity.weak_verified && expected->delete_epoch_verified
+                && !route_c_capture_delete_epoch_matches(*expected))
+                throw std::runtime_error{"automatic capture spawner lifetime changed before file replacement"};
+            if (expected)
+                append_route_c_trace_failure(route_c_capture_retry_identity_available(*expected)
+                    ? "capture.lifetime-identity.verified" : "capture.lifetime-identity.initial-unverified",
+                    "request=" + std::to_string(expected->request_id)
+                        + " identity=" + route_c_capture_lifetime_identity(*expected)
+                        + " pinGlobalEpoch=" + std::to_string(expected->delete_epoch)
+                        + " globalEpoch=" + std::to_string(g_route_c_capture_delete_listener.epoch.load(std::memory_order_seq_cst))
+                        + " targetEpoch=" + std::to_string(expected->target_epoch));
             invalidate_exact_supplements_before_capture();
             append_route_c_trace("capture.write.begin");
             write_file_atomically(path, main_contents);
@@ -4691,6 +5081,16 @@ namespace QuantumCheckpoint
                    << json_escape(restore.hand_health_reason) << "\",\n"
                    << "  \"exactPlayerHandBaseHealthActionsQueued\": "
                    << restore.hand_base_health_actions_queued << ",\n"
+                   << "  \"exactPlayerOffFieldBaseHealthStatus\": \""
+                   << json_escape(restore.zone_base_health_status) << "\",\n"
+                   << "  \"exactPlayerOffFieldBaseHealthReason\": \""
+                   << json_escape(restore.zone_base_health_reason) << "\",\n"
+                   << "  \"exactPlayerOffFieldBaseHealthActionsQueued\": "
+                   << restore.zone_base_health_actions_queued << ",\n"
+                   << "  \"exactPlayerOffFieldBaseHealthUiVerified\": "
+                   << (restore.zone_base_health_ui_verified ? "true" : "false") << ",\n"
+                   << "  \"exactPlayerOffFieldBaseHealthUiSynchronizations\": "
+                   << restore.zone_base_health_ui_synchronizations << ",\n"
                    << "  \"exactPlayerHandCounterStatus\": \""
                    << json_escape(restore.hand_counter_status) << "\",\n"
                    << "  \"exactPlayerHandCounterReason\": \""
@@ -4707,10 +5107,10 @@ namespace QuantumCheckpoint
                    << (restore.off_field_statistics_covered
                            ? (restore.exact_player_hand_health
                                    && restore.exact_player_hand_health->schema_version >= ExactPlayerHandBaseHealthSchemaVersion
-                               ? "DECK/TRASH default numeric state; HAND native-index base HEALTH at least the selected immutable definition, nonnegative HEALTH modifiers, current=max and generic counters 0..256 with no special entries; default attack, level and turns verified; effect/action history excluded"
+                               ? "DECK/TRASH base-health coverage reported separately; HAND native-index base HEALTH at least the selected immutable definition, nonnegative HEALTH modifiers, current=max and generic counters 0..256 with no special entries; default attack, level and turns verified; effect/action history excluded"
                                : restore.exact_player_hand_health && restore.exact_player_hand_health->schema_version >= 2
-                               ? "DECK/TRASH default numeric state; HAND native-index HEALTH nonnegative modifiers with current=max and generic counters 0..256 with no special entries; definition base stats, level and default turns verified; effect/action history excluded"
-                               : "DECK/TRASH default numeric state; HAND native-index HEALTH nonnegative modifiers with current=max and default zero counters; definition base stats, level and default turns verified; effect/action history excluded")
+                               ? "DECK/TRASH base-health coverage reported separately; HAND native-index HEALTH nonnegative modifiers with current=max and generic counters 0..256 with no special entries; definition base stats, level and default turns verified; effect/action history excluded"
+                               : "DECK/TRASH base-health coverage reported separately; HAND native-index HEALTH nonnegative modifiers with current=max and default zero counters; definition base stats, level and default turns verified; effect/action history excluded")
                            : "legacy or semantic layout: off-field statistics not covered") << "\",\n"
                    << "  \"generatedPlayerCardCount\": " << restore.generated_player_card_count << ",\n"
                    << "  \"generatedStartupMaxCountdown\": " << restore.generated_startup_max_countdown << ",\n"
@@ -4877,7 +5277,7 @@ namespace QuantumCheckpoint
                     ? std::to_string(read_native_value<std::uint8_t>(owner, 0x414)) : "?");
         }
 
-        auto native_restore_actions_settled(const void* state) -> bool
+        auto native_restore_actions_settled(const void* state, std::string* observation) -> bool
         {
             if (GetCurrentThreadId() != g_game_thread_id.load(std::memory_order_acquire)
                 || !state || !address_is_readable(state, 0x40))
@@ -4911,6 +5311,19 @@ namespace QuantumCheckpoint
             const auto* tail = read_native_value<const void*>(manager, 0x18);
             if (!head || !tail || !address_is_readable(tail, sizeof(void*)))
                 throw std::runtime_error{"restore MOVE deferred action queue is unreadable"};
+            // Optional identity snapshot for synchronous UI-only calls. A pair
+            // of settled=true reads alone would miss a completed new action.
+            if (observation) observation->clear();
+            const auto observe_pointer = [&](const void* pointer) {
+                if (observation) *observation += std::to_string(reinterpret_cast<std::uintptr_t>(pointer)) + ":";
+            };
+            const auto observe_count = [&](std::int32_t count) {
+                if (observation) *observation += std::to_string(count) + ":";
+            };
+            observe_pointer(manager); observe_pointer(root);
+            observe_count(priorities); observe_count(priority_capacity);
+            observe_pointer(head); observe_pointer(tail);
+            observe_pointer(read_native_value<const void*>(tail, 0));
             // The native driver drains tail->next only after the action tree is
             // complete. Both the tree and the deferred queue must be settled.
             if (head != tail || read_native_value<const void*>(tail, 0) != nullptr) return false;
@@ -4929,9 +5342,13 @@ namespace QuantumCheckpoint
                     || edge_count + static_cast<std::size_t>(count) > 16384)
                     throw std::runtime_error{"restore MOVE action array exceeds guarded traversal bounds"};
                 edge_count += static_cast<std::size_t>(count);
+                observe_pointer(header); observe_pointer(data);
+                observe_count(count); observe_count(capacity);
                 for (std::int32_t index{}; index < count; ++index)
                 {
                     const auto offset = static_cast<std::size_t>(index) * 16;
+                    observe_pointer(read_native_value<const void*>(data, offset));
+                    observe_pointer(read_native_value<const void*>(data, offset + sizeof(void*)));
                     visitor(read_native_value<const void*>(data, offset),
                             read_native_value<const void*>(data, offset + sizeof(void*)));
                 }
@@ -4950,6 +5367,8 @@ namespace QuantumCheckpoint
                 const auto action_state = read_native_value<std::uint8_t>(action, 0x29);
                 if (action_state > 8)
                     throw std::runtime_error{"restore MOVE action state exceeds the native enum"};
+                observe_count(action_state);
+                if (observation) observation->append(static_cast<const char*>(action), 0x40);
                 complete = (action_state == 8) && complete;
                 visit_array(static_cast<const std::byte*>(action) + 0x40,
                     [&](const void* child, const void* child_owner) { self(self, child, child_owner, depth + 1); });
@@ -4984,10 +5403,10 @@ namespace QuantumCheckpoint
             return {object, controller};
         }
 
-        auto queue_native_player_hand_base_health(UObject* engine, const NativeCardReference& card,
-                                                   std::int32_t base_health) -> void
+        auto queue_native_player_base_health(UObject* engine, const NativeCardReference& card,
+                                             std::int32_t base_health, std::uint8_t expected_location = 0) -> void
         {
-            if (GetCurrentThreadId() != g_game_thread_id.load(std::memory_order_acquire)
+            if (expected_location > 2 || GetCurrentThreadId() != g_game_thread_id.load(std::memory_order_acquire)
                 || !engine || engine->IsUnreachable()
                 || engine->HasAnyFlags(static_cast<EObjectFlags>(RF_BeginDestroyed | RF_FinishDestroyed))
                 || !card.card || card.card->IsUnreachable()
@@ -4995,29 +5414,29 @@ namespace QuantumCheckpoint
                 || !engine->GetWorld() || card.card->GetWorld() != engine->GetWorld()
                 || !address_is_readable(static_cast<const std::byte*>(static_cast<const void*>(card.card))
                     + InGameCardStatePointerOffset, sizeof(void*)))
-                throw std::runtime_error{"HAND base health requires a live target on the game thread"};
+                throw std::runtime_error{"off-field base health requires a live D/H/T target on the game thread"};
             const auto api = validated_native_move_card_api(engine);
             if (read_native_value<const void*>(card.card, InGameCardStatePointerOffset) != card.state
-                || native_card_location(api.engine_state, card.state, api.get_card_location) != 0)
-                throw std::runtime_error{"HAND base-health target ownership or location changed"};
-            const auto hand = read_native_player_zone_cards(engine, 0);
-            if (std::count_if(hand.begin(), hand.end(), [&](const auto& live) {
+                || native_card_location(api.engine_state, card.state, api.get_card_location) != expected_location)
+                throw std::runtime_error{"off-field base-health target ownership or location changed"};
+            const auto zone = read_native_player_zone_cards(engine, expected_location);
+            if (std::count_if(zone.begin(), zone.end(), [&](const auto& live) {
                     return live.card == card.card && live.state == card.state;
                 }) != 1)
-                throw std::runtime_error{"HAND base-health target is not uniquely owned by the player hand"};
+                throw std::runtime_error{"off-field base-health target is not uniquely owned by the selected player zone"};
             std::string error{};
             if (!validate_player_health_state({base_health, base_health, {}}, error))
-                throw std::runtime_error{"HAND base-health target exceeds scalar bounds: " + error};
+                throw std::runtime_error{"off-field base-health target exceeds scalar bounds: " + error};
             const auto before = capture_player_health_state(card.card);
             if (before.base_health >= base_health || before.max_health != before.base_health
                 || !before.modifiers.empty()
                 || parse_int32(required_getter_text(card.card, STR("getCurrentHealth"))) != before.max_health)
-                throw std::runtime_error{"HAND base health must increase a fresh, unmodified full-health target"};
+                throw std::runtime_error{"off-field base health must increase a fresh, unmodified full-health target"};
             const auto module_base = reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr));
             const auto signature = [&](std::uintptr_t rva, const auto& bytes) {
                 const auto* address = reinterpret_cast<const std::uint8_t*>(module_base + rva);
                 if (!address_is_readable(address, bytes.size()) || !std::equal(bytes.begin(), bytes.end(), address))
-                    throw std::runtime_error{"native HAND base-health action signature changed"};
+                    throw std::runtime_error{"native off-field base-health action signature changed"};
             };
             signature(0xE51CB0, std::array<std::uint8_t,8>{0x48,0x8B,0xC4,0x53,0x48,0x83,0xEC,0x60});
             signature(0xDFC4ED, std::array<std::uint8_t,4>{0xC6,0x47,0x28,0x2A});
@@ -5026,7 +5445,7 @@ namespace QuantumCheckpoint
             signature(0xE45C59, std::array<std::uint8_t,9>{0x48,0x8B,0x4B,0x70,0xE8,0xAE,0x7F,0xFF,0xFF});
             if (!address_is_writable(static_cast<const std::byte*>(card.state) + 0x118, 8)
                 || !address_is_writable(static_cast<const std::byte*>(card.state) + 0x130, 0x50))
-                throw std::runtime_error{"HAND base-health storage is unavailable"};
+                throw std::runtime_error{"off-field base-health storage is unavailable"};
             const auto* shared = read_native_value<const void*>(card.state, CardStateSharedObjectOffset);
             const auto* owner = read_native_value<const void*>(card.state, CardStateSharedControllerOffset);
             // SET_BASE_STATS consumes a retained shared target, resets current
@@ -5618,7 +6037,7 @@ namespace QuantumCheckpoint
                 throw std::runtime_error{"restore MOVE overlay pointer permutation did not read back exactly"};
         }
 
-        auto overlay_gameplay_observation(UObject* card) -> std::string
+        auto overlay_gameplay_observation(UObject* card, bool include_face_cache = true) -> std::string
         {
             ObjectSnapshot state{};
             append_native_card_statistics(state, card);
@@ -5638,9 +6057,96 @@ namespace QuantumCheckpoint
                 state.properties.push_back({to_string(getter), required_getter_text(card, getter)});
             std::string result{};
             for (const auto& property : state.properties)
+            {
+                // FB9190 intentionally refreshes the face cache. Preserve all
+                // native state/getters while excluding only these UI fields.
+                if (!include_face_cache && property.name.contains(":cardFace")) continue;
                 result += std::to_string(property.name.size()) + ":" + property.name
                     + std::to_string(property.value.size()) + ":" + property.value;
+            }
             return result;
+        }
+
+        using SynchronizeCardNumericUi = void(__fastcall*)(UObject*);
+
+        auto validated_native_card_numeric_ui_synchronizer() -> SynchronizeCardNumericUi
+        {
+            if (!fingerprint_matches_supported_game(executable_fingerprint()))
+                throw std::runtime_error{"D/T health UI synchronization requires the supported executable"};
+            const auto module_base = reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr));
+            const auto signature = [&](std::uintptr_t rva, const auto& bytes) {
+                const auto* address = reinterpret_cast<const std::uint8_t*>(module_base + rva);
+                if (!address_is_readable(address, bytes.size()) || !std::equal(bytes.begin(), bytes.end(), address))
+                    throw std::runtime_error{"D/T health UI synchronization signature changed"};
+            };
+            // This independent native state-to-display helper is called by
+            // normal Tick, but does not run Tick, effect reconciliation, action
+            // queue/resume, or any gameplay action. It reads the live state;
+            // the mod never supplies or writes widget health values.
+            signature(0xFB9190, std::array<std::uint8_t,29>{0x48,0x8B,0xC4,0x53,0x56,0x57,0x48,0x81,0xEC,0xF0,0,0,0,0x48,0x8D,0xB1,0x28,0x02,0,0,0x48,0x8B,0xF9,0x48,0x8B,0x0E,0x48,0x85,0xC9});
+            signature(0xFB92ED, std::array<std::uint8_t,22>{0x49,0x8B,0x1F,0x48,0x8B,0xCB,0xE8,0x48,0x4C,0xE6,0xFF,0x48,0x8B,0xCB,0x44,0x8B,0xE8,0xE8,0x9D,0x8D,0xE6,0xFF});
+            signature(0xFB932C, std::array<std::uint8_t,17>{0x45,0x89,0x91,0x9C,0x02,0,0,0x45,0x8B,0xC5,0x45,0x89,0xA9,0xA0,0x02,0,0});
+            signature(0xFB934D, std::array<std::uint8_t,5>{0xE8,0x7E,0x2A,0x06,0});
+            signature(0xFB93F5, std::array<std::uint8_t,5>{0xE8,0x36,0xC1,0xFF,0xFF});
+            signature(0xFB940E, std::array<std::uint8_t,5>{0xE8,0x1D,0xC1,0xFF,0xFF});
+            signature(0xFB553F, std::array<std::uint8_t,7>{0x48,0x8D,0x81,0x3C,0x02,0,0});
+            signature(0xFB5551, std::array<std::uint8_t,16>{0x8B,0x08,0x45,0x33,0xE4,0x44,0x8B,0xFA,0x3B,0xD1,0x0F,0x8E,0x16,0x01,0,0});
+            signature(0xFB5677, std::array<std::uint8_t,2>{0x7D,0x7D});
+            signature(0xFB94CE, std::array<std::uint8_t,10>{0x48,0x8B,0x8B,0x28,0x02,0,0,0x48,0x8B,0x01});
+            return reinterpret_cast<SynchronizeCardNumericUi>(module_base + 0xFB9190);
+        }
+
+        auto read_zone_base_health_ui_objects(UObject* card, const void* world,
+                                              const std::set<UObject*>& registered)
+            -> std::array<UObject*, 7>
+        {
+            require_live_overlay_object(card, world, registered);
+            if (object_class_name(card) != "BP_InGameCard_C")
+                throw std::runtime_error{"D/T health UI target class changed"};
+            const auto dependency = [&](UObject* owner, StringViewType name,
+                                        std::size_t offset, std::string_view expected_class) {
+                auto* value = overlay_object_property(owner, name);
+                auto* property = owner->GetPropertyByNameInChain(name.data());
+                if (property->ContainerPtrToValuePtr<void>(owner)
+                    != static_cast<const std::byte*>(static_cast<const void*>(owner)) + offset)
+                    throw std::runtime_error{"D/T health UI dependency offset changed"};
+                require_live_overlay_object(value, world, registered);
+                if (object_class_name(value) != expected_class)
+                    throw std::runtime_error{"D/T health UI dependency class changed: " + to_string(name)};
+                return value;
+            };
+            std::array<UObject*, 7> result{
+                dependency(card, STR("CardFaceWidget"), 0x380, "UMG_CardFace_C"),
+                dependency(card, STR("displayWidget"), 0x378, "WidgetComponent"),
+                dependency(card, STR("cardOverlayGenericCounters"), 0x260, "BP_GenericCounterDisplay_C"),
+                dependency(card, STR("cardOverlaySpecialCounters"), 0x268, "BP_SpecialCounterDisplay_C"),
+                dependency(card, STR("displayTurnCounter"), 0x3C0, "ChildActorComponent"),
+                dependency(card, STR("cardOverlayTurnCounter"), 0x250, "BP_CardTurnCountNumber_C"),
+                nullptr};
+            result[6] = dependency(result[5], STR("clickableArea"), 0x228, "CardClickableArea");
+            if (!address_is_readable(result[0], 0x2EB)
+                || !address_is_writable(static_cast<const std::byte*>(static_cast<const void*>(result[0])) + 0x250, 0x9B)
+                || !address_is_writable(static_cast<const std::byte*>(static_cast<const void*>(result[5])) + 0x250, 4))
+                throw std::runtime_error{"D/T health UI cache storage is unavailable"};
+            // Equal zero native/display counts make FB5530 skip both spawning
+            // and destroying counter actors and their Blueprint callbacks.
+            const auto counters = capture_player_counter_state(card);
+            if (counters.generic != 0 || !counters.special.empty())
+                throw std::runtime_error{"D/T health UI synchronization requires empty native counters"};
+            for (const auto index : {2, 3})
+                if (!address_is_readable(result[index], 0x258)
+                    || !address_is_writable(static_cast<const std::byte*>(static_cast<const void*>(result[index])) + 0x23C, 4)
+                    || read_native_value<std::int32_t>(result[index], 0x23C) != 0
+                    || read_native_value<std::int32_t>(result[index], 0x250) != 0
+                    || required_getter_text(result[index], STR("getCurrentCounters")) != "0")
+                    throw std::runtime_error{"D/T health UI synchronization requires empty counter displays"};
+            return result;
+        }
+
+        auto zone_base_health_ui_matches(UObject* face, const PlayerHealthState& desired) -> bool
+        {
+            return read_native_value<std::int32_t>(face, 0x29C) == desired.base_health
+                && read_native_value<std::int32_t>(face, 0x2A0) == desired.base_health;
         }
 
         auto reconcile_restore_move_overlays(UObject* engine, const PendingNativeRestoreMove& move) -> void
@@ -6334,6 +6840,11 @@ namespace QuantumCheckpoint
             const bool exact_spawn_plan_available = exact_spawn_plan.has_value();
             const bool exact_player_zones_available = exact_player_zones.has_value();
             const bool player_effect_membership_requested = exact_player_field || exact_player_trash || exact_player_zones;
+            const bool zone_base_health_requested = exact_player_field
+                ? exact_player_field->schema_version >= ExactPlayerFieldBaseHealthSchemaVersion
+                : exact_player_trash
+                    ? exact_player_trash->schema_version >= ExactPlayerTrashBaseHealthSchemaVersion
+                    : exact_player_zones && exact_player_zones->schema_version >= ExactPlayerZonesBaseHealthSchemaVersion;
             const bool player_effect_membership_attested = exact_player_field
                 ? exact_player_field->schema_version >= ExactPlayerFieldEffectMembershipSchemaVersion
                 : exact_player_trash
@@ -6385,6 +6896,14 @@ namespace QuantumCheckpoint
                 .hand_counter_status = std::move(hand_counter_status),
                 .hand_counter_reason = std::move(hand_counter_reason),
                 .off_field_statistics_covered = off_field_statistics_covered,
+                .zone_base_health_status = zone_base_health_requested ? "pending"
+                    : !player_effect_membership_requested ? "not-applicable-no-player-layout"
+                    : off_field_statistics_covered ? "legacy-default-only" : "legacy-unavailable",
+                .zone_base_health_reason = zone_base_health_requested
+                    ? "selected layout binds DECK/TRASH base health; awaiting final native positions"
+                    : !player_effect_membership_requested ? "ordinary Route C has no exact player layout"
+                    : off_field_statistics_covered ? "selected legacy layout requires default DECK/TRASH numeric state"
+                    : "selected legacy layout has no off-field numeric coverage",
                 .player_effect_membership_status = player_effect_membership_requested ? "pending" : "not-applicable-no-player-layout",
                 .player_effect_membership_reason = player_effect_membership_requested
                     ? (player_effect_membership_attested
@@ -7157,6 +7676,246 @@ namespace QuantumCheckpoint
             return false;
         }
 
+        struct PlayerZoneBaseHealthLayout
+        {
+            bool covered{};
+            std::string_view deck{}, trash{"()"}, deck_states{}, trash_states{};
+        };
+
+        auto selected_player_zone_base_health_layout(const PendingRouteCRestore& restore)
+            -> PlayerZoneBaseHealthLayout
+        {
+            // Select exactly the same winning layout as startup. A superseded
+            // newer file must never widen the scope of an older selected layout.
+            if (restore.exact_player_field)
+            {
+                const auto& exact = *restore.exact_player_field;
+                return {exact.schema_version >= ExactPlayerFieldBaseHealthSchemaVersion,
+                    exact.player_deck, exact.player_trash,
+                    exact.player_deck_base_health_states, exact.player_trash_base_health_states};
+            }
+            if (restore.exact_player_trash)
+            {
+                const auto& exact = *restore.exact_player_trash;
+                return {exact.schema_version >= ExactPlayerTrashBaseHealthSchemaVersion,
+                    exact.player_deck, exact.player_trash,
+                    exact.player_deck_base_health_states, exact.player_trash_base_health_states};
+            }
+            if (restore.exact_player_zones)
+            {
+                const auto& exact = *restore.exact_player_zones;
+                return {exact.schema_version >= ExactPlayerZonesBaseHealthSchemaVersion,
+                    exact.player_deck, "()", exact.player_deck_base_health_states, {}};
+            }
+            return {};
+        }
+
+        auto verify_exact_player_zone_base_health(PendingRouteCRestore& restore,
+                                                   const RouteCBattleObjects& objects,
+                                                   std::chrono::steady_clock::time_point now) -> bool
+        {
+            const auto layout = selected_player_zone_base_health_layout(restore);
+            if (!layout.covered) return true;
+            try
+            {
+                if (!restore.off_field_statistics_covered
+                    || restore.player_effect_membership_saved_proof != "attested-by-layout-schema")
+                    throw std::runtime_error{"DECK/TRASH base health lacks accepted layout/HAND dependency or effect membership proof"};
+                // Layout helpers above this call can queue a new MOVE in the
+                // current update. Never bypass its retained effect guard, or
+                // treat an already changed HP value as action completion.
+                if (!restore.move_effect_suppressions.empty()) return false;
+                const auto api = validated_native_move_card_api(objects.card_engine);
+                if (GetCurrentThreadId() != g_game_thread_id.load(std::memory_order_acquire)
+                    || objects.card_engine->GetWorld() != restore.intercepted_world
+                    || !address_is_readable(objects.card_engine, 0x415)
+                    || read_native_value<std::uint8_t>(objects.card_engine, 0x414) != 0
+                    || required_text(export_property_text(objects.card_engine, STR("currentGameState")), "D/T UI engine state") != "OPEN")
+                    throw std::runtime_error{"DECK/TRASH base health requires the owning OPEN game thread"};
+                if (!native_restore_actions_settled(api.engine_state))
+                {
+                    if (restore.zone_base_health_pending_card
+                        && now - restore.zone_base_health_queued_at > std::chrono::seconds{8})
+                        throw std::runtime_error{"DECK/TRASH base-health action did not settle within eight seconds"};
+                    return false;
+                }
+                if (read_native_player_zone_order(objects.card_engine, 1) != layout.deck
+                    || read_native_player_zone_order(objects.card_engine, 2) != layout.trash)
+                    throw std::runtime_error{"DECK/TRASH order or complete definitions changed during base-health recovery"};
+
+                std::string error{};
+                const auto saved_deck = parse_player_off_field_base_health_states(layout.deck_states, error);
+                if (!saved_deck) throw std::runtime_error{"invalid DECK base-health records: " + error};
+                const auto saved_trash = parse_player_off_field_base_health_states(layout.trash_states, error);
+                if (!saved_trash) throw std::runtime_error{"invalid TRASH base-health records: " + error};
+                auto cards = read_native_player_zone_cards(objects.card_engine, 1);
+                const auto deck_count = cards.size();
+                const auto trash = read_native_player_zone_cards(objects.card_engine, 2);
+                if (saved_deck->size() != deck_count || saved_trash->size() != trash.size())
+                    throw std::runtime_error{"DECK/TRASH base-health record count differs from native positions"};
+                cards.insert(cards.end(), trash.begin(), trash.end());
+                auto desired = *saved_deck;
+                desired.insert(desired.end(), saved_trash->begin(), saved_trash->end());
+                const auto hand_schema = restore.exact_player_hand_health
+                    ? restore.exact_player_hand_health->schema_version : 1;
+                const auto statistics = validate_off_field_statistics(objects, true,
+                    restore.exact_player_hand_health && hand_schema >= 2, hand_schema, true);
+                auto observed = statistics.deck_base_health;
+                observed.insert(observed.end(), statistics.trash_base_health.begin(), statistics.trash_base_health.end());
+                if (observed.size() != desired.size())
+                    throw std::runtime_error{"DECK/TRASH native health observations are incomplete"};
+                const auto registered = registered_overlay_objects();
+                const auto synchronize_ui = validated_native_card_numeric_ui_synchronizer();
+
+                if (!restore.zone_base_health_initialized)
+                {
+                    // Validate every selected definition and fresh target before
+                    // the first write. Duplicate definitions remain index-bound.
+                    for (std::size_t index{}; index < cards.size(); ++index)
+                    {
+                        const auto definition = defined_player_card_statistics(objects.game_instance, cards[index].card);
+                        if (!validate_player_off_field_base_health_for_definition(desired[index], definition.health, error))
+                            throw std::runtime_error{"saved DECK/TRASH base health violates definition policy: " + error};
+                        if (observed[index] != PlayerHealthState{definition.health, definition.health, {}})
+                            throw std::runtime_error{"DECK/TRASH base health did not start at its unmodified selected definition"};
+                        // Validate all UI dependencies before the first native
+                        // numeric action, even for cards that need no change.
+                        restore.zone_base_health_ui_objects.push_back(read_zone_base_health_ui_objects(
+                            cards[index].card, objects.card_engine->GetWorld(), registered));
+                        restore.zone_base_health_owners.push_back(read_native_card_effects(
+                            objects.card_engine, cards[index].card).controller);
+                        restore.zone_base_health_ids.push_back(required_getter_text(cards[index].card, STR("getId")));
+                    }
+                    for (std::size_t index{}; index < cards.size(); ++index)
+                        restore.zone_base_health_targets.push_back({cards[index].card, cards[index].state,
+                            static_cast<std::uint8_t>(index < deck_count ? 1 : 2)});
+                    restore.zone_base_health_prefix = observed;
+                    restore.zone_base_health_initialized = true;
+                    restore.zone_base_health_status = "applying";
+                    restore.zone_base_health_reason = "replaying DECK/TRASH base health after final layout and before HAND numeric state";
+                }
+                if (cards.size() != restore.zone_base_health_targets.size()
+                    || cards.size() != restore.zone_base_health_ui_objects.size()
+                    || cards.size() != restore.zone_base_health_owners.size()
+                    || cards.size() != restore.zone_base_health_ids.size())
+                    throw std::runtime_error{"DECK/TRASH target population changed during base-health recovery"};
+                for (std::size_t index{}; index < cards.size(); ++index)
+                {
+                    const auto& pinned = restore.zone_base_health_targets[index];
+                    if (cards[index].card != pinned.card || cards[index].state != pinned.state
+                        || pinned.origin != (index < deck_count ? 1 : 2)
+                        || read_native_card_effects(objects.card_engine, cards[index].card).controller
+                            != restore.zone_base_health_owners[index]
+                        || required_getter_text(cards[index].card, STR("getId")) != restore.zone_base_health_ids[index]
+                        || read_zone_base_health_ui_objects(cards[index].card, objects.card_engine->GetWorld(), registered)
+                            != restore.zone_base_health_ui_objects[index])
+                        throw std::runtime_error{"DECK/TRASH base-health target identity or native position changed"};
+                    if (observed[index] != restore.zone_base_health_prefix[index])
+                    {
+                        if (restore.zone_base_health_pending_card == index
+                            && observed[index] == restore.zone_base_health_before_queue
+                            && now - restore.zone_base_health_queued_at <= std::chrono::seconds{8})
+                            return false;
+                        throw std::runtime_error{"DECK/TRASH base health diverged from its exact replay prefix"};
+                    }
+                }
+                restore.zone_base_health_pending_card.reset();
+                for (std::size_t index{}; index < cards.size(); ++index)
+                {
+                    auto& prefix = restore.zone_base_health_prefix[index];
+                    if (prefix == desired[index]) continue;
+                    if (restore.zone_base_health_status == "verified-native-base-health")
+                        throw std::runtime_error{"DECK/TRASH base health changed after verification"};
+                    restore.zone_base_health_before_queue = prefix;
+                    queue_native_player_base_health(objects.card_engine, cards[index], desired[index].base_health,
+                        restore.zone_base_health_targets[index].origin);
+                    prefix = desired[index];
+                    restore.zone_base_health_pending_card = index;
+                    restore.zone_base_health_queued_at = now;
+                    ++restore.zone_base_health_actions_queued;
+                    append_route_c_trace_failure("restore.exact-player-zone-base-health.queued",
+                        "location=" + std::to_string(restore.zone_base_health_targets[index].origin)
+                            + " index=" + std::to_string(index < deck_count ? index : index - deck_count)
+                            + " base=" + std::to_string(desired[index].base_health));
+                    resume_native_restore_actions(objects.card_engine);
+                    return false;
+                }
+                // The entire D/T numeric prefix is now complete and settled.
+                // Synchronize each stale face at most once; every subsequent
+                // call, including final verification/stability, is read-only.
+                for (std::size_t index{}; index < cards.size(); ++index)
+                {
+                    auto* face = restore.zone_base_health_ui_objects[index][0];
+                    if (zone_base_health_ui_matches(face, desired[index])) continue;
+                    if (restore.zone_base_health_ui_verified
+                        || restore.phase == RouteCRestorePhase::AwaitingPostRestoreStability)
+                        throw std::runtime_error{"DECK/TRASH health UI cache drifted after verification"};
+                    std::vector<NativeCardEffects> native_before{};
+                    std::vector<std::string> gameplay_before{};
+                    for (const auto& card : cards)
+                    {
+                        native_before.push_back(read_native_card_effects(objects.card_engine, card.card));
+                        gameplay_before.push_back(overlay_gameplay_observation(card.card, false));
+                    }
+                    std::string queue_before{}, queue_after{};
+                    if (!restore.move_effect_suppressions.empty()
+                        || !native_restore_actions_settled(api.engine_state, &queue_before))
+                        throw std::runtime_error{"DECK/TRASH health UI synchronization lost its settled boundary"};
+                    const auto before_current = read_native_value<std::int32_t>(face, 0x29C);
+                    const auto before_base = read_native_value<std::int32_t>(face, 0x2A0);
+                    synchronize_ui(cards[index].card);
+                    const auto after_registered = registered_overlay_objects();
+                    for (const auto& card : cards)
+                        require_live_overlay_object(card.card, objects.card_engine->GetWorld(), after_registered);
+                    if (validated_native_move_card_api(objects.card_engine).engine_state != api.engine_state
+                        || read_native_value<std::uint8_t>(objects.card_engine, 0x414) != 0
+                        || required_text(export_property_text(objects.card_engine, STR("currentGameState")), "D/T UI engine state") != "OPEN"
+                        || !native_restore_actions_settled(api.engine_state, &queue_after)
+                        || queue_after != queue_before
+                        || read_native_player_zone_order(objects.card_engine, 1) != layout.deck
+                        || read_native_player_zone_order(objects.card_engine, 2) != layout.trash)
+                        throw std::runtime_error{"DECK/TRASH health UI synchronization changed native order or action queues"};
+                    for (std::size_t checked{}; checked < cards.size(); ++checked)
+                        if (read_native_card_effects(objects.card_engine, cards[checked].card) != native_before[checked]
+                            || overlay_gameplay_observation(cards[checked].card, false) != gameplay_before[checked])
+                            throw std::runtime_error{"DECK/TRASH health UI synchronization changed native gameplay state"};
+                    if (read_zone_base_health_ui_objects(cards[index].card, objects.card_engine->GetWorld(), after_registered)
+                            != restore.zone_base_health_ui_objects[index]
+                        || !zone_base_health_ui_matches(face, desired[index]))
+                        throw std::runtime_error{"DECK/TRASH native UI synchronization did not preserve references and align HP caches"};
+                    ++restore.zone_base_health_ui_synchronizations;
+                    append_route_c_trace_failure("restore.exact-player-zone-base-health.ui-synchronized",
+                        "location=" + std::to_string(restore.zone_base_health_targets[index].origin)
+                            + " index=" + std::to_string(index < deck_count ? index : index - deck_count)
+                            + " actor=" + to_string(cards[index].card->GetName())
+                            + " previousCurrent=" + std::to_string(before_current)
+                            + " previousBase=" + std::to_string(before_base)
+                            + " nativeCurrent=" + std::to_string(desired[index].base_health)
+                            + " nativeBase=" + std::to_string(desired[index].base_health)
+                            + " nativeAndQueueUnchanged=true");
+                }
+                for (std::size_t index{}; index < cards.size(); ++index)
+                    if (!zone_base_health_ui_matches(restore.zone_base_health_ui_objects[index][0], desired[index]))
+                        throw std::runtime_error{"DECK/TRASH health UI cache is not aligned at numeric completion"};
+                if (!restore.zone_base_health_ui_verified)
+                    append_route_c_trace("restore.exact-player-zone-base-health.ui-verified");
+                restore.zone_base_health_ui_verified = true;
+                if (restore.zone_base_health_status != "verified-native-base-health")
+                    append_route_c_trace("restore.exact-player-zone-base-health.verified-native-base-health");
+                restore.zone_base_health_status = "verified-native-base-health";
+                restore.zone_base_health_reason = "native DECK/TRASH order, full definitions, pinned targets and nonnegative base-HP gains verified; current=max=base, no HEALTH modifiers, and face HP caches aligned";
+                return true;
+            }
+            catch (const std::exception& error)
+            {
+                restore.zone_base_health_status = "failed";
+                restore.zone_base_health_ui_verified = false;
+                restore.zone_base_health_reason = error.what();
+                append_route_c_trace_failure("restore.exact-player-zone-base-health.failed", error.what());
+                throw;
+            }
+        }
+
         auto verify_exact_player_hand_health(PendingRouteCRestore& restore,
                                               const RouteCBattleObjects& objects,
                                               std::chrono::steady_clock::time_point now) -> bool
@@ -7176,7 +7935,8 @@ namespace QuantumCheckpoint
                 // Moving a card after this layer would reset its dynamic state.
                 if (base_covered && restore.player_effect_membership_saved_proof != "attested-by-layout-schema")
                     throw std::runtime_error{"HAND base health lacks accepted capture-time effect membership proof"};
-                const auto statistics = validate_off_field_statistics(objects, true, counters_covered, hand_schema);
+                const auto statistics = validate_off_field_statistics(objects, true, counters_covered, hand_schema,
+                    selected_player_zone_base_health_layout(restore).covered);
                 const auto& observed = statistics.hand_health;
                 const auto& observed_counters = statistics.hand_counters;
                 if (!restore.exact_player_hand_health)
@@ -7285,7 +8045,7 @@ namespace QuantumCheckpoint
                         || saved.base_health <= prefix.base_health)
                         throw std::runtime_error{"HAND base health changed after verification or has an invalid replay prefix"};
                     restore.hand_health_before_queue = prefix;
-                    queue_native_player_hand_base_health(objects.card_engine, cards[index], saved.base_health);
+                    queue_native_player_base_health(objects.card_engine, cards[index], saved.base_health);
                     prefix = {saved.base_health, saved.base_health, {}};
                     restore.hand_health_pending_card = index;
                     restore.hand_health_queued_at = now;
@@ -8954,6 +9714,285 @@ namespace QuantumCheckpoint
         }
 
 #if defined(QUANTUM_CHECKPOINT_RUNTIME_TEST_FIXTURES)
+        auto run_pending_capture_test_if_enabled() -> bool
+        {
+            const auto enabled_setting = [](const wchar_t* name) {
+                std::array<wchar_t, 4> setting{};
+                return GetEnvironmentVariableW(name,
+                    setting.data(), static_cast<DWORD>(setting.size())) == 1 && setting[0] == L'1';
+            };
+            static const bool enabled = enabled_setting(L"QUANTUM_CHECKPOINT_TEST_CAPTURE_PENDING");
+            static const bool automatic = enabled_setting(L"QUANTUM_CHECKPOINT_TEST_AUTO_CAPTURE_PENDING");
+            if (!enabled && !automatic) return false;
+            if (enabled && automatic)
+                throw std::runtime_error{"manual and automatic pending-capture fixtures must be enabled separately"};
+            const auto event = [&](std::string_view suffix) {
+                return std::string{automatic ? "test.auto-capture.pending." : "test.capture.pending."} + std::string{suffix};
+            };
+            // Consume every F5 while armed, including key-repeat after the one
+            // test attempt. A later ordinary save would confound attribution of
+            // the one-shot probe's rejection or delayed automatic completion.
+            static bool consumed{}, repeated_request_logged{};
+            if (std::exchange(consumed, true))
+            {
+                if (!std::exchange(repeated_request_logged, true))
+                {
+                    append_route_c_trace(event("already-consumed"));
+                    try
+                    {
+                        const auto objects = find_route_c_objects();
+                        const auto api = validated_native_move_card_api(objects.card_engine);
+                        append_route_c_trace_failure(event("later-observation"),
+                            "state=" + required_text(export_property_text(objects.card_engine, STR("currentGameState")), "state")
+                                + " settled=" + (native_restore_actions_settled(api.engine_state) ? "true" : "false"));
+                    }
+                    catch (const std::exception& error)
+                    {
+                        append_route_c_trace_failure(event("later-observation.failed"), error.what());
+                    }
+                }
+                return true;
+            }
+            append_route_c_trace(event("begin"));
+            UObject* queued_engine{};
+            bool resume_needed{};
+            std::optional<PendingRouteCCapture> test_capture{};
+            const auto checkpoint_files = [&] {
+                std::vector<std::pair<std::string, std::string>> files{};
+                const auto directory = route_c_checkpoint_path().parent_path();
+                std::uintmax_t bytes{};
+                for (const auto& item : std::filesystem::recursive_directory_iterator{directory})
+                {
+                    if (item.is_symlink()) throw std::runtime_error{"pending-capture fixture refuses checkpoint symlinks"};
+                    if (!item.is_regular_file()) continue;
+                    bytes += item.file_size();
+                    if (files.size() >= 128 || item.file_size() > RouteCMaximumFileBytes || bytes > 32 * 1024 * 1024)
+                        throw std::runtime_error{"pending-capture fixture checkpoint file set exceeds bounds"};
+                    files.emplace_back(std::filesystem::relative(item.path(), directory).generic_string(), sha256_file(item.path()));
+                }
+                std::sort(files.begin(), files.end());
+                if (files.empty()) throw std::runtime_error{"pending-capture fixture requires existing checkpoint files"};
+                return files;
+            };
+            const auto resume = [&] {
+                if (!resume_needed) return;
+                resume_native_restore_actions(queued_engine);
+                resume_needed = false;
+                append_route_c_trace(event("resume.returned"));
+            };
+            try
+            {
+                if (GetCurrentThreadId() != g_game_thread_id.load(std::memory_order_acquire)
+                    || g_pending_route_c_restore || g_pending_route_c_capture || g_pending_route_c_fallback
+                    || g_pending_move_card_probe || g_pending_health_write_probe || g_pending_turn_write_probe
+                    || g_pending_battle_turn_write_probe || g_pending_draw_delay_write_probe)
+                    throw std::runtime_error{"pending-capture test requires the game thread with no other transaction"};
+                const auto objects = find_route_c_objects();
+                if (!objects.card_engine || !objects.game_instance || !objects.spawner || !objects.bottom_bar
+                    || required_text(export_property_text(objects.card_engine, STR("currentGameState")), "state") != "OPEN"
+                    || required_text(export_property_text(objects.card_engine, STR("mActiveCardPlacementPrompt")), "prompt") != "None"
+                    || required_text(export_property_text(objects.card_engine, STR("mActiveCardSelectionPrompt")), "selection") != "None"
+                    || !address_is_readable(objects.card_engine, 0x415)
+                    || read_native_value<std::uint8_t>(objects.card_engine, 0x414) != 0)
+                    throw std::runtime_error{"pending-capture test requires a complete unpaused prompt-free OPEN battle"};
+                const auto api = validated_native_move_card_api(objects.card_engine);
+                if (!native_restore_actions_settled(api.engine_state)
+                    || !native_cards_at_location(objects.card_engine, api, 4).empty())
+                    throw std::runtime_error{"pending-capture test requires an initially settled queue and empty PENDING zone"};
+                const auto hand = read_native_player_zone_cards(objects.card_engine, 0);
+                std::optional<std::size_t> target_index{};
+                for (std::size_t index{}; index < hand.size(); ++index)
+                {
+                    if (required_getter_text(hand[index].card, STR("getTag")) != "naturalApple") continue;
+                    const auto counters = capture_player_counter_state(hand[index].card);
+                    if (counters.generic != 0 || !counters.special.empty()) continue;
+                    if (target_index) throw std::runtime_error{"pending-capture test requires exactly one zero-counter HAND apple"};
+                    target_index = index;
+                }
+                if (!target_index) throw std::runtime_error{"pending-capture test found no zero-counter HAND apple"};
+                const auto target = hand[*target_index];
+                validate_player_card_effect_membership(objects.card_engine, target.card);
+                const auto* target_object = read_native_value<const void*>(target.state, CardStateSharedObjectOffset);
+                const auto* target_owner = read_native_value<const void*>(target.state, CardStateSharedControllerOffset);
+                std::vector<std::pair<std::string, std::string>> files_before{};
+                if (automatic)
+                {
+                    const auto wave = parse_int32(required_text(export_property_text(objects.spawner, STR("currentWaveIndex")), "wave"));
+                    if (!wave) throw std::runtime_error{"automatic pending-capture fixture has no wave"};
+                    test_capture = make_pending_route_c_capture(objects.spawner, *wave, std::chrono::steady_clock::now());
+                    append_route_c_trace_failure(event("identity"),
+                        "spawnerWeak=" + std::string{test_capture->spawner_identity.weak_verified ? "true" : "false"}
+                            + " worldWeak=" + (test_capture->world_identity.weak_verified ? "true" : "false")
+                            + " engineWeak=" + (test_capture->engine_identity.weak_verified ? "true" : "false")
+                            + " spawnerIndex=" + std::to_string(test_capture->spawner_identity.internal_index)
+                            + " worldIndex=" + std::to_string(test_capture->world_identity.internal_index)
+                            + " engineIndex=" + std::to_string(test_capture->engine_identity.internal_index));
+                    // Keep both records below the trace writer's 256-byte event
+                    // limit, even with maximum-width indices and uint64 epochs.
+                    append_route_c_trace_failure(event("lifetime-identity"),
+                        "lifetimeIdentity=" + route_c_capture_lifetime_identity(*test_capture)
+                            + " deleteListenerReady=" + (g_route_c_capture_delete_listener.ready.load(std::memory_order_acquire) ? "true" : "false")
+                            + " targetVerified=" + (test_capture->delete_epoch_verified ? "true" : "false"));
+                    std::ostringstream lifetime{};
+                    lifetime << "pinGlobalEpoch=" << test_capture->delete_epoch
+                             << " targetEpoch=" << test_capture->target_epoch
+                             << " watchedSpawner=" << g_route_c_capture_delete_listener.watched_spawner.load(std::memory_order_seq_cst);
+                    append_route_c_trace_failure(event("target-lifetime"), lifetime.str());
+                    if (!route_c_capture_retry_identity_available(*test_capture))
+                        throw std::runtime_error{"automatic pending-capture fixture requires verified lifetime identity before queueing"};
+                    files_before = checkpoint_files();
+                    for (const auto& [name, hash] : files_before)
+                        append_route_c_trace_failure(event("file-before"), "path=" + name + " sha256=" + hash);
+                }
+                append_route_c_trace_failure(event("before"),
+                    "state=OPEN settled=true handIndex=" + std::to_string(*target_index)
+                        + " guid=" + required_getter_text(target.card, STR("getId")) + " generic=0");
+
+                queued_engine = objects.card_engine;
+                // Mark before invoking the native queue so a partial exception
+                // also attempts normal driver resumption. No pause/state writes.
+                resume_needed = true;
+                queue_native_player_counter(queued_engine, target, {}, 1, -1, 0);
+                const auto state = required_text(export_property_text(queued_engine, STR("currentGameState")), "state");
+                const bool settled = native_restore_actions_settled(api.engine_state);
+                append_route_c_trace_failure(event("queued"),
+                    "state=" + state + " settled=" + (settled ? "true" : "false")
+                        + " " + native_queue_diagnostic(api.engine_state)
+                        + " genericBeforeResume=" + std::to_string(capture_player_counter_state(target.card).generic));
+                if (state != "OPEN" || settled)
+                {
+                    append_route_c_trace(event("inconclusive-open-or-queue"));
+                    resume();
+                    return true;
+                }
+
+                // Independently witness the real native counter action. The
+                // queue ABI/executable gates above and constructor bytes below
+                // fix these type/amount/target offsets; completed roots can stay
+                // in the arrays and must not be counted as pending actions.
+                const auto module_base = reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr));
+                const std::array<std::uint8_t, 4> type_signature{0xC6, 0x47, 0x28, 0x21};
+                const auto* type_address = reinterpret_cast<const std::uint8_t*>(module_base + 0xDF710C);
+                if (!address_is_readable(type_address, type_signature.size())
+                    || !std::equal(type_signature.begin(), type_signature.end(), type_address))
+                    throw std::runtime_error{"pending-capture counter constructor signature changed"};
+                const auto* manager = read_native_value<const void*>(api.engine_state, 0x38);
+                if (!manager || !address_is_readable(manager, 0x20)
+                    || read_native_value<std::int32_t>(manager, 8) != 3)
+                    throw std::runtime_error{"pending-capture action manager is unreadable"};
+                const auto* roots = read_native_value<const void*>(manager, 0);
+                if (!roots || !address_is_readable(roots, 48))
+                    throw std::runtime_error{"pending-capture root arrays are unreadable"};
+                std::size_t matches{};
+                for (std::size_t priority{}; priority < 3; ++priority)
+                {
+                    const auto* header = static_cast<const std::byte*>(roots) + priority * 16;
+                    const auto* data = read_native_value<const void*>(header, 0);
+                    const auto count = read_native_value<std::int32_t>(header, 8);
+                    const auto capacity = read_native_value<std::int32_t>(header, 12);
+                    if (count < 0 || count > 4096 || capacity < count || capacity > 16384
+                        || (count > 0 && (!data || !address_is_readable(data, static_cast<std::size_t>(count) * 16))))
+                        throw std::runtime_error{"pending-capture root count exceeds the guarded bounds"};
+                    for (std::int32_t index{}; index < count; ++index)
+                    {
+                        const auto* action = read_native_value<const void*>(data, static_cast<std::size_t>(index) * 16);
+                        const auto* owner = read_native_value<const void*>(data, static_cast<std::size_t>(index) * 16 + 8);
+                        if (!action || !owner || !address_is_readable(action, 0x30)
+                            || !address_is_readable(owner, 16) || read_native_value<std::int32_t>(owner, 8) <= 0
+                            || read_native_value<std::int32_t>(owner, 8) > 1'000'000)
+                            throw std::runtime_error{"pending-capture root action ownership is unreadable"};
+                        const auto action_state = read_native_value<std::uint8_t>(action, 0x29);
+                        if (action_state > 8) throw std::runtime_error{"pending-capture root action state is invalid"};
+                        if (action_state == 8 || read_native_value<std::uint8_t>(action, 0x28) != 33
+                            || read_native_value<std::uintptr_t>(action, 0) != module_base + 0x3A08FD8) continue;
+                        if (!address_is_readable(action, 0x80))
+                            throw std::runtime_error{"pending-capture counter action payload is unreadable"};
+                        if (read_native_value<const void*>(action, 0x70) != target_object
+                            || read_native_value<const void*>(action, 0x78) != target_owner
+                            || read_native_value<std::int32_t>(action, 0x68) != 1
+                            || read_native_value<std::int32_t>(action, 0x6C) != -1) continue;
+                        ++matches;
+                        std::ostringstream witness{};
+                        witness << "priority=" << priority << " action=" << action
+                                << " state=" << static_cast<unsigned>(action_state)
+                                << " type=33 amount=1 limit=-1 target=" << target_object << " owner=" << target_owner;
+                        append_route_c_trace_failure(event("native-action"), witness.str());
+                    }
+                }
+                if (matches != 1)
+                {
+                    append_route_c_trace_failure(event("inconclusive-action-witness"),
+                        "matchingPendingRoots=" + std::to_string(matches));
+                    resume();
+                    return true;
+                }
+                if (automatic)
+                {
+                    g_pending_route_c_capture = *test_capture;
+                    // Exercise the actual production updater with a real native
+                    // +1 action still pending. No fake OPEN or gate result.
+                    update_route_c_capture();
+                    if (!g_pending_route_c_capture
+                        || g_pending_route_c_capture->request_id != test_capture->request_id
+                        || g_pending_route_c_capture->wave_index != test_capture->wave_index
+                        || g_pending_route_c_capture->busy_retries != 1
+                        || g_pending_route_c_capture->open_waits != 0
+                        || g_pending_route_c_capture->deadline != test_capture->deadline
+                        || g_pending_route_c_capture->ready_at <= std::chrono::steady_clock::now())
+                        throw std::runtime_error{"automatic pending-capture fixture did not retain its identical bounded request"};
+                    if (checkpoint_files() != files_before)
+                        throw std::runtime_error{"automatic pending-capture fixture changed checkpoint files while busy"};
+                    if (!route_c_capture_retry_identity_available(*test_capture))
+                        throw std::runtime_error{"automatic pending-capture fixture lifetime changed before retained observation"};
+                    append_route_c_trace_failure(event("retained"),
+                        "request=" + std::to_string(test_capture->request_id)
+                            + " wave=" + std::to_string(test_capture->wave_index)
+                            + " busyRetries=1 sameDeadline=true identity=" + route_c_capture_lifetime_identity(*test_capture)
+                            + " targetEpoch=" + std::to_string(test_capture->target_epoch)
+                            + " unchangedFiles=" + std::to_string(files_before.size()));
+                }
+                else
+                {
+                    bool expected_rejection{};
+                    try { (void)capture_route_c_checkpoint(); }
+                    catch (const RouteCCaptureNativeActionsBusy& error)
+                    {
+                        if (error.phase != RouteCCaptureBusyPhase::BeforeRead) throw;
+                        expected_rejection = true;
+                        append_route_c_trace_failure(event("expected-rejection"), error.what());
+                    }
+                    if (!expected_rejection)
+                        throw std::runtime_error{"pending-capture production save unexpectedly succeeded; inspect checkpoint files"};
+                }
+                resume();
+                append_route_c_trace(event(automatic ? "awaiting-normal-update" : "awaiting-external-validation"));
+            }
+            catch (const std::exception& error)
+            {
+                if (test_capture && g_pending_route_c_capture
+                    && g_pending_route_c_capture->request_id == test_capture->request_id)
+                    g_pending_route_c_capture.reset();
+                append_route_c_trace_failure(event("failed"), error.what());
+                try { resume(); }
+                catch (const std::exception& cleanup_error)
+                {
+                    append_route_c_trace_failure(event("resume.failed"), cleanup_error.what());
+                }
+                throw;
+            }
+            catch (...)
+            {
+                if (test_capture && g_pending_route_c_capture
+                    && g_pending_route_c_capture->request_id == test_capture->request_id)
+                    g_pending_route_c_capture.reset();
+                append_route_c_trace(event("failed-unknown"));
+                try { resume(); }
+                catch (...) { append_route_c_trace(event("resume.failed-unknown")); }
+                throw;
+            }
+            return true;
+        }
+
         auto inject_pending_move_test_failure(PendingRouteCRestore& restore) -> void
         {
             // Read the explicit process-start test setting only once. Production
@@ -9258,6 +10297,13 @@ namespace QuantumCheckpoint
                     throw std::runtime_error{"Restored wave index does not match the checkpoint"};
                 }
 
+                if (restore.phase == RouteCRestorePhase::AwaitingPostRestoreStability
+                    && !native_restore_actions_settled(validated_native_move_card_api(objects.card_engine).engine_state))
+                {
+                    restore.stability_deadline = now + std::chrono::seconds{3};
+                    return;
+                }
+
                 if (restore.phase == RouteCRestorePhase::AwaitingStableBattle
                     && maximum && *maximum == 0)
                 {
@@ -9327,6 +10373,7 @@ namespace QuantumCheckpoint
                         + restore.exact_player_zones_reason + "; " + restore.exact_player_trash_reason};
                 }
                 verify_restore_player_effect_membership(restore, objects);
+                if (!verify_exact_player_zone_base_health(restore, objects, now)) return;
                 if (!verify_exact_player_hand_health(restore, objects, now)) return;
 
                 if (restore.exact_spawn_plan_status == "pending")
@@ -9554,27 +10601,103 @@ namespace QuantumCheckpoint
 
         auto update_route_c_capture() -> void
         {
+            const auto now = std::chrono::steady_clock::now();
             if (!g_pending_route_c_capture || g_pending_route_c_restore
-                || std::chrono::steady_clock::now() < g_pending_route_c_capture->ready_at)
+                || now < g_pending_route_c_capture->ready_at)
             {
                 return;
             }
             auto capture = *g_pending_route_c_capture;
-            g_pending_route_c_capture.reset();
+            const auto still_current = [&] {
+                return g_pending_route_c_capture && g_pending_route_c_capture->request_id == capture.request_id;
+            };
+            const auto refuse = [&](std::string_view reason) {
+                if (still_current()) g_pending_route_c_capture.reset();
+                append_route_c_trace_failure("auto-capture.refused", reason);
+                Output::send<LogLevel::Warning>(
+                    STR("[QuantumCheckpoint] Automatic Route C checkpoint refused: {}\n"), to_wstring(reason));
+            };
+            // Only the two explicit transient exception types call this helper.
+            // They share the original request, lifetime witness and deadline;
+            // changing transient kind does not restart the thirty-second budget.
+            const auto retain = [&](bool processing, RouteCCaptureBusyPhase phase) {
+                const std::string event_prefix = processing ? "auto-capture.processing." : "auto-capture.busy.";
+                const auto retry_at = std::chrono::steady_clock::now() + std::chrono::milliseconds{500};
+                if (!still_current())
+                {
+                    append_route_c_trace(event_prefix + "superseded");
+                    return;
+                }
+                if (retry_at >= capture.deadline)
+                {
+                    refuse("automatic capture transient state exceeded its fixed retry deadline");
+                    return;
+                }
+                if (!route_c_capture_retry_identity_available(capture))
+                {
+                    refuse("automatic capture transient state has no verified spawner lifetime or world/engine weak identity; no delayed retry");
+                    return;
+                }
+                try { validate_pending_route_c_capture(capture, find_route_c_objects()); }
+                catch (const std::exception& identity_error) { refuse(identity_error.what()); return; }
+                catch (...) { refuse("unknown non-standard identity exception; automatic retry is not permitted"); return; }
+                if (!still_current())
+                {
+                    append_route_c_trace(event_prefix + "superseded");
+                    return;
+                }
+                auto& pending = *g_pending_route_c_capture;
+                pending.ready_at = retry_at;
+                if (processing) ++pending.open_waits;
+                else ++pending.busy_retries;
+                append_route_c_trace_failure(event_prefix + "retry-scheduled",
+                    "request=" + std::to_string(pending.request_id) + " wave=" + std::to_string(pending.wave_index)
+                        + (processing ? " openWaits=" : " busyRetries=")
+                        + std::to_string(processing ? pending.open_waits : pending.busy_retries)
+                        + " retryDelayMs=500"
+                        + " phase=" + (phase == RouteCCaptureBusyPhase::BeforeRead ? "before-read" : "before-write")
+                        + " filesUntouched=true identity=" + route_c_capture_lifetime_identity(pending)
+                        + " targetEpoch=" + std::to_string(pending.target_epoch));
+            };
             try
             {
+                if (now >= capture.deadline)
+                    throw std::runtime_error{"automatic capture expired thirty seconds after its first due time"};
+                const auto lifetime_identity = route_c_capture_lifetime_identity(capture);
                 const auto path = capture_route_c_checkpoint(capture);
+                if (still_current()) g_pending_route_c_capture.reset();
+                append_route_c_trace_failure("auto-capture.complete",
+                    "request=" + std::to_string(capture.request_id) + " wave=" + std::to_string(capture.wave_index)
+                        + " busyRetries=" + std::to_string(capture.busy_retries)
+                        + " openWaits=" + std::to_string(capture.open_waits)
+                        + " identity=" + lifetime_identity + " targetEpoch=" + std::to_string(capture.target_epoch)
+                        + " globalEpoch=" + std::to_string(g_route_c_capture_delete_listener.epoch.load(std::memory_order_seq_cst)));
                 Output::send<LogLevel::Verbose>(
                     STR("[QuantumCheckpoint] Route C checkpoint saved for wave {}: {}\n"),
                     capture.wave_index,
                     path.wstring());
             }
+            catch (const RouteCCaptureNativeActionsBusy& error)
+            {
+                // Both typed throws precede invalidation/write. Never retry an
+                // IO failure, scene/prompt refusal, or malformed queue graph.
+                try { retain(false, error.phase); }
+                catch (const std::exception& retry_error) { refuse(retry_error.what()); }
+                catch (...) { refuse("unknown non-standard busy-retry exception; automatic retry is not permitted"); }
+            }
+            catch (const RouteCCaptureProcessingWait&)
+            {
+                try { retain(true, RouteCCaptureBusyPhase::BeforeRead); }
+                catch (const std::exception& retry_error) { refuse(retry_error.what()); }
+                catch (...) { refuse("unknown non-standard processing-wait exception; automatic retry is not permitted"); }
+            }
             catch (const std::exception& error)
             {
-                append_route_c_trace_failure("auto-capture.refused", error.what());
-                Output::send<LogLevel::Warning>(
-                    STR("[QuantumCheckpoint] Automatic Route C checkpoint refused: {}\n"),
-                    to_wstring(error.what()));
+                refuse(error.what());
+            }
+            catch (...)
+            {
+                refuse("unknown non-standard capture exception; automatic retry is not permitted");
             }
         }
 
@@ -9892,12 +11015,9 @@ namespace QuantumCheckpoint
                 append_route_c_trace("auto-capture.skipped.restore-settle");
                 return;
             }
-            g_pending_route_c_capture.emplace(PendingRouteCCapture{
-                .spawner = spawner,
-                .wave_index = *wave,
-                .ready_at = now + std::chrono::milliseconds{1500},
-            });
-            append_route_c_trace("auto-capture.scheduled.wave-poll");
+            schedule_route_c_capture(spawner, *wave, now + std::chrono::milliseconds{1500},
+                "auto-capture.scheduled.wave-poll");
+            if (!g_pending_route_c_capture) return;
             Output::send<LogLevel::Verbose>(
                 STR("[QuantumCheckpoint] Route C observed stable wave {}; checkpoint capture scheduled.\n"),
                 *wave);
@@ -9970,12 +11090,8 @@ namespace QuantumCheckpoint
                     "currentWaveIndex=" + std::to_string(*wave_index));
                 return;
             }
-            g_pending_route_c_capture.emplace(PendingRouteCCapture{
-                .spawner = context,
-                .wave_index = *wave_index,
-                .ready_at = std::chrono::steady_clock::now() + std::chrono::milliseconds{1500},
-            });
-            append_route_c_trace(
+            schedule_route_c_capture(context, *wave_index,
+                std::chrono::steady_clock::now() + std::chrono::milliseconds{1500},
                 trigger == "spawn-next-wave"
                     ? "auto-capture.scheduled.spawn-next-wave"
                     : "auto-capture.scheduled.spawn-wave-index");
@@ -13300,9 +14416,9 @@ namespace QuantumCheckpoint
         QuantumCheckpointMod()
         {
             ModName = STR("QuantumCheckpoint");
-            ModVersion = STR("0.37.0");
+            ModVersion = STR("0.38.0");
 #if defined(QUANTUM_CHECKPOINT_RUNTIME_TEST_FIXTURES)
-            ModVersion = STR("0.37.0-test-fixtures");
+            ModVersion = STR("0.38.0-test-fixtures");
 #endif
             ModDescription = STR("Route C checkpoint with optional exact-state supplements");
             ModAuthors = STR("zaofenMachine and contributors");
@@ -13312,6 +14428,7 @@ namespace QuantumCheckpoint
         ~QuantumCheckpointMod() override
         {
             g_game_thread_pump.store(nullptr, std::memory_order_release);
+            g_route_c_capture_delete_listener.stop_before_mod_destruction();
             try
             {
                 if (g_spawn_next_wave_function && g_spawn_next_wave_hook_ids)
@@ -13587,10 +14704,15 @@ namespace QuantumCheckpoint
                     append_route_c_trace("manual-save.dispatch");
                     try
                     {
-                        const auto path = capture_route_c_checkpoint();
-                        Output::send<LogLevel::Verbose>(
-                            STR("[QuantumCheckpoint] Manual Route C checkpoint saved: {}\n"),
-                            path.wstring());
+#if defined(QUANTUM_CHECKPOINT_RUNTIME_TEST_FIXTURES)
+                        if (!run_pending_capture_test_if_enabled())
+#endif
+                        {
+                            const auto path = capture_route_c_checkpoint();
+                            Output::send<LogLevel::Verbose>(
+                                STR("[QuantumCheckpoint] Manual Route C checkpoint saved: {}\n"),
+                                path.wstring());
+                        }
                     }
                     catch (const std::exception& error)
                     {

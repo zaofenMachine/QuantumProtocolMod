@@ -57,5 +57,37 @@ int main()
     for (const int schema : {-1,0,ExactPlayerHandHealthSchemaVersion + 1})
         require(!validate_player_hand_health_for_definition(ordinary,1,schema,error),
                 "unknown HAND schema versions cannot inherit dynamic base coverage");
+    for (const auto& state : {ordinary, grown, PlayerHealthState{100000,100000,{}}})
+        require(validate_player_off_field_base_health_for_definition(state,1,error),
+                "DECK/TRASH accepts default or bounded positive base growth without modifiers");
+    require(!validate_player_off_field_base_health_for_definition(ordinary,2,error),
+            "DECK/TRASH cannot lower base HP below its selected definition");
+    for (const int definition : {-1,0,100001})
+        require(!validate_player_off_field_base_health_for_definition(grown,definition,error),
+                "DECK/TRASH requires a positive bounded definition baseline");
+    for (const auto& invalid : std::vector<PlayerHealthState>{
+             {0,0,{}}, {-1,-1,{}}, {100001,100001,{}}, {2,3,{}},
+             ordinary_buff, grown_buff, {2,2,{{"expired",0,-1,0}}},
+             {2,2,{{"negative",-1,-1,0},{"positive",1,-1,0}}}})
+        require(!validate_player_off_field_base_health_for_definition(invalid,1,error),
+                "DECK/TRASH base-only coverage rejects every modifier and invalid scalar");
+    const auto empty_zone = parse_player_off_field_base_health_states("",error);
+    require(empty_zone && empty_zone->empty(), "empty DECK/TRASH has an empty record sequence");
+    const std::vector<PlayerHealthState> maximum_zone(128, grown);
+    const auto maximum_records = serialize_player_health_states(maximum_zone);
+    const auto parsed_maximum_zone = parse_player_off_field_base_health_states(maximum_records,error);
+    require(parsed_maximum_zone && *parsed_maximum_zone == maximum_zone,
+            "DECK/TRASH supports 128 native-index records without the FIELD ten-slot limit");
+    require(!parse_player_health_states(maximum_records,error),
+            "new DECK/TRASH grammar does not widen the existing FIELD/HAND record limit");
+    require(!parse_player_off_field_base_health_states(maximum_records + ";2,2",error),
+            "DECK/TRASH rejects 129 records");
+    for (const auto text : {"2,2;", ";2,2", "2,2;;1,1", "02,02", "2,2 ",
+                            "0,0", "100001,100001", "2,3", "2,3|buff,1,-1,0",
+                            "2,2|expired,0,-1,0"})
+        require(!parse_player_off_field_base_health_states(text,error),
+                "DECK/TRASH rejects malformed, noncanonical and modified records");
+    require(!parse_player_off_field_base_health_states(std::string(65537,'1'),error),
+            "DECK/TRASH record input remains size-bounded");
     std::cout << "Player health state tests passed\n";
 }

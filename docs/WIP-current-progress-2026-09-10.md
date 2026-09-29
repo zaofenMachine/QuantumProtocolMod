@@ -1,6 +1,18 @@
 # QuantumCheckpoint 当前工作进度（临时续接记录）
 
-> 2026-09-20 当前续接入口：[第三十六阶段](phase-36-player-hand-base-health.md)。用户最新要求完成当前任务后停下汇报；本轮验收与原检查点恢复已完成，不展开新功能。下方旧调试内容仅保留历史证据。
+> 2026-09-30 已按用户新指示恢复推进；沿“小关重开＋玩家精确恢复”，周额度剩余约 10% 时收尾并汇报。下方 9 月 20 日的停工指示已被本次继续指示替代。
+
+## 2026-09-30 第三十七阶段已验收，继续下一观测切片
+
+v0.38.0 已实现 Z5/T6/F9 的 DECK/TRASH 非负基础生命增长与隐藏 CardFace 数值同步，HAND3 保持独立。最终生产 DLL `345C7D029506F7E1817FD04BC20D65914D535042B654B8E372DE8EC07DAD47BB`，Mod 源码 `7B932C51EE8EC912817978585113F7FC2E78F3EAA13BA545AC1C9784057F1179`；ON/OFF 各 4/4 CTest，生产测试标记关闭。八组最终构建恢复通过全 25 项玩家对照及适用 UI 检查，覆盖牌堆成长、同名副本、场地／墓地、生成卡、全墓地、旧 HAND2、重存 HAND3/F9 和原用户检查点；另有 AAD 五组与 CDEA 三组按各自 DLL 保留。
+
+自动保存已增加两处 native idle 门禁、有界 busy 重试，以及只在读取前允许的 PROCESSING 无提示等待。固定请求／期限、world/engine weak identity 和单目标 spawner 删除见证避免跨生命周期重试；热重载关闭。DEV BD597 实际证明 busy 时 7 文件不变，正常 resume 后同请求保存、Apple 原生／UI计数变为 1。生产正常换波保存也通过。PROCESSING 等待、目标删除、监听关闭仍无实机通过声明；连续操作的第二组因 F1 迟到只保留有限结论。
+
+早期隐藏卡缓存不一致、第一条双焰火 INIT 历史差异、CDEA 换波 non-OPEN 漏保存、缺 weak serial 的 2B4 拒绝、全局删除 epoch 过严的 10AB 拒绝，均保留原始证据，未放宽成通过。稳定窗口正常抽牌已验证只回退一次，不在验证后重复修补。完整范围见[第三十七阶段](phase-37-player-zone-base-health.md)。
+
+阶段证据根为 `F:/Project/QuantumProtoclMod.runtime-evidence/20260930-player-state`，冻结工具在 `phase37-final-tooling`，最终索引／提交记录另存该根目录。原始备份23文件核对一致；原用户17个checkpoint已在阶段里程碑还原并恢复通过（主校验和 `81095982711C71E2`），游戏仍开着供本次授权测试。后续试验结束仍须再次核对还原checkpoint、4个SaveGames，关闭游戏并还原临时最小化的 Genesis 窗口，不能把本条当最终停机状态。
+
+下一项是技能 ONCE 使用位与动态 flags 的只读观测和正常来源复现。Bow deck-only 夹具及只读 F1 候选已准备，尚不代表资格保存／恢复支持；新资料目录 `F:/Project/QuantumProtoclMod.runtime-evidence/20260930-effect-qualification`。重编程和敌人精确恢复继续搁置。按用户本次指示持续推进，周额度剩约10%时完成手头切片并收尾汇报。
 
 ## 2026-09-20 当前完成状态
 

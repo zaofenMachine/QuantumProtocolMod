@@ -1501,13 +1501,16 @@ int main()
     require(!parse_exact_player_hand_health_checkpoint(missing_hand3_counters, error),
             "HAND3 still requires aligned counter coverage from schema 2");
 
-    require(ExactPlayerZonesCheckpoint{}.schema_version == 4
-                && ExactPlayerTrashCheckpoint{}.schema_version == 5
-                && ExactPlayerFieldCheckpoint{}.schema_version == 8
+    require(ExactPlayerZonesCheckpoint{}.schema_version == 5
+                && ExactPlayerTrashCheckpoint{}.schema_version == 6
+                && ExactPlayerFieldCheckpoint{}.schema_version == 9
+                && ExactPlayerZonesBaseHealthSchemaVersion == 5
+                && ExactPlayerTrashBaseHealthSchemaVersion == 6
+                && ExactPlayerFieldBaseHealthSchemaVersion == 9
                 && ExactPlayerZonesEffectMembershipSchemaVersion == 4
                 && ExactPlayerTrashEffectMembershipSchemaVersion == 5
                 && ExactPlayerFieldEffectMembershipSchemaVersion == 8,
-            "new captures select layouts that attest whole-player native effect membership");
+            "new layouts add DECK/TRASH base records while fixed effect attestation minima remain unchanged");
     const auto check_hand_health_dependency = [&](auto legacy_layout, int dependency_version,
                                                    auto serialize, auto parse, auto checksum) {
         const auto legacy_json = serialize(legacy_layout);
@@ -1670,22 +1673,173 @@ int main()
         empty_hand.player_hand_health_checksum = attested.player_hand_health_checksum;
         require(!parse(serialize(empty_hand), error),
                 "new proof versions reject a sidecar dependency on an empty HAND");
-        require(!parse(change_version(attested_json, attested_version + 1), error)
+        require(!parse(change_version(attested_json, decltype(layout){}.schema_version + 1), error)
                     && error.find("schema") != std::string::npos,
                 "future layout versions remain unsupported rather than inheriting capture-proof claims");
     };
-    check_effect_membership_schema(zones, 3, ExactPlayerZonesSchemaVersion,
+    check_effect_membership_schema(zones, 3, ExactPlayerZonesEffectMembershipSchemaVersion,
         ExactPlayerZonesEffectMembershipSchemaVersion,
         serialize_exact_player_zones_checkpoint, parse_exact_player_zones_checkpoint,
         exact_player_zones_payload_checksum);
-    check_effect_membership_schema(trash, 4, ExactPlayerTrashSchemaVersion,
+    check_effect_membership_schema(trash, 4, ExactPlayerTrashEffectMembershipSchemaVersion,
         ExactPlayerTrashEffectMembershipSchemaVersion,
         serialize_exact_player_trash_checkpoint, parse_exact_player_trash_checkpoint,
         exact_player_trash_payload_checksum);
-    check_effect_membership_schema(generated_schema, 7, ExactPlayerFieldSchemaVersion,
+    check_effect_membership_schema(generated_schema, 7, ExactPlayerFieldEffectMembershipSchemaVersion,
         ExactPlayerFieldEffectMembershipSchemaVersion,
         serialize_exact_player_field_checkpoint, parse_exact_player_field_checkpoint,
         exact_player_field_payload_checksum);
+
+    const auto check_off_field_base_health = [&](auto layout, int version,
+                                                  auto serialize, auto parse, auto checksum, auto validate) {
+        layout.schema_version = version - 1;
+        layout.player_hand = parsed_hand_base->player_hand;
+        layout.player_hand_health_checksum = parsed_hand_base->payload_checksum;
+        const auto legacy_json = serialize(layout);
+        const auto legacy_hash = checksum(layout);
+        require(parse(legacy_json,error).has_value()
+                    && legacy_json.find("BaseHealthStates") == std::string::npos,
+                "previous layouts retain their exact fields and default-only DECK/TRASH meaning");
+        auto hidden_legacy = layout;
+        hidden_legacy.player_deck_base_health_states = "2,2";
+        hidden_legacy.payload_checksum = checksum(hidden_legacy);
+        require(checksum(hidden_legacy) == legacy_hash && serialize(hidden_legacy) == legacy_json
+                    && !validate(hidden_legacy,error),
+                "legacy hashing stays unchanged but structural validation rejects hidden DECK coverage");
+        if constexpr (requires { layout.player_trash_base_health_states; })
+        {
+            hidden_legacy = layout;
+            hidden_legacy.player_trash_base_health_states = "2,2";
+            hidden_legacy.payload_checksum = checksum(hidden_legacy);
+            require(checksum(hidden_legacy) == legacy_hash && serialize(hidden_legacy) == legacy_json
+                        && !validate(hidden_legacy,error),
+                    "legacy structural validation rejects hidden TRASH coverage independently");
+        }
+        for (const std::string key : {"playerDeckBaseHealthStates", "playerTrashBaseHealthStates"})
+        {
+            if constexpr (!requires { layout.player_trash_base_health_states; })
+            {
+                if (key == "playerTrashBaseHealthStates") continue;
+            }
+            for (const std::string value : {"", "2,2"})
+            {
+                auto injected = legacy_json;
+                injected.insert(injected.rfind('}'),",\"" + key + "\":\"" + value + "\"");
+                require(!parse(injected,error),
+                        "legacy JSON rejects even an empty newer base-health field");
+            }
+        }
+
+        layout.schema_version = version;
+        layout.player_deck = card_array({"mageSorcIgnis", "mageSorcIgnis"});
+        layout.player_deck_base_health_states = "1,1;2,2";
+        if constexpr (requires { layout.player_trash_base_health_states; })
+        {
+            layout.player_trash = card_array({"mageSorcIgnis", "mageSorcIgnis"});
+            layout.player_trash_base_health_states = "3,3;1,1";
+        }
+        const auto current_json = serialize(layout);
+        const auto current = parse(current_json,error);
+        require(current && current->schema_version == version
+                    && current->player_deck == layout.player_deck
+                    && current->player_deck_base_health_states == "1,1;2,2"
+                    && current->player_hand_health_checksum == parsed_hand_base->payload_checksum
+                    && serialize(*current) == current_json,
+                "new layout binds native DECK indexes to base records and preserves the independent HAND3 link");
+        if constexpr (requires { layout.player_trash_base_health_states; })
+            require(current->player_trash == layout.player_trash
+                        && current->player_trash_base_health_states == "3,3;1,1",
+                    "TRASH base records round trip in insertion order with duplicate card definitions");
+        auto swapped = layout;
+        swapped.player_deck_base_health_states = "2,2;1,1";
+        require(checksum(swapped) != checksum(layout) && parse(serialize(swapped),error).has_value(),
+                "swapping base values between identical DECK cards changes the layout checksum");
+        if constexpr (requires { layout.player_trash_base_health_states; })
+        {
+            swapped = layout;
+            swapped.player_trash_base_health_states = "1,1;3,3";
+            require(checksum(swapped) != checksum(layout) && parse(serialize(swapped),error).has_value(),
+                    "swapping base values between identical TRASH cards changes the layout checksum");
+        }
+        auto tampered = current_json;
+        tampered.replace(tampered.find("1,1;2,2"),7,"2,2;1,1");
+        require(!parse(tampered,error) && error.find("checksum") != std::string::npos,
+                "changing aligned base records without recomputing the payload checksum is rejected");
+
+        for (const auto invalid : {"", "1,1", "1,1;2,2;3,3", "1,1;0,0", "1,1;100001,100001",
+                                   "1,1;2,3", "1,1;2,3|buff,1,-1,0", "1,1;2,2|expired,0,-1,0",
+                                   "1,1;2,2;", "1,1;02,02"})
+        {
+            auto broken = layout;
+            broken.player_deck_base_health_states = invalid;
+            require(!parse(serialize(broken),error),
+                    "correct checksums cannot authorize invalid or misaligned DECK base records");
+            if constexpr (requires { layout.player_trash_base_health_states; })
+            {
+                broken = layout;
+                broken.player_trash_base_health_states = invalid;
+                require(!parse(serialize(broken),error),
+                        "correct checksums cannot authorize invalid or misaligned TRASH base records");
+            }
+        }
+        for (const std::string key : {"playerDeckBaseHealthStates", "playerTrashBaseHealthStates"})
+        {
+            if constexpr (!requires { layout.player_trash_base_health_states; })
+            {
+                if (key == "playerTrashBaseHealthStates") continue;
+            }
+            auto missing = current_json;
+            const auto begin = missing.find("  \"" + key + "\"");
+            missing.erase(begin,missing.find('\n',begin) - begin + 1);
+            require(!parse(missing,error), "new layouts require explicit base-health fields even for default cards");
+        }
+        auto empty_deck = layout;
+        empty_deck.player_deck = "()";
+        empty_deck.player_deck_base_health_states.clear();
+        require(parse(serialize(empty_deck),error).has_value(),
+                "empty DECK aligns with an explicitly empty base-record string");
+        empty_deck.player_deck_base_health_states = "1,1";
+        require(!parse(serialize(empty_deck),error), "empty DECK cannot carry a stray numeric record");
+        if constexpr (requires { layout.player_trash_base_health_states; layout.player_field; })
+        {
+            auto empty_trash = layout;
+            empty_trash.player_trash = "()";
+            empty_trash.player_trash_base_health_states.clear();
+            require(parse(serialize(empty_trash),error).has_value(),
+                    "FIELD layouts can have empty TRASH and an explicitly empty record string");
+            empty_trash.player_trash_base_health_states = "1,1";
+            require(!parse(serialize(empty_trash),error), "empty TRASH cannot carry a stray numeric record");
+        }
+        auto large = layout;
+        large.player_deck = "(";
+        large.player_deck_base_health_states.clear();
+        for (int index{}; index < 11; ++index)
+        {
+            if (index != 0)
+            {
+                large.player_deck += ',';
+                large.player_deck_base_health_states += ';';
+            }
+            large.player_deck += "(CardInfo=(Tag=\"mageSorcIgnis\"))";
+            large.player_deck_base_health_states += "2,2";
+        }
+        large.player_deck += ')';
+        require(parse(serialize(large),error).has_value(),
+                "layout parsing does not impose the FIELD ten-slot limit on DECK numeric records");
+        auto future = layout;
+        ++future.schema_version;
+        require(!parse(serialize(future),error) && error.find("schema") != std::string::npos,
+                "unknown later versions cannot silently expand base-health coverage");
+    };
+    check_off_field_base_health(zones,ExactPlayerZonesBaseHealthSchemaVersion,
+        serialize_exact_player_zones_checkpoint,parse_exact_player_zones_checkpoint,
+        exact_player_zones_payload_checksum,validate_exact_player_zones_checkpoint);
+    check_off_field_base_health(trash,ExactPlayerTrashBaseHealthSchemaVersion,
+        serialize_exact_player_trash_checkpoint,parse_exact_player_trash_checkpoint,
+        exact_player_trash_payload_checksum,validate_exact_player_trash_checkpoint);
+    check_off_field_base_health(generated_schema,ExactPlayerFieldBaseHealthSchemaVersion,
+        serialize_exact_player_field_checkpoint,parse_exact_player_field_checkpoint,
+        exact_player_field_payload_checksum,validate_exact_player_field_checkpoint);
 
     std::cout << "Route C checkpoint persistence tests passed\n";
     return 0;

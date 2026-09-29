@@ -364,6 +364,26 @@ namespace QuantumCheckpoint
             return true;
         }
 
+        auto validate_off_field_base_health_records(std::size_t zone_size,
+                                                    std::string_view records,
+                                                    bool covered,
+                                                    std::string& error) -> bool
+        {
+            if (!covered)
+            {
+                if (records.empty()) return true;
+                error = "legacy player layout cannot claim DECK/TRASH base-health coverage";
+                return false;
+            }
+            const auto states = parse_player_off_field_base_health_states(records, error);
+            if (!states || states->size() != zone_size)
+            {
+                error = "player layout DECK/TRASH base-health records are invalid or misaligned: " + error;
+                return false;
+            }
+            return true;
+        }
+
         auto required_string(const std::unordered_map<std::string, JsonValue>& values,
                              std::string_view name, std::string& error)
             -> std::optional<std::string>
@@ -1732,6 +1752,8 @@ namespace QuantumCheckpoint
 
         if (checkpoint.schema_version >= 3)
             append_hash_bytes(hash, checkpoint.player_hand_health_checksum);
+        if (checkpoint.schema_version >= ExactPlayerZonesBaseHealthSchemaVersion)
+            append_hash_bytes(hash, checkpoint.player_deck_base_health_states);
 
         std::ostringstream output{};
         output << std::hex << std::uppercase << std::setw(16) << std::setfill('0') << hash;
@@ -1761,6 +1783,9 @@ namespace QuantumCheckpoint
         if (checkpoint.schema_version >= 3)
             output << "  \"playerHandHealthChecksum\": \""
                    << json_escape(checkpoint.player_hand_health_checksum) << "\",\n";
+        if (checkpoint.schema_version >= ExactPlayerZonesBaseHealthSchemaVersion)
+            output << "  \"playerDeckBaseHealthStates\": \""
+                   << json_escape(checkpoint.player_deck_base_health_states) << "\",\n";
         output << "  \"payloadChecksum\": \"" << checkpoint.payload_checksum << "\"\n"
                << "}\n";
         return output.str();
@@ -1828,6 +1853,8 @@ namespace QuantumCheckpoint
         }
         if (!validate_hand_health_checksum_link(hand->size(), checkpoint.player_hand_health_checksum,
                                                checkpoint.schema_version >= 3, error)) return false;
+        if (!validate_off_field_base_health_records(deck->size(), checkpoint.player_deck_base_health_states,
+                checkpoint.schema_version >= ExactPlayerZonesBaseHealthSchemaVersion, error)) return false;
         if (checkpoint.payload_checksum != exact_player_zones_payload_checksum(checkpoint))
         {
             error = "exact player-zones payload checksum does not match";
@@ -1880,6 +1907,15 @@ namespace QuantumCheckpoint
             error = "legacy player-zones JSON contains a newer hand-health dependency";
             return std::nullopt;
         }
+        if (checkpoint.schema_version >= ExactPlayerZonesBaseHealthSchemaVersion)
+        {
+            READ_ZONES_STRING(player_deck_base_health_states, "playerDeckBaseHealthStates");
+        }
+        else if (values->contains("playerDeckBaseHealthStates"))
+        {
+            error = "legacy player-zones JSON contains newer DECK base-health records";
+            return std::nullopt;
+        }
         READ_ZONES_STRING(payload_checksum, "payloadChecksum");
 
 #undef READ_ZONES_INTEGER
@@ -1910,6 +1946,11 @@ namespace QuantumCheckpoint
 
         if (checkpoint.schema_version >= 4)
             append_hash_bytes(hash, checkpoint.player_hand_health_checksum);
+        if (checkpoint.schema_version >= ExactPlayerTrashBaseHealthSchemaVersion)
+        {
+            append_hash_bytes(hash, checkpoint.player_deck_base_health_states);
+            append_hash_bytes(hash, checkpoint.player_trash_base_health_states);
+        }
 
         std::ostringstream output{};
         output << std::hex << std::uppercase << std::setw(16) << std::setfill('0') << hash;
@@ -1940,6 +1981,11 @@ namespace QuantumCheckpoint
         if (checkpoint.schema_version >= 4)
             output << "  \"playerHandHealthChecksum\": \""
                    << json_escape(checkpoint.player_hand_health_checksum) << "\",\n";
+        if (checkpoint.schema_version >= ExactPlayerTrashBaseHealthSchemaVersion)
+            output << "  \"playerDeckBaseHealthStates\": \""
+                   << json_escape(checkpoint.player_deck_base_health_states) << "\",\n"
+                   << "  \"playerTrashBaseHealthStates\": \""
+                   << json_escape(checkpoint.player_trash_base_health_states) << "\",\n";
         output << "  \"payloadChecksum\": \"" << checkpoint.payload_checksum << "\"\n"
                << "}\n";
         return output.str();
@@ -2045,6 +2091,10 @@ namespace QuantumCheckpoint
         }
         if (!validate_hand_health_checksum_link(hand->size(), checkpoint.player_hand_health_checksum,
                                                checkpoint.schema_version >= 4, error)) return false;
+        if (!validate_off_field_base_health_records(deck->size(), checkpoint.player_deck_base_health_states,
+                checkpoint.schema_version >= ExactPlayerTrashBaseHealthSchemaVersion, error)
+            || !validate_off_field_base_health_records(trash->size(), checkpoint.player_trash_base_health_states,
+                checkpoint.schema_version >= ExactPlayerTrashBaseHealthSchemaVersion, error)) return false;
         if (checkpoint.payload_checksum != exact_player_trash_payload_checksum(checkpoint))
         {
             error = "exact player-trash payload checksum does not match";
@@ -2098,6 +2148,16 @@ namespace QuantumCheckpoint
             error = "legacy player-trash JSON contains a newer hand-health dependency";
             return std::nullopt;
         }
+        if (checkpoint.schema_version >= ExactPlayerTrashBaseHealthSchemaVersion)
+        {
+            READ_TRASH_STRING(player_deck_base_health_states, "playerDeckBaseHealthStates");
+            READ_TRASH_STRING(player_trash_base_health_states, "playerTrashBaseHealthStates");
+        }
+        else if (values->contains("playerDeckBaseHealthStates") || values->contains("playerTrashBaseHealthStates"))
+        {
+            error = "legacy player-trash JSON contains newer DECK/TRASH base-health records";
+            return std::nullopt;
+        }
         READ_TRASH_STRING(payload_checksum, "payloadChecksum");
 
 #undef READ_TRASH_INTEGER
@@ -2136,6 +2196,11 @@ namespace QuantumCheckpoint
 
         if (checkpoint.schema_version >= 7)
             append_hash_bytes(hash, checkpoint.player_hand_health_checksum);
+        if (checkpoint.schema_version >= ExactPlayerFieldBaseHealthSchemaVersion)
+        {
+            append_hash_bytes(hash, checkpoint.player_deck_base_health_states);
+            append_hash_bytes(hash, checkpoint.player_trash_base_health_states);
+        }
 
         std::ostringstream output{};
         output << std::hex << std::uppercase << std::setw(16) << std::setfill('0') << hash;
@@ -2182,6 +2247,11 @@ namespace QuantumCheckpoint
         if (checkpoint.schema_version >= 7)
             output << "  \"playerHandHealthChecksum\": \""
                    << json_escape(checkpoint.player_hand_health_checksum) << "\",\n";
+        if (checkpoint.schema_version >= ExactPlayerFieldBaseHealthSchemaVersion)
+            output << "  \"playerDeckBaseHealthStates\": \""
+                   << json_escape(checkpoint.player_deck_base_health_states) << "\",\n"
+                   << "  \"playerTrashBaseHealthStates\": \""
+                   << json_escape(checkpoint.player_trash_base_health_states) << "\",\n";
         output << "  \"payloadChecksum\": \"" << checkpoint.payload_checksum << "\"\n"
                << "}\n";
         return output.str();
@@ -2328,6 +2398,10 @@ namespace QuantumCheckpoint
         }
         if (!validate_hand_health_checksum_link(hand->size(), checkpoint.player_hand_health_checksum,
                                                checkpoint.schema_version >= 7, error)) return false;
+        if (!validate_off_field_base_health_records(deck->size(), checkpoint.player_deck_base_health_states,
+                checkpoint.schema_version >= ExactPlayerFieldBaseHealthSchemaVersion, error)
+            || !validate_off_field_base_health_records(trash->size(), checkpoint.player_trash_base_health_states,
+                checkpoint.schema_version >= ExactPlayerFieldBaseHealthSchemaVersion, error)) return false;
         if (checkpoint.payload_checksum != exact_player_field_payload_checksum(checkpoint))
         {
             error = "exact player-field payload checksum does not match";
@@ -2408,6 +2482,16 @@ namespace QuantumCheckpoint
         else if (values->contains("playerHandHealthChecksum"))
         {
             error = "legacy player-field JSON contains a newer hand-health dependency";
+            return std::nullopt;
+        }
+        if (checkpoint.schema_version >= ExactPlayerFieldBaseHealthSchemaVersion)
+        {
+            READ_FIELD_STRING(player_deck_base_health_states, "playerDeckBaseHealthStates");
+            READ_FIELD_STRING(player_trash_base_health_states, "playerTrashBaseHealthStates");
+        }
+        else if (values->contains("playerDeckBaseHealthStates") || values->contains("playerTrashBaseHealthStates"))
+        {
+            error = "legacy player-field JSON contains newer DECK/TRASH base-health records";
             return std::nullopt;
         }
         READ_FIELD_STRING(payload_checksum, "payloadChecksum");

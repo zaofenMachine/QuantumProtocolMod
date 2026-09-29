@@ -20,6 +20,15 @@ namespace QuantumCheckpoint
     // proof remain runtime checks, outside this pure scalar/modifier validator.
     auto validate_player_hand_health_for_definition(const PlayerHealthState& state,
         std::int32_t definition_health, int hand_schema, std::string& error) -> bool;
+    // New DECK/TRASH layout schemas preserve only nonnegative base-HP gains:
+    // positive bounded base=max, no modifiers, and base >= selected definition.
+    // Current HP, independent adjustment, ownership and membership stay runtime checks.
+    auto validate_player_off_field_base_health_for_definition(const PlayerHealthState& state,
+        std::int32_t definition_health, std::string& error) -> bool;
+    // Empty zones are represented by an empty string; up to 128 canonical records.
+    // This does not broaden the existing ten-record FIELD/HAND health grammar.
+    auto parse_player_off_field_base_health_states(std::string_view text, std::string& error)
+        -> std::optional<std::vector<PlayerHealthState>>;
     auto serialize_player_health_states(const std::vector<PlayerHealthState>& states) -> std::string;
     auto parse_player_health_states(std::string_view text, std::string& error)
         -> std::optional<std::vector<PlayerHealthState>>;

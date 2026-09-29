@@ -417,6 +417,138 @@ function ConvertTo-NativeEffectMembership {
     }
 }
 
+function Get-UninitializedCardExclusion {
+    param(
+        [Parameter(Mandatory = $true)][object]$Inventory,
+        [Parameter(Mandatory = $true)][object]$Card,
+        [Parameter(Mandatory = $true)][string]$CardName,
+        [Parameter(Mandatory = $true)][object]$ObjectNameCounts,
+        [Parameter(Mandatory = $true)][object]$PlacementCountsByOwner
+    )
+
+    # This is an exclusion proof for a fully invalid reflected actor, not a
+    # repair of its native memory. Any missing/ambiguous evidence leaves it on
+    # the original comparison path (which rejects a CardInfo without a Tag).
+    $zeroId = '00000000000000000000000000000000'
+    $emptyInfo = '(CardInfo=(Level=1,rarityTier=1,imageTint=(R=1.000000,G=1.000000,B=1.000000,A=1.000000),relativeRarity=1.000000,usageType=UNLOCKABLE))'
+    if ((Get-SnapshotProperty $Card 'getter:getId') -cne $zeroId -or
+        (Get-SnapshotProperty $Card 'getter:getTag') -cne 'None' -or
+        (Get-SnapshotProperty $Card 'getter:getCurrentHealth') -cne '0' -or
+        (Get-SnapshotProperty $Card 'getter:getCardLocation') -cne 'HAND' -or
+        (Get-SnapshotProperty $Card 'getter:getCardInfoInstance') -cne $emptyInfo -or
+        $CardName -cnotmatch '^BP_InGameCard_C_[0-9]+$' -or
+        $ObjectNameCounts[$CardName] -ne 1 -or $PlacementCountsByOwner[$CardName] -ne 1) {
+        return $null
+    }
+
+    try {
+        if ($Inventory.schemaVersion -ne 5 -or $Inventory.objectCount -ne @($Inventory.objects).Count) {
+            return $null
+        }
+        $objectsByPath = [System.Collections.Generic.Dictionary[string,object]]::new([System.StringComparer]::Ordinal)
+        foreach ($snapshot in $Inventory.objects) {
+            if ($snapshot.fullName -isnot [string] -or $snapshot.properties -isnot [pscustomobject]) { return $null }
+            $separator = $snapshot.fullName.IndexOf(' ')
+            if ($separator -lt 1) { return $null }
+            $objectPath = $snapshot.fullName.Substring($separator + 1)
+            if (-not $objectPath.StartsWith('/') -or $objectsByPath.ContainsKey($objectPath)) { return $null }
+            $objectsByPath.Add($objectPath, $snapshot)
+        }
+        $cardPath = $Card.fullName.Substring($Card.fullName.IndexOf(' ') + 1)
+        $placementPath = $cardPath + '.CardPlacementComponent'
+        if ((Get-SnapshotProperty $Card 'CardPlacementComponent') -cne "CardPlacementComponent'$placementPath'" -or
+            -not $objectsByPath.ContainsKey($placementPath)) { return $null }
+        $placement = $objectsByPath[$placementPath]
+        if ($placement.role -cne 'CardPlacementComponent' -or
+            (Get-SnapshotProperty $placement 'getter:getPlacedFieldSlot') -cne 'None') { return $null }
+
+        $nativeArrays = [System.Collections.Generic.List[object]]::new()
+        $playerRoles = @('BP_ControllerDeck_C', 'BP_ControllerHand_C', 'BP_ControllerTrash_C')
+        foreach ($role in $playerRoles) {
+            $controllers = @($Inventory.objects | Where-Object {
+                $_.role -ceq $role -and -not $_.fullName.Contains('Default__') -and
+                (Get-SnapshotProperty $_ 'boardSide') -ceq 'PLAYER'
+            })
+            if ($controllers.Count -ne 1 -or
+                $null -eq $controllers[0].properties.PSObject.Properties['native:cardIdOrder']) { return $null }
+        }
+        # Inspect every emitted native ID array, including any extra side/zone,
+        # while requiring complete ID and instance arrays for all player D/H/T.
+        foreach ($snapshot in $Inventory.objects) {
+            $property = $snapshot.properties.PSObject.Properties['native:cardIdOrder']
+            if ($null -eq $property) { continue }
+            if ($property.Value -isnot [string]) { return $null }
+            $parsed = ('{"ids":' + $property.Value + '}') | ConvertFrom-Json
+            if ($parsed.ids -isnot [System.Array] -or @($parsed.PSObject.Properties).Count -ne 1) { return $null }
+            $seenIds = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+            foreach ($id in $parsed.ids) {
+                if ($id -isnot [string] -or $id -cnotmatch '^[0-9A-F]{32}$' -or
+                    $id -ceq $zeroId -or -not $seenIds.Add($id)) { return $null }
+            }
+            $side = Get-SnapshotProperty $snapshot 'boardSide'
+            $instanceCount = $null
+            if ($snapshot.role -cin $playerRoles -and $side -ceq 'PLAYER') {
+                $instances = Get-SnapshotProperty $snapshot 'native:cardOrder'
+                if ([string]::IsNullOrWhiteSpace($instances)) { return $null }
+                $instanceCount = @(Split-UnrealArray $instances).Count
+                if ($instanceCount -ne @($parsed.ids).Count) { return $null }
+            }
+            $nativeArrays.Add([ordered]@{ controller = $snapshot.fullName; side = $side;
+                idCount = @($parsed.ids).Count; instanceCount = $instanceCount; containsExcludedId = $false })
+        }
+
+        $slots = @($Inventory.objects | Where-Object {
+            $_.role -ceq 'BP_FieldSlot_C' -and -not $_.fullName.Contains('Default__')
+        })
+        # A complete known board prevents missing slot observations from being
+        # mistaken for proof that no FIELD reference exists.
+        if ($slots.Count -ne 20) { return $null }
+        $slotKeys = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+        $slotProof = [System.Collections.Generic.List[object]]::new()
+        foreach ($slot in $slots) {
+            $side = Get-SnapshotProperty $slot 'boardSide'
+            $row = Get-SnapshotProperty $slot 'rowType'
+            $index = Get-SnapshotProperty $slot 'SlotIndex'
+            $placementInfo = Get-SnapshotProperty $slot 'getter:getPlacementInfo'
+            if ($side -cnotin @('PLAYER', 'ENEMY') -or $row -cnotin @('FRONT', 'BACK') -or
+                $index -cnotmatch '^[0-4]$' -or -not $slotKeys.Add("${side}:${row}:$index")) { return $null }
+            $expectedPlacementInfo = '(Type=FIELD_SLOT'
+            if ($index -cne '0') { $expectedPlacementInfo += ",Index=$index" }
+            if ($row -ceq 'BACK') { $expectedPlacementInfo += ',row=BACK' }
+            if ($side -ceq 'ENEMY') { $expectedPlacementInfo += ',side=ENEMY' }
+            $expectedPlacementInfo += ')'
+            if ($placementInfo -cne $expectedPlacementInfo) { return $null }
+            foreach ($property in $slot.properties.PSObject.Properties) {
+                if ($property.Value -isnot [string] -or
+                    $property.Value.Contains($CardName) -or $property.Value.Contains($cardPath) -or
+                    $property.Value.Contains($zeroId)) { return $null }
+            }
+            $slotProof.Add([ordered]@{ fullName = $slot.fullName; slot = "${side}:${row}:$index";
+                getPlacementInfo = $placementInfo; knownCompletePlacementInfo = $true;
+                containsActorOrIdReference = $false })
+        }
+
+        return [ordered]@{
+            fullName = $Card.fullName
+            id = $zeroId
+            tag = 'None'
+            currentHealth = '0'
+            reportedLocation = Get-SnapshotProperty $Card 'getter:getCardLocation'
+            cardInfoInstance = $emptyInfo
+            cardInfoTagAbsent = $true
+            knownCompleteEmptyDefinition = $true
+            uniqueActorNameAndObjectPath = $true
+            placement = [ordered]@{ fullName = $placement.fullName; uniqueOwnerPlacementCount = 1;
+                matchesActorComponentReference = $true; getPlacedFieldSlot = 'None' }
+            nativeZoneProof = @($nativeArrays)
+            fieldSlotProof = @($slotProof)
+            reason = 'Zero reflected GUID, Tag=None and complete known empty definition; zero reflected HP; uniquely unplaced and absent from all observed native ID arrays and every slot on the complete board'
+        }
+    } catch {
+        return $null
+    }
+}
+
 function ConvertTo-NormalizedInventory {
     param([Parameter(Mandatory = $true)][string]$Path)
 
@@ -453,8 +585,16 @@ function ConvertTo-NormalizedInventory {
     }
 
     $cards = [System.Collections.Generic.List[object]]::new()
+    $excludedActors = [System.Collections.Generic.List[object]]::new()
     foreach ($card in @($inventory.objects | Where-Object role -eq 'BP_InGameCard_C')) {
         $cardName = Get-UnrealObjectName $card.fullName
+        $exclusion = if ($cardName) {
+            Get-UninitializedCardExclusion $inventory $card $cardName $objectNameCounts $placementCountsByOwner
+        } else { $null }
+        if ($null -ne $exclusion) {
+            $excludedActors.Add($exclusion)
+            continue
+        }
         $placement = $placementsByOwner[$cardName]
         $field = '-'
         $fieldBindingAvailable = $false
@@ -632,6 +772,7 @@ function ConvertTo-NormalizedInventory {
         fileSha256 = (Get-FileHash -LiteralPath $resolvedPath -Algorithm SHA256).Hash
         schemaVersion = $inventory.schemaVersion
         capturedAtUtc = $inventory.capturedAtUtc
+        excludedUninitializedActors = @($excludedActors)
         context = [ordered]@{
             sourceLevelName = Get-SnapshotProperty $gameInstance 'sourceLevelName'
             currentLevel = Get-SnapshotProperty $gameInstance 'CurrentLevel'
@@ -855,6 +996,11 @@ $report = [ordered]@{
         path = $afterState.path
         fileSha256 = $afterState.fileSha256
         capturedAtUtc = $afterState.capturedAtUtc
+    }
+    normalization = [ordered]@{
+        beforeExcludedUninitializedActors = @($beforeState.excludedUninitializedActors)
+        afterExcludedUninitializedActors = @($afterState.excludedUninitializedActors)
+        exclusionScope = 'Only the listed fully invalid reflected actors are omitted from derived card state and runtime GUID collections. Raw inventories and hashes, controller sequences, slot observations and effects of all retained cards are unchanged. Native memory or UI history on an excluded residual actor is not interpreted as a live card. Missing or ambiguous proof keeps the original rejection/comparison path; no skill history is normalized.'
     }
     checks = [ordered]@{
         semanticEqual = ($differences.Count -eq 0)
