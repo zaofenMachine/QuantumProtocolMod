@@ -1,6 +1,18 @@
 # QuantumCheckpoint 当前工作进度（临时续接记录）
 
-> 2026-10-15 当前沿“小关重开＋受限玩家恢复”持续推进，本轮额度收尾阈值为剩余30%。Phase40 基础长弓切片已完成下述实机范围、冻结复验和独立清理；接着处理角色能力状态边界。下方旧阶段均是当时记录，不代表后续部署／停机状态。
+> 2026-10-15 当前沿“小关重开＋受限玩家恢复”持续推进，本轮额度收尾阈值为剩余约30%。Phase41 角色资源许可守卫已完成下述实机范围、冻结复验和独立清理；下一项只读评估基础长弓 PLAYER FIELD 准入。下方旧阶段均是当时记录，不代表后续部署／停机状态。
+
+## 2026-10-15 第四十一阶段：角色资源许可守卫已收尾
+
+当前 v0.42.0，生产 OFF 4/4 CTest，DLL `58867DE68C189005D287047FAAB2E30C25404F707FE7E9E8FAA06237355D863F`，实际 Mod 源码 `692079558207364BB16DC660B0DA2BACA642CD9B335F930F45715576BF57703B`。新角色资源 C3 保存实际规范 False／True、policy observed-allowance-match-v1，绑定主checksum／EXE／时间／关卡／波次；仅未满充，恢复前后与稳定采样必须匹配，不写许可bool。C1数值语义与unknown保留，C2 False-only保持独立。Q1/Q2玩家DHTF资格不包含角色能力牌生命周期。详见[第四十一阶段](phase-41-character-allowance-guard.md)。
+
+七个资源正例均25/25（五个C3、两个C2／兼容）；两个相反许可启动案例均在玩家布局前失败并各一次语义回退。二十个资源审计加一个原用户legacy审计均完成各自范围；无资源／坏checksum／错时间及两个旧档启动差异保留24/25，不计精确正例。候选build03仅False捕获曾导致True2/6来源丢数值、恢复0/6，最终build04以C3修正，原失败保留。True／False与正常加载SaveGame／标题直接F6有本轮相关性，未证明完整因果或曾经满充假说。
+
+证据根 `QuantumProtoclMod.runtime-evidence/20261015-character-allowance-guard`。原用户最终回归25/25，许可C1仍unknown。74个工具文件、2233个外部文件和152个目录集合冻结；44项复验通过（21验收＋22原比较＋1合成自测），10正例／57拒绝变体／4checksum向量均属合成审计工具自测。原28项和差异忠实保留。manifest `53F536F0FD85CEFB72DCB24BCB58A892EA9BA3300DC6E1A2FFDC13D75AAE05F4`；索引 `phase41-frozen-revalidation-20261014T222451560922Z/revalidation-index.json`。
+
+`validation-summary.json` 和 `session-cleanup.json` 已完成；正常关闭游戏，fresh backup的17个checkpoint＋4个SaveGames逐字节还原，主checksum `81095982711C71E2`，新58867D DLL保留，未操作Genesis。summary SHA `EFDADFBFF9D76AF3852516DC04B0762E6DC8690F8DB66DD2B1AF4A8B58CB2B0D`，cleanup SHA `53A99257E141E5750F56A934ED511EF3D0785B2469633FE6AACD0131D82FA43E`。提交推送另记同根 `commit-and-push.json`；不能编辑r39/r40/r41冻结工具及固定case文件集合。
+
+下一步 Phase42 先读 `runtime/phase42-bow-field-design-review.md` 及独立 persistence/native 审阅；只研究基础Bow在PLAYER FIELD，暂定独立F12准入、复用既有Q2，首片全D/H/T/F只允许一个baseBow。不要把Bow加进通用supports_plain_player_field_card，不改F11和旧Q2的效果语义；需先确认受抑制播放不会更换effect数组／descriptor，不得弱化header/owner/queue守卫。新阶段使用独立证据根和fresh backup。满充／能力牌、升级／动态ONCE、LEVEL、敌人精确及重编程仍不扩域。
 
 ## 2026-10-15 第四十阶段：基础长弓 ONCE 原生回放
 

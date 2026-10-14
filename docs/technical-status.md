@@ -1,8 +1,18 @@
 # 技术状态与已知事实
 
-> 2026-10-15 当前续接入口：[第四十阶段](phase-40-bow-once-replay.md)、[第三十九阶段 A](phase-39-player-qualification-baseline.md)及[工作进度](WIP-current-progress-2026-09-10.md)。方向仍为“小关重开 + 玩家精确恢复”，重编程与敌人精确恢复搁置。
+> 2026-10-15 当前续接入口：[第四十一阶段](phase-41-character-allowance-guard.md)及[工作进度](WIP-current-progress-2026-09-10.md)。方向仍为“小关重开 + 玩家精确恢复”，重编程与敌人精确恢复搁置。
 
 ## 2026-10-15 当前状态
+
+v0.42.0 新捕获角色资源 C3（observed-allowance-match-v1），保存规范 False／True 并在恢复前后匹配；C1 旧数值语义与许可 unknown、C2 False-only 均独立保留。只支持未满充。唯一 PLAYER 角色槽、mCardEngine 归属、world/engine/slot weak identity、getter 原生签名和返回 ABI 经守卫，双次采样与原生字节相符。没有调用许可 setter 或直接写字节，能力牌状态明确 not-covered。
+
+七个资源正例（其中五个 C3、两个 C2／兼容）均25/25；False→True、True→False 两个启动不匹配在玩家布局前失败，各一次语义回退。无资源、坏 checksum、错 captureTime 以及 C1 未知单独验收，二十个资源审计不等于二十次完整恢复成功。最终原用户检查点25/25，保存时资格和许可仍旧档未知。比较器全部28项与差异保留，稳定观测是离散采样，未证明连续不变或 trace 独立覆盖完整三秒。
+
+候选 False-only 构建曾让自然 True 2/6 来源丢失资源补充、恢复成0/6，24/25失败保留；最终用独立 C3 正确保存 True 来源，未改变 C2 含义。正常 SaveGame 加载与标题直接F6的实际 True／False 相关性已记录，完整初始化因果和“曾经满充”假说尚未证明。静态 getter 只读取许可字节，不能等同满充或能力牌存在。
+
+生产 OFF 4/4 CTest，最终 DLL `58867DE68C189005D287047FAAB2E30C25404F707FE7E9E8FAA06237355D863F`，实际 Mod 源码 `692079558207364BB16DC660B0DA2BACA642CD9B335F930F45715576BF57703B`。证据根 `QuantumProtoclMod.runtime-evidence/20261015-character-allowance-guard`；冻结／清理状态以 WIP 最新记录为准。下一项只读评估基础 Bow 在 PLAYER FIELD 的独立准入，不直接放开 plain-field 通用守卫。
+
+## 2026-10-15 第四十阶段（历史里程碑）
 
 v0.41.0 为基础 sakuraBow@0 增加 Q2／flags-baseline-bow-once-v2 与 Z7/T8/F11。仅允许已核实的单技能、flags[0]、used0/1；已用源在全部布局／数值恢复及队列安定后，对新生 used0 实例调用一次原生 setter true。未用源零调用，同名副本按原生位置区分；禁止 false/reset/flags 写回。全部目标预验证、每次调用前后完整状态守卫及单次语义回退已实现；部分调用失败尚无新实机故障注入。
 

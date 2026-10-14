@@ -10,6 +10,7 @@
 #include <iostream>
 #include <limits>
 #include <string>
+#include <utility>
 
 namespace
 {
@@ -139,6 +140,7 @@ namespace
         -> QuantumCheckpoint::ExactCharacterChargeCheckpoint
     {
         return {
+            .schema_version = QuantumCheckpoint::ExactCharacterChargeLegacySchemaVersion,
             .captured_at_utc = route_c.captured_at_utc,
             .route_c_payload_checksum = route_c.payload_checksum,
             .game_executable_sha256 = route_c.game_executable_sha256,
@@ -701,6 +703,209 @@ namespace
         bowed_field.player_field = "(" + bow_instance + "," + lemon_instance + ")";
         require(!parse_exact_player_field_checkpoint(serialize_exact_player_field_checkpoint(bowed_field), error),
                 "new Bow qualification does not broaden the existing plain-fruit FIELD reconstruction range");
+    }
+
+    auto run_character_allowance_tests() -> void
+    {
+        using namespace QuantumCheckpoint;
+        std::string error{};
+        // Historical Phase40 numeric-only bytes. They contain no saved False proof.
+        const ExactCharacterChargeCheckpoint unobserved{};
+        require(unobserved.schema_version == ExactCharacterChargeObservedAllowanceSchemaVersion
+                && unobserved.ability_allowance.empty() && unobserved.allowance_policy.empty(),
+                "default schema3 construction preserves unknown source allowance");
+        const std::string legacy_json = R"json({
+  "schemaVersion": 1,
+  "kind": "route-c-exact-character-charge",
+  "capturedAtUtc": "2026-10-14T20:03:41Z",
+  "routeCPayloadChecksum": "DD7BCB6EFFC8B373",
+  "gameExecutableSha256": "0DCF220317FA31667C14DD7FB41A6757B94FF7CDE2262E5A87337D00CCB017A6",
+  "gameExecutableSize": 82718720,
+  "sourceLevelName": "cometDungeon1",
+  "waveIndex": 2,
+  "charge": 2,
+  "requirement": 6,
+  "payloadChecksum": "7A85223F9B332D00"
+}
+)json";
+        const auto replace_once = [](std::string json, std::string_view from, std::string_view to) {
+            const auto begin = json.find(from);
+            require(begin != std::string::npos, "charge mutation token exists");
+            json.replace(begin, from.size(), to);
+            return json;
+        };
+        const auto remove_field = [](std::string json, std::string_view name) {
+            const auto begin = json.find("  \"" + std::string{name} + "\"");
+            require(begin != std::string::npos, "charge mutation field exists");
+            json.erase(begin, json.find('\n', begin) - begin + 1);
+            return json;
+        };
+        const auto inject = [](std::string json, std::string_view field) {
+            json.insert(json.rfind('}'), "," + std::string{field});
+            return json;
+        };
+        const auto rejected = [&](const std::string& json, const char* reason) {
+            error.clear();
+            require(!parse_exact_character_charge_checkpoint(json, error), reason);
+            require(!error.empty(), "charge rejection explains its reason");
+        };
+        const auto legacy = parse_exact_character_charge_checkpoint(legacy_json, error);
+        require(legacy && legacy->schema_version == ExactCharacterChargeLegacySchemaVersion
+                && legacy->ability_allowance.empty() && legacy->allowance_policy.empty(),
+                "schema1 stays numeric-only with unknown saved allowance");
+        require(exact_character_charge_payload_checksum(*legacy) == "7A85223F9B332D00"
+                && serialize_exact_character_charge_checkpoint(*legacy) == legacy_json,
+                "schema1 fixed FNV and exact serialization bytes remain unchanged");
+        require(parse_exact_character_charge_checkpoint(inject(legacy_json, "\"historicalExtra\":0"), error).has_value(),
+                "schema1 keeps its unrelated extra-field behavior");
+        require(parse_exact_character_charge_checkpoint(replace_once(legacy_json, "\"waveIndex\": 2", "\"waveIndex\": 02"), error).has_value(),
+                "schema1 retains historical integer-token behavior");
+        for (const std::string_view name : {"abilityAllowance", "allowancePolicy"})
+        {
+            for (const std::string_view value : {"", "False", "observed-disallowed-v1"})
+                rejected(inject(legacy_json, "\"" + std::string{name} + "\":\"" + std::string{value} + "\""),
+                         "schema1 rejects allowance-key injection even with an empty value");
+            auto hidden = *legacy;
+            if (name == "abilityAllowance") hidden.ability_allowance = "False";
+            else hidden.allowance_policy = ExactCharacterAllowancePolicy;
+            require(exact_character_charge_payload_checksum(hidden) == "7A85223F9B332D00",
+                    "hidden new members never alter the historical FNV sequence");
+            require(!validate_exact_character_charge_checkpoint(hidden, error),
+                    "schema1 structs cannot hide a nonempty allowance proof");
+        }
+        auto current = *legacy;
+        current.schema_version = ExactCharacterChargeAllowanceSchemaVersion;
+        require(current.schema_version == ExactCharacterChargeAllowanceSchemaVersion
+                && current.ability_allowance.empty() && current.allowance_policy.empty(),
+                "schema2 does not manufacture a default source False");
+        rejected(serialize_exact_character_charge_checkpoint(current), "unobserved default schema2 fails closed");
+        current.allowance_policy = ExactCharacterAllowancePolicy;
+        current.ability_allowance = "False";
+        current.payload_checksum = exact_character_charge_payload_checksum(current);
+        require(current.payload_checksum == "7763319A95763E08",
+                "schema2 fixed FNV appends policy then allowance after requirement");
+        const auto json = serialize_exact_character_charge_checkpoint(current);
+        const auto parsed = parse_exact_character_charge_checkpoint(json, error);
+        require(parsed && parsed->schema_version == 2 && parsed->ability_allowance == "False"
+                && parsed->allowance_policy == ExactCharacterAllowancePolicy
+                && parsed->charge == 2 && parsed->requirement == 6,
+                "explicit synthetic observed-False schema2 round trips");
+        require(json.find("\"allowancePolicy\"") < json.find("\"abilityAllowance\"")
+                && serialize_exact_character_charge_checkpoint(*parsed) == json,
+                "schema2 serializer has deterministic policy/allowance order");
+        for (const std::string_view field : {"allowancePolicy", "abilityAllowance", "capturedAtUtc"})
+            rejected(remove_field(json, field), "schema2 missing proof/header field rejects");
+        rejected(replace_once(json, "\"abilityAllowance\"", "\"unknownAllowanceField\""),
+                 "same-count substituted field cannot satisfy exact schema2 shape");
+        for (const std::string_view value : {"", "True", "false", "False ", " False", "unknown", "False\n"})
+        {
+            auto invalid = current;
+            invalid.ability_allowance = value;
+            rejected(serialize_exact_character_charge_checkpoint(invalid), "noncanonical or unsupported allowance rejects even with recomputed FNV");
+        }
+        for (const std::string_view value : {"", "observed-disallowed-v2", "Observed-disallowed-v1", "observed-disallowed-v1 ", "observed-allowance-match-v1"})
+        {
+            auto invalid = current;
+            invalid.allowance_policy = value;
+            rejected(serialize_exact_character_charge_checkpoint(invalid), "unknown/noncanonical allowance policy rejects even with recomputed FNV");
+        }
+        for (const std::string_view value : {"0", "false", "null", "[]", "{}"})
+            rejected(replace_once(json, "\"abilityAllowance\": \"False\"", "\"abilityAllowance\": " + std::string{value}),
+                     "allowance proof must be a string, never bool/int/null/nested data");
+        rejected(replace_once(json, "\"allowancePolicy\": \"observed-disallowed-v1\"", "\"allowancePolicy\": 1"),
+                 "policy must be a string");
+        rejected(inject(json, "\"unrelatedExtra\":0"), "schema2 extra field rejects");
+        rejected(inject(json, "\"abilityAllowance\":\"False\""), "duplicate allowance key rejects");
+        rejected(inject(json, R"json("ability\u0041llowance":"False")json"), "decoded alias duplicate key rejects");
+        require(parse_exact_character_charge_checkpoint(replace_once(json, "\"abilityAllowance\": \"False\"", R"json("abilityAllowance": "\u0046alse")json"), error).has_value(),
+                "ordinary JSON escaping preserves exact decoded allowance value");
+        for (const std::string_view value : {"02", "+2", "-0", "2.0", "2e0"})
+            rejected(replace_once(json, "\"charge\": 2", "\"charge\": " + std::string{value}),
+                     "schema2 rejects noncanonical integer tokens");
+        rejected(replace_once(json, "\"schemaVersion\": 2", "\"schemaVersion\": 02"),
+                 "schema dispatch cannot bypass canonical schema2 token parsing");
+        rejected(replace_once(json, "\"waveIndex\": 2", "\"waveIndex\": \"2\""), "wave remains a typed integer");
+        rejected(replace_once(json, "{\n", "{\v"), "schema2 rejects non-JSON whitespace");
+        for (const auto& mutation : std::array<std::pair<std::string_view, std::string_view>, 8>{{
+                 {"2026-10-14T20:03:41Z", "2026-10-14T20:03:42Z"},
+                 {"DD7BCB6EFFC8B373", "DD7BCB6EFFC8B374"},
+                 {"0DCF220317FA31667C14DD7FB41A6757B94FF7CDE2262E5A87337D00CCB017A6", "1DCF220317FA31667C14DD7FB41A6757B94FF7CDE2262E5A87337D00CCB017A6"},
+                 {"82718720", "82718721"}, {"cometDungeon1", "cometDungeon2"},
+                 {"\"waveIndex\": 2", "\"waveIndex\": 3"}, {"\"charge\": 2", "\"charge\": 3"},
+                 {"\"requirement\": 6", "\"requirement\": 7"}}})
+        {
+            rejected(replace_once(json, mutation.first, mutation.second), "schema2 linkage/numeric tampering invalidates checksum");
+            require(error.find("checksum") != std::string::npos, "valid-shape linkage tamper specifically fails checksum");
+        }
+        rejected(replace_once(json, "7763319A95763E08", "7763319A95763E09"), "schema2 bad payload checksum rejects");
+        rejected(replace_once(json, "\"schemaVersion\": 2", "\"schemaVersion\": 1"), "downgrade cannot keep new proof keys");
+        rejected(replace_once(legacy_json, "\"schemaVersion\": 1", "\"schemaVersion\": 2"), "upgrade cannot synthesize missing source proof");
+        for (const int version : {0, 4})
+        {
+            auto invalid = current;
+            invalid.schema_version = version;
+            rejected(serialize_exact_character_charge_checkpoint(invalid), "unsupported charge proof version rejects");
+        }
+        for (const auto [charge, requirement] : std::array<std::pair<int, int>, 5>{{{-1,6},{6,6},{7,6},{0,0},{0,10001}}})
+        {
+            auto invalid = current;
+            invalid.charge = charge;
+            invalid.requirement = requirement;
+            rejected(serialize_exact_character_charge_checkpoint(invalid), "schema2 retains below-positive-requirement bounds");
+        }
+        for (const auto [charge, requirement] : std::array<std::pair<int, int>, 2>{{{0,1},{9999,10000}}})
+        {
+            auto boundary = current;
+            boundary.charge = charge;
+            boundary.requirement = requirement;
+            require(parse_exact_character_charge_checkpoint(serialize_exact_character_charge_checkpoint(boundary), error).has_value(),
+                    "schema2 supports exact original numeric interval boundaries with explicit False");
+        }
+        auto new_unobserved = *legacy;
+        new_unobserved.schema_version = ExactCharacterChargeSchemaVersion;
+        rejected(serialize_exact_character_charge_checkpoint(new_unobserved), "default schema3 cannot invent either observed boolean");
+        require(new_unobserved.schema_version == 3, "latest new capture schema is explicitly schema3");
+        for (const std::string_view allowance : {"False", "True"})
+        {
+            auto observed = current;
+            observed.schema_version = ExactCharacterChargeObservedAllowanceSchemaVersion;
+            observed.allowance_policy = ExactCharacterObservedAllowancePolicy;
+            observed.ability_allowance = allowance;
+            observed.payload_checksum = exact_character_charge_payload_checksum(observed);
+            require(observed.payload_checksum == (allowance == "False" ? "92A07E49B7829F34" : "866F850AE7C2D968"),
+                    "schema3 independent fixed False/True FNV goldens preserve policy then allowance order");
+            const auto observed_json = serialize_exact_character_charge_checkpoint(observed);
+            const auto round_trip = parse_exact_character_charge_checkpoint(observed_json, error);
+            require(round_trip && round_trip->schema_version == 3 && round_trip->ability_allowance == allowance
+                    && round_trip->allowance_policy == ExactCharacterObservedAllowancePolicy,
+                    "schema3 canonical source True/False separately round trip");
+            rejected(remove_field(observed_json, "allowancePolicy"), "schema3 missing policy rejects");
+            rejected(remove_field(observed_json, "abilityAllowance"), "schema3 missing allowance rejects");
+            rejected(inject(observed_json, "\"unknown\":0"), "schema3 extra fields reject");
+            rejected(inject(observed_json, "\"abilityAllowance\":\"" + std::string{allowance} + "\""), "schema3 duplicate allowance rejects");
+            rejected(replace_once(observed_json, "\"charge\": 2", "\"charge\": -0"), "schema3 noncanonical integer rejects");
+            rejected(replace_once(observed_json, "\"abilityAllowance\": \"" + std::string{allowance} + "\"", "\"abilityAllowance\": true"),
+                     "schema3 requires canonical string rather than JSON boolean");
+            rejected(replace_once(observed_json, "\"abilityAllowance\": \"" + std::string{allowance} + "\"",
+                                  "\"abilityAllowance\": \"" + std::string{allowance == "False" ? "True" : "False"} + "\""),
+                     "switching admitted source value without a new checksum rejects");
+            require(error.find("checksum") != std::string::npos, "source True/False substitutions are checksummed");
+            rejected(replace_once(observed_json, "2026-10-14T20:03:41Z", "2026-10-14T20:03:42Z"), "schema3 source time tampering rejects");
+            rejected(replace_once(observed_json, "\"schemaVersion\": 3", "\"schemaVersion\": 2"), "C3 cannot downgrade under its new policy");
+            auto cross_policy = observed;
+            cross_policy.allowance_policy = ExactCharacterAllowancePolicy;
+            rejected(serialize_exact_character_charge_checkpoint(cross_policy), "C3 never accepts the C2 False-only policy");
+            for (const std::string_view value : {"", "true", "false", " True", "True ", "unknown"})
+            {
+                auto malformed = observed;
+                malformed.ability_allowance = value;
+                rejected(serialize_exact_character_charge_checkpoint(malformed), "C3 malformed source allowance rejects with valid recomputed checksum");
+            }
+            auto full = observed;
+            full.charge = full.requirement;
+            rejected(serialize_exact_character_charge_checkpoint(full), "C3 never admits full charge even with source True");
+        }
+        rejected(replace_once(json, "\"schemaVersion\": 2", "\"schemaVersion\": 3"), "old C2 policy cannot silently become C3");
     }
 }
 
@@ -2389,6 +2594,7 @@ int main()
         exact_player_field_payload_checksum,validate_exact_player_field_checkpoint);
 
     run_qualification_tests();
+    run_character_allowance_tests();
     std::cout << "Route C checkpoint persistence tests passed\n";
     return 0;
 }

@@ -3421,6 +3421,11 @@ namespace QuantumCheckpoint
         append_hash_number(hash, checkpoint.wave_index);
         append_hash_number(hash, checkpoint.charge);
         append_hash_number(hash, checkpoint.requirement);
+        if (checkpoint.schema_version >= ExactCharacterChargeAllowanceSchemaVersion)
+        {
+            append_hash_bytes(hash, checkpoint.allowance_policy);
+            append_hash_bytes(hash, checkpoint.ability_allowance);
+        }
 
         std::ostringstream output{};
         output << std::hex << std::uppercase << std::setw(16) << std::setfill('0') << hash;
@@ -3446,8 +3451,15 @@ namespace QuantumCheckpoint
                << "\",\n"
                << "  \"waveIndex\": " << checkpoint.wave_index << ",\n"
                << "  \"charge\": " << checkpoint.charge << ",\n"
-               << "  \"requirement\": " << checkpoint.requirement << ",\n"
-               << "  \"payloadChecksum\": \"" << checkpoint.payload_checksum << "\"\n"
+               << "  \"requirement\": " << checkpoint.requirement << ",\n";
+        if (checkpoint.schema_version >= ExactCharacterChargeAllowanceSchemaVersion)
+        {
+            output << "  \"allowancePolicy\": \""
+                   << json_escape(checkpoint.allowance_policy) << "\",\n"
+                   << "  \"abilityAllowance\": \""
+                   << json_escape(checkpoint.ability_allowance) << "\",\n";
+        }
+        output << "  \"payloadChecksum\": \"" << checkpoint.payload_checksum << "\"\n"
                << "}\n";
         return output.str();
     }
@@ -3455,7 +3467,9 @@ namespace QuantumCheckpoint
     auto validate_exact_character_charge_checkpoint(
         const ExactCharacterChargeCheckpoint& checkpoint, std::string& error) -> bool
     {
-        if (checkpoint.schema_version != ExactCharacterChargeSchemaVersion)
+        if (checkpoint.schema_version != ExactCharacterChargeLegacySchemaVersion
+            && checkpoint.schema_version != ExactCharacterChargeAllowanceSchemaVersion
+            && checkpoint.schema_version != ExactCharacterChargeObservedAllowanceSchemaVersion)
         {
             error = "unsupported exact character-charge schema version";
             return false;
@@ -3487,6 +3501,29 @@ namespace QuantumCheckpoint
             error = "exact character charge must be below its positive requirement";
             return false;
         }
+        if (checkpoint.schema_version == ExactCharacterChargeAllowanceSchemaVersion)
+        {
+            if (checkpoint.allowance_policy != ExactCharacterAllowancePolicy
+                || checkpoint.ability_allowance != "False")
+            {
+                error = "exact character charge requires observed-disallowed-v1 and canonical False allowance";
+                return false;
+            }
+        }
+        else if (checkpoint.schema_version == ExactCharacterChargeObservedAllowanceSchemaVersion)
+        {
+            if (checkpoint.allowance_policy != ExactCharacterObservedAllowancePolicy
+                || (checkpoint.ability_allowance != "False" && checkpoint.ability_allowance != "True"))
+            {
+                error = "exact character charge requires observed-allowance-match-v1 and canonical True/False allowance";
+                return false;
+            }
+        }
+        else if (!checkpoint.allowance_policy.empty() || !checkpoint.ability_allowance.empty())
+        {
+            error = "legacy exact character charge cannot attest saved allowance";
+            return false;
+        }
         if (checkpoint.payload_checksum != exact_character_charge_payload_checksum(checkpoint))
         {
             error = "exact character-charge payload checksum does not match";
@@ -3516,9 +3553,28 @@ namespace QuantumCheckpoint
         do { auto value = required_integer<Type>(*values, JsonName, error); if (!value) return std::nullopt; checkpoint.Field = *value; } while (false)
 
         READ_CHARGE_INTEGER(schema_version, "schemaVersion", int);
-        if (checkpoint.schema_version != ExactCharacterChargeSchemaVersion)
+        if (checkpoint.schema_version != ExactCharacterChargeLegacySchemaVersion
+            && checkpoint.schema_version != ExactCharacterChargeAllowanceSchemaVersion
+            && checkpoint.schema_version != ExactCharacterChargeObservedAllowanceSchemaVersion)
         {
             error = "unsupported exact character-charge schema version";
+            return std::nullopt;
+        }
+        if (checkpoint.schema_version >= ExactCharacterChargeAllowanceSchemaVersion)
+        {
+            // Preserve historical schema1 token/extra-field behavior. Only the
+            // new observed source-proof document has a canonical exact shape.
+            values = FlatJsonParser{json, 13, true}.parse(error);
+            if (!values) return std::nullopt;
+            if (values->size() != 13)
+            {
+                error = "exact character-charge schema2/schema3 requires exactly thirteen fields";
+                return std::nullopt;
+            }
+        }
+        else if (values->contains("abilityAllowance") || values->contains("allowancePolicy"))
+        {
+            error = "legacy exact character charge cannot contain allowance proof fields";
             return std::nullopt;
         }
         READ_CHARGE_STRING(kind, "kind");
@@ -3530,6 +3586,11 @@ namespace QuantumCheckpoint
         READ_CHARGE_INTEGER(wave_index, "waveIndex", std::int32_t);
         READ_CHARGE_INTEGER(charge, "charge", std::int32_t);
         READ_CHARGE_INTEGER(requirement, "requirement", std::int32_t);
+        if (checkpoint.schema_version >= ExactCharacterChargeAllowanceSchemaVersion)
+        {
+            READ_CHARGE_STRING(allowance_policy, "allowancePolicy");
+            READ_CHARGE_STRING(ability_allowance, "abilityAllowance");
+        }
         READ_CHARGE_STRING(payload_checksum, "payloadChecksum");
 
 #undef READ_CHARGE_INTEGER

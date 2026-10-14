@@ -5,6 +5,7 @@
 #include "CheckpointPersistence.hpp"
 #include "EffectQualificationPolicy.hpp"
 #include "BowOnceNativeSignature.hpp"
+#include "CharacterAllowanceNativeSignature.hpp"
 #include "PlayerRestorePlan.hpp"
 #include "PlayerAttackState.hpp"
 #include "PlayerHealthState.hpp"
@@ -31,6 +32,7 @@
 #include <string_view>
 #include <stdexcept>
 #include <system_error>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -48,6 +50,8 @@
 #include <Unreal/FWeakObjectPtr.hpp>
 #include <Unreal/Hooks.hpp>
 #include <Unreal/Property/FArrayProperty.hpp>
+#include <Unreal/Property/FBoolProperty.hpp>
+#include <Unreal/Property/NumericPropertyTypes.hpp>
 #include <Unreal/Property/FObjectProperty.hpp>
 #include <Unreal/Property/FStrProperty.hpp>
 #include <Unreal/Property/FStructProperty.hpp>
@@ -167,6 +171,22 @@ namespace QuantumCheckpoint
             std::chrono::steady_clock::time_point queued_at{};
         };
 
+        struct RouteCCaptureObjectIdentity
+        {
+            UObject* object{};
+            std::int32_t internal_index{};
+            std::string full_name{};
+            FWeakObjectPtr weak{};
+            bool weak_verified{};
+        };
+
+        struct CharacterResourceObservation
+        {
+            RouteCCaptureObjectIdentity world{}, engine{}, slot{};
+            std::int32_t charge{}, requirement{};
+            std::string allowance{};
+        };
+
         struct PendingRouteCRestore
         {
             RouteCCheckpoint checkpoint{};
@@ -227,6 +247,18 @@ namespace QuantumCheckpoint
             std::size_t exact_player_field_turn_active_mismatches{};
             std::string exact_character_charge_status{"unavailable"};
             std::string exact_character_charge_reason{};
+            std::string character_resource_supplement_state{"absent"};
+            std::string character_allowance_saved_proof{"unavailable"};
+            std::string character_allowance_status{"unavailable"};
+            std::string character_allowance_reason{};
+            std::string character_allowance_policy{};
+            std::string character_resource_proof_checksum{};
+            int character_resource_proof_schema{};
+            bool character_allowance_proven{};
+            std::optional<CharacterResourceObservation> character_resource_startup{};
+            std::optional<std::string> character_allowance_source{};
+            std::optional<std::string> character_allowance_startup_observed{};
+            std::optional<std::string> character_allowance_final{};
             std::string exact_turn_progress_status{"unavailable"};
             std::string exact_turn_progress_reason{};
             bool active_decklist_restored_after_exact_startup{};
@@ -315,15 +347,6 @@ namespace QuantumCheckpoint
             std::vector<PendingNativeRestoreMove> move_effect_suppressions{};
             std::size_t move_effects_suppressed{}, move_effects_restored{};
             std::vector<PendingNativeTrashMove> move_overlay_targets{};
-        };
-
-        struct RouteCCaptureObjectIdentity
-        {
-            UObject* object{};
-            std::int32_t internal_index{};
-            std::string full_name{};
-            FWeakObjectPtr weak{};
-            bool weak_verified{};
         };
 
         // The SDK has no serial allocator. Its public deletion listener supplies
@@ -2351,15 +2374,17 @@ namespace QuantumCheckpoint
         }
 
         auto try_read_exact_character_charge_checkpoint(const RouteCCheckpoint& route_c,
-                                                        std::string& reason)
+                                                        std::string& reason, std::string& supplement_state)
             -> std::optional<ExactCharacterChargeCheckpoint>
         {
+            supplement_state = "invalid";
             try
             {
                 const auto path = exact_character_charge_checkpoint_path();
                 std::error_code file_error{};
                 if (!std::filesystem::exists(path, file_error))
                 {
+                    supplement_state = file_error ? "invalid" : "absent";
                     reason = file_error
                         ? "exact character-charge path could not be inspected"
                         : "exact character-charge supplement does not exist";
@@ -2402,7 +2427,9 @@ namespace QuantumCheckpoint
                         "restore.exact-character-charge.rejected", reason);
                     return std::nullopt;
                 }
-                if (exact->route_c_payload_checksum != route_c.payload_checksum
+                if ((exact->schema_version >= ExactCharacterChargeAllowanceSchemaVersion
+                        && exact->captured_at_utc != route_c.captured_at_utc)
+                    || exact->route_c_payload_checksum != route_c.payload_checksum
                     || exact->game_executable_sha256 != route_c.game_executable_sha256
                     || exact->game_executable_size != route_c.game_executable_size
                     || exact->source_level_name != route_c.source_level_name
@@ -2415,6 +2442,7 @@ namespace QuantumCheckpoint
                     return std::nullopt;
                 }
                 reason = "linked exact character-charge supplement loaded";
+                supplement_state = "schema" + std::to_string(exact->schema_version);
                 append_route_c_trace("restore.exact-character-charge.loaded");
                 return exact;
             }
@@ -4598,6 +4626,134 @@ namespace QuantumCheckpoint
                 && (!saved.weak_verified || saved.weak.Get() == current);
         }
 
+        auto same_character_resource_owner(const CharacterResourceObservation& left,
+                                            const CharacterResourceObservation& right) -> bool
+        {
+            const auto same = [](const auto& a, const auto& b) {
+                return a.weak_verified && b.weak_verified && a.object == b.object
+                    && a.weak.Get() == a.object && b.weak.Get() == b.object
+                    && a.internal_index == b.internal_index && a.full_name == b.full_name;
+            };
+            return same(left.world, right.world) && same(left.engine, right.engine)
+                && same(left.slot, right.slot);
+        }
+
+        auto same_character_resource(const CharacterResourceObservation& left,
+                                      const CharacterResourceObservation& right) -> bool
+        {
+            return same_character_resource_owner(left, right) && left.charge == right.charge
+                && left.requirement == right.requirement && left.allowance == right.allowance;
+        }
+
+        auto read_character_resource(const RouteCBattleObjects& objects) -> CharacterResourceObservation
+        {
+            if (GetCurrentThreadId() != g_game_thread_id.load(std::memory_order_acquire)
+                || !fingerprint_matches_supported_game(executable_fingerprint())
+                || !g_route_c_object_type_filter_ready || !objects.card_engine || !objects.character_card_slot)
+                throw std::runtime_error{"character allowance needs a typed game-thread owner and fixed executable"};
+            const auto registered = registered_overlay_objects();
+            auto* world = reinterpret_cast<UObject*>(objects.card_engine->GetWorld());
+            CharacterResourceObservation result{};
+            result.world = pin_route_c_capture_object(world, nullptr, registered);
+            result.engine = pin_route_c_capture_object(objects.card_engine, world, registered);
+            if (!objects.card_engine->IsA(g_route_c_object_classes[1]))
+                throw std::runtime_error{"character allowance owner is not the native card-engine class"};
+            const auto owned_by_current_engine = [&](UObject* candidate) {
+                auto* property = candidate->GetPropertyByNameInChain(STR("mCardEngine"));
+                if (!property || !property->IsA<FObjectProperty>() || property->GetElementSize() != sizeof(UObject*)
+                    || property->GetArrayDim() != 1 || property->GetOffset_Internal() != 0x220
+                    || candidate->GetClassPrivate()->GetPropertiesSize() < 0x228)
+                    return false;
+                auto** storage = property->ContainerPtrToValuePtr<UObject*>(candidate);
+                return address_is_readable(storage, sizeof(UObject*)) && *storage == objects.card_engine;
+            };
+            std::vector<UObject*> slots{};
+            for (auto* object : registered)
+            {
+                if (!object || object->IsUnreachable()
+                    || object->HasAnyFlags(static_cast<EObjectFlags>(RF_BeginDestroyed | RF_FinishDestroyed))
+                    || !object->IsA(g_route_c_object_classes[4])
+                    || reinterpret_cast<UObject*>(object->GetWorld()) != world)
+                    continue;
+                const auto side = required_text(export_property_text(object, STR("boardSide")), "character slot side");
+                if (side != "PLAYER") continue;
+                if (!owned_by_current_engine(object))
+                    throw std::runtime_error{"player character slot has an unverified card-engine owner"};
+                slots.push_back(object);
+            }
+            if (slots.size() != 1 || slots.front() != objects.character_card_slot)
+                throw std::runtime_error{"character allowance requires one uniquely owned player slot"};
+            auto* slot = slots.front();
+            result.slot = pin_route_c_capture_object(slot, world, registered);
+            if (!result.world.weak_verified || !result.engine.weak_verified || !result.slot.weak_verified)
+                throw std::runtime_error{"character allowance has no verified world/engine/slot weak identity"};
+            const auto guard = [&] {
+                if (!same_route_c_capture_object(result.world, world, nullptr, registered)
+                    || !same_route_c_capture_object(result.engine, objects.card_engine, world, registered)
+                    || !same_route_c_capture_object(result.slot, slot, world, registered)
+                    || !owned_by_current_engine(slot)
+                    || required_text(export_property_text(slot, STR("boardSide")), "character slot side") != "PLAYER")
+                    throw std::runtime_error{"character allowance owner changed during observation"};
+            };
+            const auto base = reinterpret_cast<std::uintptr_t>(GetModuleHandleW(L"Quantum-Win64-Shipping.exe"));
+            const auto signature = [&](std::uintptr_t rva, const auto& bytes) {
+                const auto* address = reinterpret_cast<const std::uint8_t*>(base + rva);
+                if (!base || !address_is_readable(address, bytes.size())
+                    || !std::equal(bytes.begin(), bytes.end(), address))
+                    throw std::runtime_error{"character resource getter signature differs"};
+            };
+            const auto getter = [&](StringViewType name, std::uintptr_t rva, const auto& bytes, bool boolean) {
+                guard(); signature(rva, bytes);
+                auto* function = slot->GetFunctionByNameInChain(name.data());
+                auto* value = function ? function->GetReturnProperty() : nullptr;
+                const auto size = boolean ? 1 : 4;
+                if (!function || !value || !function->HasAllFunctionFlags(static_cast<EFunctionFlags>(FUNC_Native | FUNC_BlueprintPure))
+                    || reinterpret_cast<std::uintptr_t>(function->GetFuncPtr()) != base + rva
+                    || function->GetParmsSize() != size || value->GetElementSize() != size
+                    || value->GetOffset_Internal() != 0 || value->GetArrayDim() != 1
+                    || !value->HasAllPropertyFlags(static_cast<EPropertyFlags>(CPF_Parm | CPF_OutParm | CPF_ReturnParm))
+                    || (boolean ? !value->IsA<FBoolProperty>() : !value->IsA<FIntProperty>()))
+                    throw std::runtime_error{"character resource getter reflection contract differs"};
+                if (boolean)
+                {
+                    const auto native_bool = static_cast<FBoolProperty*>(value);
+                    if (!native_bool->IsNativeBool() || native_bool->GetByteOffset() != 0
+                        || native_bool->GetFieldSize() != 1 || native_bool->GetByteMask() != 1)
+                        throw std::runtime_error{"character allowance getter return is not the fixed native bool layout"};
+                }
+                for (auto* property : function->ForEachProperty())
+                    if (property->HasAnyPropertyFlags(CPF_Parm) && !property->HasAnyPropertyFlags(CPF_ReturnParm))
+                        throw std::runtime_error{"character resource getter has an input parameter"};
+                return required_getter_text(slot, name);
+            };
+            signature(character_allowance::AllowanceGetterRva, character_allowance::AllowanceGetterBytes);
+            if (slot->GetClassPrivate()->GetPropertiesSize() <= character_allowance::AllowanceOffset
+                || !address_is_readable(static_cast<const std::byte*>(static_cast<const void*>(slot))
+                    + character_allowance::AllowanceOffset, 1))
+                throw std::runtime_error{"character allowance byte is not in the verified slot layout"};
+            const auto read_values = [&] {
+                const auto charge = parse_int32(getter(STR("getCurrentCharacterCardCharge"),
+                    character_allowance::ChargeGetterThunkRva, character_allowance::ChargeGetterThunkBytes, false));
+                const auto requirement = parse_int32(getter(STR("getAmountPerCharacterCard"),
+                    character_allowance::RequirementGetterThunkRva, character_allowance::RequirementGetterThunkBytes, false));
+                const auto allowance = getter(STR("isCharacterAbilityOk"),
+                    character_allowance::AllowanceGetterThunkRva, character_allowance::AllowanceGetterThunkBytes, true);
+                guard();
+                const auto raw = read_native_value<std::uint8_t>(slot, character_allowance::AllowanceOffset);
+                if (!charge || !requirement || *charge < 0 || *charge > 10000 || *requirement <= 0 || *requirement > 10000
+                    || raw > 1 || (allowance != "False" && allowance != "True")
+                    || allowance != (raw == 0 ? "False" : "True"))
+                    throw std::runtime_error{"character resource getter is noncanonical or disagrees with the guarded allowance byte"};
+                return std::tuple{*charge, *requirement, allowance};
+            };
+            const auto before = read_values();
+            if (before != read_values())
+                throw std::runtime_error{"character resource changed during its read-only observation"};
+            guard();
+            std::tie(result.charge, result.requirement, result.allowance) = before;
+            return result;
+        }
+
         auto route_c_capture_retry_identity_available(const PendingRouteCCapture& capture) -> bool
         {
             return capture.world_identity.weak_verified && capture.engine_identity.weak_verified
@@ -5240,25 +5396,13 @@ namespace QuantumCheckpoint
             }
 
             std::optional<ExactCharacterChargeCheckpoint> exact_character_charge{};
+            std::optional<CharacterResourceObservation> character_resource_observation{};
             try
             {
                 append_route_c_trace("capture.exact-character-charge.prepare.begin");
                 if (!player_effect_membership_rejection.empty())
                     throw std::runtime_error{player_effect_membership_rejection};
-                if (!objects.character_card_slot)
-                {
-                    throw std::runtime_error{"live character charge slot was not found"};
-                }
-                const auto charge = parse_int32(required_getter_text(
-                    objects.character_card_slot,
-                    STR("getCurrentCharacterCardCharge")));
-                const auto requirement = parse_int32(required_getter_text(
-                    objects.character_card_slot,
-                    STR("getAmountPerCharacterCard")));
-                if (!charge || !requirement)
-                {
-                    throw std::runtime_error{"character charge getters were not integers"};
-                }
+                const auto resource = read_character_resource(objects);
                 if (!player_qualification_rejection.empty()) throw std::runtime_error{player_qualification_rejection};
                 ExactCharacterChargeCheckpoint exact{};
                 exact.captured_at_utc = checkpoint.captured_at_utc;
@@ -5267,8 +5411,10 @@ namespace QuantumCheckpoint
                 exact.game_executable_size = checkpoint.game_executable_size;
                 exact.source_level_name = checkpoint.source_level_name;
                 exact.wave_index = checkpoint.wave_index;
-                exact.charge = *charge;
-                exact.requirement = *requirement;
+                exact.charge = resource.charge;
+                exact.requirement = resource.requirement;
+                exact.ability_allowance = resource.allowance;
+                exact.allowance_policy = ExactCharacterObservedAllowancePolicy;
                 exact.payload_checksum = exact_character_charge_payload_checksum(exact);
                 std::string exact_validation_error{};
                 if (!validate_exact_character_charge_checkpoint(
@@ -5277,6 +5423,10 @@ namespace QuantumCheckpoint
                     throw std::runtime_error{exact_validation_error};
                 }
                 exact_character_charge = std::move(exact);
+                character_resource_observation = resource;
+                append_route_c_trace_failure("capture.character-allowance.source-verified",
+                    "allowance=" + resource.allowance + " charge=" + std::to_string(resource.charge)
+                        + " requirement=" + std::to_string(resource.requirement));
                 append_route_c_trace("capture.exact-character-charge.prepare.complete");
             }
             catch (const std::exception& error)
@@ -5419,6 +5569,9 @@ namespace QuantumCheckpoint
             if (exact_player_qualification
                 && observe_player_qualification(final_objects, exact_player_qualification->qualification_policy) != *player_qualification_observation)
                 throw std::runtime_error{"player qualification changed before publication; checkpoint files were not replaced"};
+            if (exact_character_charge && (!character_resource_observation
+                || !same_character_resource(*character_resource_observation, read_character_resource(final_objects))))
+                throw std::runtime_error{"character resource changed before publication; checkpoint files were not replaced"};
             const auto final_wave = parse_int32(required_text(export_property_text(objects.spawner, STR("currentWaveIndex")), "currentWaveIndex"));
             if (!final_wave || *final_wave != checkpoint.wave_index
                 || required_text(export_property_text(objects.card_engine, STR("currentGameState")), "currentGameState") != "OPEN"
@@ -5768,6 +5921,22 @@ namespace QuantumCheckpoint
                    << json_escape(restore.exact_character_charge_status) << "\",\n"
                    << "  \"exactCharacterChargeReason\": \""
                    << json_escape(restore.exact_character_charge_reason) << "\",\n"
+                   << "  \"characterResourceSupplementState\": \"" << json_escape(restore.character_resource_supplement_state) << "\",\n"
+                   << "  \"characterAllowanceSavedProof\": \"" << json_escape(restore.character_allowance_saved_proof) << "\",\n"
+                   << "  \"characterAllowanceStatus\": \"" << json_escape(restore.character_allowance_status) << "\",\n"
+                   << "  \"characterAllowanceReason\": \"" << json_escape(restore.character_allowance_reason) << "\",\n"
+                   << "  \"characterAllowancePolicy\": \"" << json_escape(restore.character_allowance_policy) << "\",\n"
+                   << "  \"characterResourceProofSchema\": " << restore.character_resource_proof_schema << ",\n"
+                   << "  \"characterResourceProofChecksum\": \"" << json_escape(restore.character_resource_proof_checksum) << "\",\n"
+                   << "  \"characterAllowanceSource\": "
+                   << (restore.character_allowance_source ? '"' + json_escape(*restore.character_allowance_source) + '"' : "null") << ",\n"
+                   << "  \"characterAllowanceStartup\": "
+                   << (restore.character_allowance_startup_observed ? '"' + json_escape(*restore.character_allowance_startup_observed) + '"' : "null") << ",\n"
+                   << "  \"characterAllowanceFinal\": "
+                   << (restore.character_allowance_final ? '"' + json_escape(*restore.character_allowance_final) + '"' : "null") << ",\n"
+                   << "  \"characterAllowanceProven\": " << (restore.character_allowance_proven ? "true" : "false") << ",\n"
+                   << "  \"characterAbilityCardStateScope\": \"not-covered\",\n"
+                   << "  \"characterResourceScope\": \"optional independent below-threshold numeric charge and matching saved canonical allowance; Q1/Q2 DHTF qualification excludes this layer; ability-card lifecycle is not restored\",\n"
                    << "  \"exactTurnProgressSupplementPresent\": "
                    << (restore.exact_turn_progress ? "true" : "false") << ",\n"
                    << "  \"exactTurnProgressStatus\": \""
@@ -7151,8 +7320,6 @@ namespace QuantumCheckpoint
             auto completed = std::move(*g_pending_route_c_restore);
             completed.status = std::move(status);
             completed.reason = std::move(reason);
-            completed.reason += "; player qualification=" + completed.player_qualification_status
-                + "; full player state is not proven";
 
             // Every terminal path, including timeout and unexpected exceptions,
             // must release temporary effect suppression before discarding targets.
@@ -7266,6 +7433,20 @@ namespace QuantumCheckpoint
                 completed.status = "retrying-route-c";
                 append_route_c_trace_failure("restore.semantic-fallback.scheduled", completed.reason);
             }
+            if (completed.status != "passed")
+            {
+                completed.character_allowance_proven = false;
+                if (completed.character_allowance_status == "pending"
+                    || completed.character_allowance_status == "verified-false-through-stability"
+                    || completed.character_allowance_status == "verified-source-allowance-through-stability")
+                {
+                    completed.character_allowance_status = "failed";
+                    completed.character_allowance_reason = completed.reason;
+                }
+            }
+            completed.reason += "; player qualification=" + completed.player_qualification_status
+                + "; character allowance=" + completed.character_allowance_status
+                + "; full player state is not proven";
             g_adopt_next_route_c_wave_without_capture = true;
             if (completed.status == "passed")
             {
@@ -7479,8 +7660,10 @@ namespace QuantumCheckpoint
                 }
             }
             std::string exact_character_charge_reason{};
+            std::string character_resource_supplement_state = semantic_only ? "not-requested" : "absent";
             auto exact_character_charge = semantic_only ? std::nullopt : try_read_exact_character_charge_checkpoint(
-                checkpoint, exact_character_charge_reason);
+                checkpoint, exact_character_charge_reason, character_resource_supplement_state);
+            const auto character_resource_proof = exact_character_charge;
             std::string exact_turn_progress_reason{};
             auto exact_turn_progress = semantic_only ? std::nullopt : try_read_exact_turn_progress_checkpoint(
                 checkpoint, exact_turn_progress_reason);
@@ -7841,6 +8024,30 @@ namespace QuantumCheckpoint
                 .player_qualification_policy = std::move(player_qualification_policy),
                 .player_once_replay_phase = once_replay_phase,
             });
+
+            auto& resource_report = *g_pending_route_c_restore;
+            resource_report.character_resource_supplement_state = character_resource_supplement_state;
+            resource_report.character_allowance_reason = resource_report.exact_character_charge_reason;
+            if (character_resource_proof)
+            {
+                resource_report.character_resource_proof_schema = character_resource_proof->schema_version;
+                resource_report.character_resource_proof_checksum = character_resource_proof->payload_checksum;
+                resource_report.character_allowance_policy = character_resource_proof->allowance_policy;
+                resource_report.character_allowance_saved_proof = character_resource_proof->schema_version == ExactCharacterChargeAllowanceSchemaVersion
+                    ? "validated-false-source"
+                    : character_resource_proof->schema_version == ExactCharacterChargeObservedAllowanceSchemaVersion
+                        ? "validated-allowance-source" : "unknown-saved-state";
+                if (character_resource_proof->schema_version >= ExactCharacterChargeAllowanceSchemaVersion)
+                    resource_report.character_allowance_source = character_resource_proof->ability_allowance;
+                resource_report.character_allowance_status = !resource_report.exact_character_charge ? "disabled-with-player-layout"
+                    : character_resource_proof->schema_version >= ExactCharacterChargeAllowanceSchemaVersion ? "pending" : "legacy-unknown";
+            }
+            else if (character_resource_supplement_state == "invalid")
+            {
+                resource_report.character_allowance_saved_proof = "invalid-saved-proof";
+                resource_report.character_allowance_status = "rejected-before-startup";
+            }
+            else if (semantic_only) resource_report.character_allowance_status = "not-requested";
 
             try
             {
@@ -10439,6 +10646,49 @@ namespace QuantumCheckpoint
             return false;
         }
 
+        auto verify_character_allowance(PendingRouteCRestore& restore,
+                                        const RouteCBattleObjects& objects,
+                                        std::string_view phase) -> std::optional<CharacterResourceObservation>
+        {
+            if (!restore.exact_character_charge
+                || restore.exact_character_charge->schema_version < ExactCharacterChargeAllowanceSchemaVersion)
+                return std::nullopt;
+            try
+            {
+                const auto observed = read_character_resource(objects);
+                if (!restore.character_allowance_startup_observed)
+                    restore.character_allowance_startup_observed = observed.allowance;
+                restore.character_allowance_final = observed.allowance;
+                if (observed.allowance != restore.exact_character_charge->ability_allowance
+                    || observed.charge >= observed.requirement
+                    || observed.requirement != restore.exact_character_charge->requirement)
+                    throw std::runtime_error{"live allowance or below-threshold requirement differs from the saved resource proof"};
+                if (restore.character_resource_startup)
+                {
+                    if (!same_character_resource_owner(*restore.character_resource_startup, observed))
+                        throw std::runtime_error{"character resource world/engine/slot identity changed"};
+                }
+                else
+                {
+                    restore.character_resource_startup = observed;
+                    append_route_c_trace_failure("restore.character-allowance.startup-verified",
+                        "allowance=" + observed.allowance + " charge=" + std::to_string(observed.charge)
+                            + " requirement=" + std::to_string(observed.requirement));
+                }
+                restore.character_allowance_reason = "typed saved allowance " + observed.allowance
+                    + " remained on the same owner at " + std::string{phase};
+                return observed;
+            }
+            catch (const std::exception& error)
+            {
+                restore.character_allowance_status = "failed";
+                restore.character_allowance_proven = false;
+                restore.character_allowance_reason = std::string{phase} + ": " + error.what();
+                append_route_c_trace_failure("restore.character-allowance.failed", restore.character_allowance_reason);
+                throw;
+            }
+        }
+
         auto update_exact_character_charge(
             PendingRouteCRestore& restore,
             const RouteCBattleObjects& objects,
@@ -10458,6 +10708,9 @@ namespace QuantumCheckpoint
             }
 
             const auto& exact = *restore.exact_character_charge;
+            const auto before = verify_character_allowance(restore, objects, "before-charge");
+            if (before && (before->charge != *current_charge || before->requirement != *requirement))
+                throw std::runtime_error{"character charge changed between outer observation and its guarded operation"};
             if (*requirement != exact.requirement)
             {
                 restore.exact_character_charge_status = "failed-no-write";
@@ -10520,6 +10773,15 @@ namespace QuantumCheckpoint
             call_reflected(objects.card_engine,
                            STR("addCharacterAbilityCharge"),
                            {{STR("Amount"), std::to_string(amount)}});
+            if (const auto after = verify_character_allowance(restore, objects, "after-charge"))
+            {
+                if (!before || !same_character_resource_owner(*before, *after)
+                    || after->charge != exact.charge || after->requirement != exact.requirement)
+                    throw std::runtime_error{"public charge addition did not preserve the guarded resource contract"};
+                append_route_c_trace_failure("restore.character-allowance.charge-verified",
+                    "before=" + std::to_string(before->charge) + " after=" + std::to_string(after->charge)
+                        + " amount=" + std::to_string(amount) + " allowance=" + after->allowance);
+            }
             restore.exact_character_charge_status = "applied";
             restore.exact_character_charge_reason =
                 "public character-charge API was called; awaiting verification";
@@ -11285,6 +11547,7 @@ namespace QuantumCheckpoint
                     if (restore.exact_player_qualification)
                         append_route_c_trace("restore.player-qualification.newborn-verified");
                 }
+                verify_character_allowance(restore, objects, "before-player-layout");
                 if (!advance_player_hand_staging(restore, objects, now))
                 {
                     return;
@@ -11441,6 +11704,7 @@ namespace QuantumCheckpoint
                 if (restore.phase == RouteCRestorePhase::AwaitingVerification)
                 {
                     if (!advance_player_once_replay(restore, objects)) return;
+                    verify_character_allowance(restore, objects, "after-once-replay");
                     if (restore.auto_spawn_suppressed)
                     {
                         import_property_text(objects.spawner,
@@ -11468,6 +11732,7 @@ namespace QuantumCheckpoint
                 // native membership and numeric restore have already verified.
                 verify_restore_move_overlays(restore, objects.card_engine);
                 verify_restore_player_qualification(restore, objects, false);
+                verify_character_allowance(restore, objects, "post-restore-stability");
                 const auto final_zones = find_route_c_player_zone_objects(
                     static_cast<const void*>(objects.card_engine->GetWorld()));
                 const auto verify_final_zones = [&](const auto& exact) {
@@ -11510,6 +11775,18 @@ namespace QuantumCheckpoint
                 if (now < restore.stability_deadline)
                 {
                     return;
+                }
+                if (restore.exact_character_charge
+                    && restore.exact_character_charge->schema_version >= ExactCharacterChargeAllowanceSchemaVersion)
+                {
+                    const auto final_resource = verify_character_allowance(restore, objects, "stability-complete");
+                    if (!final_resource || final_resource->charge != restore.exact_character_charge->charge
+                        || restore.exact_character_charge_status != "verified")
+                        throw std::runtime_error{"saved character resource did not verify at the end of the stability window"};
+                    restore.character_allowance_status = restore.exact_character_charge->schema_version == ExactCharacterChargeAllowanceSchemaVersion
+                        ? "verified-false-through-stability" : "verified-source-allowance-through-stability";
+                    restore.character_allowance_proven = true;
+                    append_route_c_trace("restore.character-allowance.stability-verified");
                 }
                 finish_route_c_restore(
                     "passed",
@@ -12177,6 +12454,30 @@ namespace QuantumCheckpoint
                 else if (role == "BP_ControllerCharacterCardSlot_C")
                 {
                     append_getters(snapshot, object, CharacterCardSlotGetters);
+                    if (export_property_text(object, STR("boardSide")) == "PLAYER")
+                    {
+                        try
+                        {
+                            const auto live = find_route_c_objects();
+                            if (live.character_card_slot != object)
+                                throw std::runtime_error{"inventory character slot is not the unique live owner"};
+                            const auto resource = read_character_resource(live);
+                            snapshot.properties.push_back({"native:characterResourceStatus", "verified-typed-observation"});
+                            snapshot.properties.push_back({"native:characterAllowance", resource.allowance});
+                            snapshot.properties.push_back({"native:characterCharge", std::to_string(resource.charge)});
+                            snapshot.properties.push_back({"native:characterRequirement", std::to_string(resource.requirement)});
+                            snapshot.properties.push_back({"native:characterResourceWorld", resource.world.full_name});
+                            snapshot.properties.push_back({"native:characterResourceEngine", resource.engine.full_name});
+                            snapshot.properties.push_back({"native:characterResourceSlot", resource.slot.full_name});
+                            snapshot.properties.push_back({"native:characterResourceWeakIdentitiesVerified", "True"});
+                            snapshot.properties.push_back({"native:characterAbilityCardStateScope", "not-covered"});
+                        }
+                        catch (const std::exception& error)
+                        {
+                            snapshot.properties.push_back({"native:characterResourceStatus", "unavailable"});
+                            snapshot.properties.push_back({"native:characterResourceReadError", error.what()});
+                        }
+                    }
                 }
                 else if (role == "BP_ControllerDeck_C")
                 {
@@ -15363,9 +15664,9 @@ namespace QuantumCheckpoint
         QuantumCheckpointMod()
         {
             ModName = STR("QuantumCheckpoint");
-            ModVersion = STR("0.41.0");
+            ModVersion = STR("0.42.0");
 #if defined(QUANTUM_CHECKPOINT_RUNTIME_TEST_FIXTURES)
-            ModVersion = STR("0.41.0-test-fixtures");
+            ModVersion = STR("0.42.0-test-fixtures");
 #endif
             ModDescription = STR("Route C checkpoint with optional exact-state supplements");
             ModAuthors = STR("zaofenMachine and contributors");

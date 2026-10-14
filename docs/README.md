@@ -1,6 +1,8 @@
 # 文档索引
 
-当前入口（2026-10-15）：[第四十阶段](phase-40-bow-once-replay.md)在 v0.41.0 增加 Z7/T8/F11＋Q2 基础长弓 ONCE 原生回放，六组新恢复通过原25项玩家检查；三个新进程 Q1 兼容案例与原用户旧档回归也通过。三个旧进程兼容失败保留为24/25，唯一必需差异为角色 abilityOk。新能力限于已审阅基础长弓，不放开 flags、任意 ONCE、完整 UI／私有历史。重编程与敌人精确恢复继续搁置。
+当前入口（2026-10-15）：[第四十一阶段](phase-41-character-allowance-guard.md)在 v0.42.0 增加 C3 角色资源证明，保存并核对实际许可 False／True，保留 C1 未知、C2 False-only 的原有含义。五组 C3 和两个 C2／兼容正例通过原25项；许可双向不匹配实际拒绝并单次回退。角色许可始终只读，能力牌、满充、完整 UI／私有历史不扩域。重编程与敌人精确恢复继续搁置。
+
+[第四十阶段](phase-40-bow-once-replay.md)的 Z7/T8/F11＋Q2 基础长弓 ONCE 回放继续保留；旧会话24/25失败及其原因边界不改写。
 
 [第三十九阶段 A](phase-39-player-qualification-baseline.md)的 Q1 默认门禁与旧档未知来源语义不变；[第三十八阶段](phase-38-effect-qualification-observation.md)及此前原始失败不改写。当前部署、冻结清理和后续任务以[工作进度](WIP-current-progress-2026-09-10.md)文首为准，续接同时读[技术状态](technical-status.md)。
 
@@ -78,3 +80,4 @@
 
 - [phase-39-player-qualification-baseline.md](phase-39-player-qualification-baseline.md)：默认 profile 资格门禁、Q1 依赖、新布局和 legacy 实机范围、ONCE／未知 profile 捕获拒绝。
 - [phase-40-bow-once-replay.md](phase-40-bow-once-replay.md)：基础长弓的 Q2 原生 ONCE 回放、同名副本绑定、自然刷新对照、旧版兼容及角色能力状态缺口。
+- [phase-41-character-allowance-guard.md](phase-41-character-allowance-guard.md)：C1/C2/C3 角色充能兼容、实际许可只读匹配、双向不匹配拒绝、独立资源证明与候选数值丢失修正。

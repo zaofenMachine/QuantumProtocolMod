@@ -60,9 +60,15 @@ namespace QuantumCheckpoint
     inline constexpr int ExactPlayerHandHealthSchemaVersion = 3;
     inline constexpr std::string_view ExactPlayerHandHealthCheckpointKind =
         "route-c-exact-player-hand-health";
-    inline constexpr int ExactCharacterChargeSchemaVersion = 1;
+    // Schema1 records numeric charge only; it cannot attest saved allowance.
+    inline constexpr int ExactCharacterChargeLegacySchemaVersion = 1;
+    inline constexpr int ExactCharacterChargeAllowanceSchemaVersion = 2;
+    inline constexpr int ExactCharacterChargeObservedAllowanceSchemaVersion = 3;
+    inline constexpr int ExactCharacterChargeSchemaVersion = 3;
     inline constexpr std::string_view ExactCharacterChargeCheckpointKind =
         "route-c-exact-character-charge";
+    inline constexpr std::string_view ExactCharacterAllowancePolicy = "observed-disallowed-v1";
+    inline constexpr std::string_view ExactCharacterObservedAllowancePolicy = "observed-allowance-match-v1";
     inline constexpr int ExactTurnProgressSchemaVersion = 2;
     inline constexpr std::string_view ExactTurnProgressCheckpointKind =
         "route-c-exact-turn-progress";
@@ -304,6 +310,9 @@ namespace QuantumCheckpoint
         std::int32_t wave_index{};
         std::int32_t charge{};
         std::int32_t requirement{};
+        // Empty is unknown/unobserved, never a default False source proof.
+        std::string ability_allowance{};
+        std::string allowance_policy{};
         std::string payload_checksum{};
     };
 
