@@ -26,13 +26,24 @@ namespace QuantumCheckpoint
     inline constexpr int ExactPlayerZonesBaseHealthSchemaVersion = 5;
     inline constexpr int ExactPlayerTrashBaseHealthSchemaVersion = 6;
     inline constexpr int ExactPlayerFieldBaseHealthSchemaVersion = 9;
-    inline constexpr int ExactPlayerZonesSchemaVersion = 5;
+    // These fixed minima require a checksummed Q1 qualification dependency marker.
+    // Do not move the historical membership/base-health minima above.
+    inline constexpr int ExactPlayerZonesQualificationSchemaVersion = 6;
+    inline constexpr int ExactPlayerTrashQualificationSchemaVersion = 7;
+    inline constexpr int ExactPlayerFieldQualificationSchemaVersion = 10;
+    inline constexpr int ExactPlayerQualificationSchemaVersion = 1;
+    inline constexpr std::string_view ExactPlayerQualificationCheckpointKind =
+        "route-c-exact-player-qualification";
+    inline constexpr std::string_view ExactPlayerQualificationPolicy = "flags-baseline-v1";
+    inline constexpr std::size_t ExactPlayerQualificationMaximumCards = 128;
+    inline constexpr std::size_t ExactPlayerQualificationMaximumEffectsPerCard = 64;
+    inline constexpr int ExactPlayerZonesSchemaVersion = 6;
     inline constexpr std::string_view ExactPlayerZonesCheckpointKind =
         "route-c-exact-player-zones";
-    inline constexpr int ExactPlayerTrashSchemaVersion = 6;
+    inline constexpr int ExactPlayerTrashSchemaVersion = 7;
     inline constexpr std::string_view ExactPlayerTrashCheckpointKind =
         "route-c-exact-player-trash";
-    inline constexpr int ExactPlayerFieldSchemaVersion = 9;
+    inline constexpr int ExactPlayerFieldSchemaVersion = 10;
     inline constexpr std::string_view ExactPlayerFieldCheckpointKind =
         "route-c-exact-player-field";
     // Fixed minimum for replaying HAND base-HP gains; keep older schemas default-only.
@@ -139,6 +150,8 @@ namespace QuantumCheckpoint
         // One base=max, modifier-free HEALTH record per native DECK index.
         // An empty zone has an empty record string. Legacy schemas leave it empty.
         std::string player_deck_base_health_states{};
+        // Empty by default: capture must explicitly attest the reviewed policy.
+        std::string qualification_policy{};
         std::string payload_checksum{};
     };
 
@@ -161,6 +174,7 @@ namespace QuantumCheckpoint
         std::string player_hand_health_checksum{};
         std::string player_deck_base_health_states{};
         std::string player_trash_base_health_states{};
+        std::string qualification_policy{};
         std::string payload_checksum{};
     };
 
@@ -196,6 +210,52 @@ namespace QuantumCheckpoint
         std::string player_hand_health_checksum{};
         std::string player_deck_base_health_states{};
         std::string player_trash_base_health_states{};
+        std::string qualification_policy{};
+        std::string payload_checksum{};
+    };
+
+    struct ExactPlayerQualificationEffect
+    {
+        std::int32_t ordinal{};
+        std::string factory_key{};
+        std::string tag{};
+        std::int32_t type{};
+        std::vector<std::uint8_t> flags{};
+        std::int32_t used_once{};
+        std::string profile_id{};
+        auto operator==(const ExactPlayerQualificationEffect&) const -> bool = default;
+    };
+
+    struct ExactPlayerQualificationCard
+    {
+        // Native locations: HAND=0, DECK=1, TRASH=2, FIELD=3. Records are in this
+        // order; each D/H/T index is contiguous. FIELD uses row/index order.
+        std::int32_t native_location{};
+        std::int32_t native_index{-1};
+        std::int32_t row{-1};
+        std::int32_t index{-1};
+        std::string card_info_instance{};
+        std::vector<ExactPlayerQualificationEffect> effects{};
+        auto operator==(const ExactPlayerQualificationCard&) const -> bool = default;
+    };
+
+    // Portable whole-player proof. Actor/effect GUIDs and addresses are excluded.
+    // The selected layout hashes its required policy; Q1 hashes that layout's
+    // checksum, so the dependency is cycle-free.
+    struct ExactPlayerQualificationCheckpoint
+    {
+        int schema_version{ExactPlayerQualificationSchemaVersion};
+        std::string kind{ExactPlayerQualificationCheckpointKind};
+        std::string captured_at_utc{};
+        std::string route_c_payload_checksum{};
+        std::string game_executable_sha256{};
+        std::uint64_t game_executable_size{};
+        std::string source_level_name{};
+        std::int32_t wave_index{};
+        std::string layout_kind{};
+        std::string layout_payload_checksum{};
+        std::string qualification_policy{};
+        std::vector<ExactPlayerQualificationCard> cards{};
         std::string payload_checksum{};
     };
 

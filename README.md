@@ -2,9 +2,9 @@
 
 《Quantum Protocol》局内检查点 Mod 的可行性研究与实验原型。
 
-当前 v0.39.0 沿用路线 C“普通地牢小关语义重开”，叠加受限的玩家精确恢复：原生牌序、手牌数量、场格、生命与攻击修正、计数器、抽牌进度，以及春生成的一张额外苹果。恢复在游戏线程执行，精确层失败后重新加载一次纯 Route C。
+当前 v0.40.0 沿用路线 C“普通地牢小关语义重开”，叠加受限的玩家精确恢复：原生牌序、手牌数量、场格、生命与攻击修正、计数器、抽牌进度，以及春生成的一张额外苹果。恢复在游戏线程执行，精确层失败后重新加载一次纯 Route C。
 
-本轮把非负基础生命增长从 HAND 扩展到 DECK/TRASH，并同步隐藏卡的生命显示缓存。保存要求原生动作队列安定，自动保存遇明确的短暂忙碌会有界等待。v0.39.0 另增加技能资格的只读 F1 观测：实机确认长弓已用的 ONCE 在普通返手后保留，却在恢复后丢失并可再次发动。该缺口尚未修复，现有报告 passed 不表示完整技能资格恢复。
+v0.40.0 增加玩家资格默认来源门禁：新布局 Z6/T7/F10 必须绑定 Q1，逐技能实际 flags 精确符合已审阅构造默认值、无 ONCE 且 used=0，才能获得独立资格通过。三组真实新布局和两组 legacy 回归均通过原 25 项玩家检查；旧档明确 legacy-bounded，保存时资格未知。基础 Bow 未用／已用均拒绝新版玩家精确层，主 Route C 与适用的未来 spawn 计划仍可保存。没有 ONCE 或 flags 写回；[第三十八阶段](docs/phase-38-effect-qualification-observation.md)的资格丢失历史仍保留。完整范围见[第三十九阶段 A](docs/phase-39-player-qualification-baseline.md)。
 
 ## 当前结论
 
@@ -25,6 +25,7 @@ HAND schema 3 按原生下标保存基础生命、HEALTH 修正与 generic 计�
 
 第三十七阶段保留了旧 UI 缓存缺口、技能历史不一致和自动捕获遗漏的原始失败，未将它们归一化为通过。最终生产构建与 DEV 夹具各 4/4 CTest；正式恢复、正常换波自动保存及真实 pending 动作重试分开验收，PROCESSING 等待仍缺实机覆盖。当前阶段证据位于 `QuantumProtoclMod.runtime-evidence/20260930-player-state`，完整范围和归档索引见阶段文档。敌人精确状态、技能私有历史、LEVEL 修正、独立生命调整及 STORAGE/能力卡运行态仍不覆盖；重编程路线继续搁置。详见：
 
+- [玩家资格默认来源门禁与 Q1](docs/phase-39-player-qualification-baseline.md)
 - [技能资格观测与 ONCE 恢复缺口](docs/phase-38-effect-qualification-observation.md)
 - [牌库／墓地基础生命与稳定捕获](docs/phase-37-player-zone-base-health.md)
 
@@ -127,23 +128,24 @@ C++ 构建前提、已验证工具链和反射结构提取方法见 [C++ 开发�
 
 安装器会把 DLL 部署为 `Mods\QuantumCheckpoint\dlls\main.dll`，在现有 `mods.txt` 中加入 `QuantumCheckpoint : 1`，并把精确回滚材料保存在被 Git 忽略的 `backups/cpp` 与 `runtime` 目录。若旧 Lua 研究探针存在，安装器会在本次 C++ 部署中将其禁用；回滚时会恢复部署前配置。
 
-v0.39.0 路线 C 与精确补充切片的热键和输出：
+v0.40.0 路线 C 与精确补充切片的热键和输出：
 
 - `Ctrl+Shift+F5`：在受支持的稳定普通小关手动保存；每次正常波次生成后也会自动保存。
 - `Ctrl+Shift+F6`：读取唯一检查点并执行语义重开。
 - `Ctrl+F1`：保留只读对象报告。
 - 检查点：`Mods\QuantumCheckpoint\Checkpoint\route-c.json`，原子替换并保留 `.bak`。
 - 精确补充：`Mods\QuantumCheckpoint\Checkpoint\route-c-exact-spawn-plan.json`；与主检查点校验和绑定，缺失或失败时安全降级为路线 C。
-- 牌库/手牌补充：`Mods\QuantumCheckpoint\Checkpoint\route-c-exact-player-zones.json`；schema 4 要求所有活动玩家卡位于牌库/手牌且总集合完全匹配，按原生顺序恢复手牌数量，并核验游戏公开容量。
-- 墓地补充：`Mods\QuantumCheckpoint\Checkpoint\route-c-exact-player-trash.json`；schema 5 要求受支持卡牌完整分布于牌库、手牌和墓地，场上/待处理区为空。支持已验证的一张额外苹果，通过原生 `DEFAULT` MoveCard 重建并严格复核三区顺序。
+- 牌库/手牌补充：`Mods\QuantumCheckpoint\Checkpoint\route-c-exact-player-zones.json`；schema 6 要求 Q1 默认资格证明及所有活动玩家卡位于牌库/手牌且总集合完全匹配，按原生顺序恢复手牌数量，并核验游戏公开容量。
+- 墓地补充：`Mods\QuantumCheckpoint\Checkpoint\route-c-exact-player-trash.json`；schema 7 要求 Q1 默认资格证明及受支持卡牌完整分布于牌库、手牌和墓地，场上/待处理区为空。支持已验证的一张额外苹果，通过原生 `DEFAULT` MoveCard 重建并严格复核三区顺序。
 - 手牌生命/计数补充：`Mods\QuantumCheckpoint\Checkpoint\route-c-exact-player-hand-health.json`；schema 3 按原生 HAND 位置记录基础生命、完整 HEALTH 修正及 generic 计数（0–256），special 计数须为空。基础生命须为正且有界，只允许相对所选定义非负增长，HEALTH 修正非负、无独立生命调整且当前生命等于上限。HAND 3 必须依赖具有保存时技能成员证明的 Z4/T5/F8 布局；旧 HAND 1/2 兼容读取，仍要求定义基础生命。
 - 角色充能补充：`Mods\QuantumCheckpoint\Checkpoint\route-c-exact-character-charge.json`；只保存低于满充阈值的值，恢复时通过公开增量 API 写回并由 Getter 复核。
-- 玩家场地补充：`Mods\QuantumCheckpoint\Checkpoint\route-c-exact-player-field.json`；schema 8 限受支持卡牌、空 PENDING，统一恢复墓地、场格、生命、攻击和计数器。按真实牌序分配同名副本，允许空牌库/手牌和已验证的一张额外苹果；完整集合和原生暂存规划仍须通过验证。
+- 玩家场地补充：`Mods\QuantumCheckpoint\Checkpoint\route-c-exact-player-field.json`；schema 10 要求 Q1 默认资格证明，限受支持卡牌、空 PENDING，统一恢复墓地、场格、生命、攻击和计数器。按真实牌序分配同名副本，允许空牌库/手牌和已验证的一张额外苹果；完整集合和原生暂存规划仍须通过验证。
 - 回合进度补充：`Mods\QuantumCheckpoint\Checkpoint\route-c-exact-turn-progress.json`；schema 2 成组保存全局回合、抽牌基础倒计时与修正量、累计威胁；同时核验游戏自行计算的抽牌缓存。旧 schema 1 只用于读取诊断，需重新保存以启用战斗补充。
+- 玩家资格补充：`Mods\QuantumCheckpoint\Checkpoint\route-c-exact-player-qualification.json`；Q1 绑定主文件、所选布局与完整 D/H/T/F 身份、有序 profile、flags 和 used0。未知 profile、任何 ONCE（包括未用 Bow）或非零 used 拒绝；旧布局无 Q1 仍按 legacy-bounded 范围读取。
 - 恢复结果：`Mods\QuantumCheckpoint\Reports\route-c-restore-*.json`。
 - 诊断轨迹：`Mods\QuantumCheckpoint\route-c-trace.log`；F5/F6 和各高风险阶段都会立即刷盘。
 
-当前 schema 2 主检查点仅接受已验证游戏 EXE 的完整 SHA-256，且只允许普通 `DUNGEON`、无活动提示、稳定 `OPEN` 状态和无额外状态的普通 Spawner。补充文件分别维护格式版本，并在写入前检查依赖。Z4/T5/F8 同时表示捕获时原生技能成员已逐项符合定义；成员不符时不保存玩家精确层、回合或充能。发布新主文件前清除七类现行补充及其备份，清理失败则中止新保存。缺少有效回合补充时禁用场地/墓地等战斗补充；缺少精确玩家牌区时也不单独写回合。新布局所需 HAND 文件缺失、损坏或错配时，预检禁用玩家布局、回合和角色充能层；旧格式保持兼容，但不声明新的手牌动态覆盖。写后失败会重新加载纯 Route C，报告明确区分 requested、preflight-route-c 与 semantic-fallback。项目仍不宣称完整中途战场快照。
+当前 schema 2 主检查点仅接受已验证游戏 EXE 的完整 SHA-256，且只允许普通 `DUNGEON`、无活动提示、稳定 `OPEN` 状态和无额外状态的普通 Spawner。补充文件分别维护格式版本，并在写入前检查依赖。Z4/T5/F8 同时表示捕获时原生技能成员已逐项符合定义；成员不符时不保存玩家精确层、回合或充能。发布新主文件前清除八类现行补充（含 Q1）及其备份，清理失败则中止新保存。缺少有效回合补充时禁用场地/墓地等战斗补充；缺少精确玩家牌区时也不单独写回合。新布局所需 HAND 文件缺失、损坏或错配时，预检禁用玩家布局、回合和角色充能层；旧格式保持兼容，但不声明新的手牌动态覆盖。写后失败会重新加载纯 Route C，报告明确区分 requested、preflight-route-c 与 semantic-fallback。Z6/T7/F10 所需 Q1 缺失、损坏或错绑定同样在启动前禁用依赖层；报告分离保存证明与资格状态，`playerOnceReplayCount=0`、`fullPlayerExactRestorationProven=false`。项目仍不宣称完整中途战场快照。
 
 旧的生命与回合写入探针仍保留用于可丢弃测试局，但不属于路线 C 的日常操作。路线 C 的实现和验收步骤见 [第七阶段报告](docs/phase-7-route-c-vertical-slice.md)。
 

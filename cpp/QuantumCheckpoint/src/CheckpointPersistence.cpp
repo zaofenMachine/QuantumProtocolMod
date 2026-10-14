@@ -2,6 +2,7 @@
 #include "PlayerAttackState.hpp"
 #include "PlayerHealthState.hpp"
 #include "PlayerCounterState.hpp"
+#include "EffectQualificationPolicy.hpp"
 
 #include <algorithm>
 #include <array>
@@ -86,7 +87,10 @@ namespace QuantumCheckpoint
         class FlatJsonParser
         {
           public:
-            explicit FlatJsonParser(std::string_view input) : m_input(input) {}
+            explicit FlatJsonParser(std::string_view input,
+                                    std::size_t maximum_fields = RouteCMaximumFileBytes,
+                                    bool strict_json = false)
+                : m_input(input), m_maximum_fields(maximum_fields), m_strict_json(strict_json) {}
 
             auto parse(std::string& error)
                 -> std::optional<std::unordered_map<std::string, JsonValue>>
@@ -146,6 +150,11 @@ namespace QuantumCheckpoint
                         error = "checkpoint JSON contains a duplicate field";
                         return std::nullopt;
                     }
+                    if (values.size() > m_maximum_fields)
+                    {
+                        error = "checkpoint JSON exceeds its field limit";
+                        return std::nullopt;
+                    }
 
                     skip_whitespace();
                     if (consume('}'))
@@ -189,7 +198,10 @@ namespace QuantumCheckpoint
             auto skip_whitespace() -> void
             {
                 while (m_position < m_input.size()
-                       && std::isspace(static_cast<unsigned char>(m_input[m_position])))
+                       && (m_strict_json
+                           ? m_input[m_position] == ' ' || m_input[m_position] == '\t'
+                             || m_input[m_position] == '\r' || m_input[m_position] == '\n'
+                           : std::isspace(static_cast<unsigned char>(m_input[m_position]))))
                 {
                     ++m_position;
                 }
@@ -295,11 +307,18 @@ namespace QuantumCheckpoint
                     error = "checkpoint integer is out of range";
                     return std::nullopt;
                 }
+                if (m_strict_json && std::to_string(value) != m_input.substr(start, m_position - start))
+                {
+                    error = "checkpoint integer is not canonical JSON";
+                    return std::nullopt;
+                }
                 return value;
             }
 
             std::string_view m_input{};
             std::size_t m_position{};
+            std::size_t m_maximum_fields{};
+            bool m_strict_json{};
         };
 
         auto append_hash_bytes(std::uint64_t& hash, std::string_view value) -> void
@@ -364,6 +383,15 @@ namespace QuantumCheckpoint
             return true;
         }
 
+        auto validate_qualification_policy(std::string_view policy, bool required,
+                                           std::string& error) -> bool
+        {
+            if (required ? policy == ExactPlayerQualificationPolicy : policy.empty()) return true;
+            error = required ? "player qualification requires flags-baseline-v1 policy"
+                             : "legacy player layout cannot claim qualification coverage";
+            return false;
+        }
+
         auto validate_off_field_base_health_records(std::size_t zone_size,
                                                     std::string_view records,
                                                     bool covered,
@@ -395,6 +423,26 @@ namespace QuantumCheckpoint
                 return std::nullopt;
             }
             return std::get<std::string>(found->second);
+        }
+
+        auto reject_inline_qualification_fields(
+            const std::unordered_map<std::string, JsonValue>& values, std::string& error) -> bool
+        {
+            for (const auto& [name, value] : values)
+            {
+                const bool dynamic_card = name.size() > 4 && name.starts_with("card")
+                    && std::isdigit(static_cast<unsigned char>(name[4]));
+                if (dynamic_card || name == "cardCount" || name == "handCardCount"
+                    || name == "deckCardCount" || name == "trashCardCount" || name == "fieldCardCount"
+                    || name == "layoutKind" || name == "layoutPayloadChecksum" || name == "cards"
+                    || name.starts_with("playerQualification")
+                    || (name.starts_with("qualification") && name != "qualificationPolicy"))
+                {
+                    error = "player layout JSON contains reserved Q1 qualification fields: " + name;
+                    return false;
+                }
+            }
+            return true;
         }
 
         template <typename Number>
@@ -1754,6 +1802,8 @@ namespace QuantumCheckpoint
             append_hash_bytes(hash, checkpoint.player_hand_health_checksum);
         if (checkpoint.schema_version >= ExactPlayerZonesBaseHealthSchemaVersion)
             append_hash_bytes(hash, checkpoint.player_deck_base_health_states);
+        if (checkpoint.schema_version >= ExactPlayerZonesQualificationSchemaVersion)
+            append_hash_bytes(hash, checkpoint.qualification_policy);
 
         std::ostringstream output{};
         output << std::hex << std::uppercase << std::setw(16) << std::setfill('0') << hash;
@@ -1786,6 +1836,10 @@ namespace QuantumCheckpoint
         if (checkpoint.schema_version >= ExactPlayerZonesBaseHealthSchemaVersion)
             output << "  \"playerDeckBaseHealthStates\": \""
                    << json_escape(checkpoint.player_deck_base_health_states) << "\",\n";
+        if (checkpoint.schema_version >= ExactPlayerZonesQualificationSchemaVersion
+            || !checkpoint.qualification_policy.empty())
+            output << "  \"qualificationPolicy\": \""
+                   << json_escape(checkpoint.qualification_policy) << "\",\n";
         output << "  \"payloadChecksum\": \"" << checkpoint.payload_checksum << "\"\n"
                << "}\n";
         return output.str();
@@ -1855,6 +1909,8 @@ namespace QuantumCheckpoint
                                                checkpoint.schema_version >= 3, error)) return false;
         if (!validate_off_field_base_health_records(deck->size(), checkpoint.player_deck_base_health_states,
                 checkpoint.schema_version >= ExactPlayerZonesBaseHealthSchemaVersion, error)) return false;
+        if (!validate_qualification_policy(checkpoint.qualification_policy,
+                checkpoint.schema_version >= ExactPlayerZonesQualificationSchemaVersion, error)) return false;
         if (checkpoint.payload_checksum != exact_player_zones_payload_checksum(checkpoint))
         {
             error = "exact player-zones payload checksum does not match";
@@ -1878,6 +1934,7 @@ namespace QuantumCheckpoint
         }
 
         ExactPlayerZonesCheckpoint checkpoint{};
+        if (!reject_inline_qualification_fields(*values, error)) return std::nullopt;
 #define READ_ZONES_STRING(Field, JsonName) \
         do { auto value = required_string(*values, JsonName, error); if (!value) return std::nullopt; checkpoint.Field = std::move(*value); } while (false)
 #define READ_ZONES_INTEGER(Field, JsonName, Type) \
@@ -1916,6 +1973,15 @@ namespace QuantumCheckpoint
             error = "legacy player-zones JSON contains newer DECK base-health records";
             return std::nullopt;
         }
+        if (checkpoint.schema_version >= ExactPlayerZonesQualificationSchemaVersion)
+        {
+            READ_ZONES_STRING(qualification_policy, "qualificationPolicy");
+        }
+        else if (values->contains("qualificationPolicy"))
+        {
+            error = "legacy player-zones JSON contains a qualification policy";
+            return std::nullopt;
+        }
         READ_ZONES_STRING(payload_checksum, "payloadChecksum");
 
 #undef READ_ZONES_INTEGER
@@ -1951,6 +2017,8 @@ namespace QuantumCheckpoint
             append_hash_bytes(hash, checkpoint.player_deck_base_health_states);
             append_hash_bytes(hash, checkpoint.player_trash_base_health_states);
         }
+        if (checkpoint.schema_version >= ExactPlayerTrashQualificationSchemaVersion)
+            append_hash_bytes(hash, checkpoint.qualification_policy);
 
         std::ostringstream output{};
         output << std::hex << std::uppercase << std::setw(16) << std::setfill('0') << hash;
@@ -1986,6 +2054,10 @@ namespace QuantumCheckpoint
                    << json_escape(checkpoint.player_deck_base_health_states) << "\",\n"
                    << "  \"playerTrashBaseHealthStates\": \""
                    << json_escape(checkpoint.player_trash_base_health_states) << "\",\n";
+        if (checkpoint.schema_version >= ExactPlayerTrashQualificationSchemaVersion
+            || !checkpoint.qualification_policy.empty())
+            output << "  \"qualificationPolicy\": \""
+                   << json_escape(checkpoint.qualification_policy) << "\",\n";
         output << "  \"payloadChecksum\": \"" << checkpoint.payload_checksum << "\"\n"
                << "}\n";
         return output.str();
@@ -2095,6 +2167,8 @@ namespace QuantumCheckpoint
                 checkpoint.schema_version >= ExactPlayerTrashBaseHealthSchemaVersion, error)
             || !validate_off_field_base_health_records(trash->size(), checkpoint.player_trash_base_health_states,
                 checkpoint.schema_version >= ExactPlayerTrashBaseHealthSchemaVersion, error)) return false;
+        if (!validate_qualification_policy(checkpoint.qualification_policy,
+                checkpoint.schema_version >= ExactPlayerTrashQualificationSchemaVersion, error)) return false;
         if (checkpoint.payload_checksum != exact_player_trash_payload_checksum(checkpoint))
         {
             error = "exact player-trash payload checksum does not match";
@@ -2118,6 +2192,7 @@ namespace QuantumCheckpoint
         }
 
         ExactPlayerTrashCheckpoint checkpoint{};
+        if (!reject_inline_qualification_fields(*values, error)) return std::nullopt;
 #define READ_TRASH_STRING(Field, JsonName) \
         do { auto value = required_string(*values, JsonName, error); if (!value) return std::nullopt; checkpoint.Field = std::move(*value); } while (false)
 #define READ_TRASH_INTEGER(Field, JsonName, Type) \
@@ -2156,6 +2231,15 @@ namespace QuantumCheckpoint
         else if (values->contains("playerDeckBaseHealthStates") || values->contains("playerTrashBaseHealthStates"))
         {
             error = "legacy player-trash JSON contains newer DECK/TRASH base-health records";
+            return std::nullopt;
+        }
+        if (checkpoint.schema_version >= ExactPlayerTrashQualificationSchemaVersion)
+        {
+            READ_TRASH_STRING(qualification_policy, "qualificationPolicy");
+        }
+        else if (values->contains("qualificationPolicy"))
+        {
+            error = "legacy player-trash JSON contains a qualification policy";
             return std::nullopt;
         }
         READ_TRASH_STRING(payload_checksum, "payloadChecksum");
@@ -2201,6 +2285,8 @@ namespace QuantumCheckpoint
             append_hash_bytes(hash, checkpoint.player_deck_base_health_states);
             append_hash_bytes(hash, checkpoint.player_trash_base_health_states);
         }
+        if (checkpoint.schema_version >= ExactPlayerFieldQualificationSchemaVersion)
+            append_hash_bytes(hash, checkpoint.qualification_policy);
 
         std::ostringstream output{};
         output << std::hex << std::uppercase << std::setw(16) << std::setfill('0') << hash;
@@ -2252,6 +2338,10 @@ namespace QuantumCheckpoint
                    << json_escape(checkpoint.player_deck_base_health_states) << "\",\n"
                    << "  \"playerTrashBaseHealthStates\": \""
                    << json_escape(checkpoint.player_trash_base_health_states) << "\",\n";
+        if (checkpoint.schema_version >= ExactPlayerFieldQualificationSchemaVersion
+            || !checkpoint.qualification_policy.empty())
+            output << "  \"qualificationPolicy\": \""
+                   << json_escape(checkpoint.qualification_policy) << "\",\n";
         output << "  \"payloadChecksum\": \"" << checkpoint.payload_checksum << "\"\n"
                << "}\n";
         return output.str();
@@ -2402,6 +2492,8 @@ namespace QuantumCheckpoint
                 checkpoint.schema_version >= ExactPlayerFieldBaseHealthSchemaVersion, error)
             || !validate_off_field_base_health_records(trash->size(), checkpoint.player_trash_base_health_states,
                 checkpoint.schema_version >= ExactPlayerFieldBaseHealthSchemaVersion, error)) return false;
+        if (!validate_qualification_policy(checkpoint.qualification_policy,
+                checkpoint.schema_version >= ExactPlayerFieldQualificationSchemaVersion, error)) return false;
         if (checkpoint.payload_checksum != exact_player_field_payload_checksum(checkpoint))
         {
             error = "exact player-field payload checksum does not match";
@@ -2425,6 +2517,7 @@ namespace QuantumCheckpoint
         }
 
         ExactPlayerFieldCheckpoint checkpoint{};
+        if (!reject_inline_qualification_fields(*values, error)) return std::nullopt;
 #define READ_FIELD_STRING(Field, JsonName) \
         do { auto value = required_string(*values, JsonName, error); if (!value) return std::nullopt; checkpoint.Field = std::move(*value); } while (false)
 #define READ_FIELD_INTEGER(Field, JsonName, Type) \
@@ -2494,6 +2587,15 @@ namespace QuantumCheckpoint
             error = "legacy player-field JSON contains newer DECK/TRASH base-health records";
             return std::nullopt;
         }
+        if (checkpoint.schema_version >= ExactPlayerFieldQualificationSchemaVersion)
+        {
+            READ_FIELD_STRING(qualification_policy, "qualificationPolicy");
+        }
+        else if (values->contains("qualificationPolicy"))
+        {
+            error = "legacy player-field JSON contains a qualification policy";
+            return std::nullopt;
+        }
         READ_FIELD_STRING(payload_checksum, "payloadChecksum");
 
 #undef READ_FIELD_INTEGER
@@ -2504,6 +2606,587 @@ namespace QuantumCheckpoint
             return std::nullopt;
         }
         return checkpoint;
+    }
+
+    namespace
+    {
+        // Q1 deliberately uses bounded dynamic flat JSON keys, sharing the existing
+        // string/integer parser. No new generic JSON dependency or F1 text format.
+        auto qualification_flags_text(const std::vector<std::uint8_t>& flags) -> std::string
+        {
+            std::string result{};
+            for (const auto flag : flags)
+            {
+                if (!result.empty()) result += ',';
+                result += std::to_string(flag);
+            }
+            return result;
+        }
+
+        auto parse_qualification_flags(std::string_view text, std::string& error)
+            -> std::optional<std::vector<std::uint8_t>>
+        {
+            std::vector<std::uint8_t> result{};
+            if (text.empty()) return result;
+            if (text.size() > 15 || text.size() % 2 == 0)
+            {
+                error = "qualification flags are not canonical unique values 0..7";
+                return std::nullopt;
+            }
+            for (std::size_t index{}; index < text.size(); index += 2)
+            {
+                if (text[index] < '0' || text[index] > '7'
+                    || (index != 0 && text[index - 1] != ',')
+                    || (!result.empty() && text[index] - '0' <= result.back()))
+                {
+                    error = "qualification flags are not canonical unique values 0..7";
+                    return std::nullopt;
+                }
+                result.push_back(static_cast<std::uint8_t>(text[index] - '0'));
+            }
+            return result;
+        }
+
+        auto qualification_zone_counts(const ExactPlayerQualificationCheckpoint& checkpoint)
+            -> std::array<std::size_t, 4>
+        {
+            std::array<std::size_t, 4> counts{};
+            for (const auto& card : checkpoint.cards)
+                if (card.native_location >= 0 && card.native_location < 4)
+                    ++counts[static_cast<std::size_t>(card.native_location)];
+            return counts;
+        }
+
+        auto qualification_struct_fields(std::string_view text, std::string& error)
+            -> std::optional<std::unordered_map<std::string, std::string_view>>
+        {
+            if (text.size() < 2 || text.front() != '(' || text.back() != ')')
+            {
+                error = "qualification CardInfoInstance is not a complete struct";
+                return std::nullopt;
+            }
+            text = text.substr(1, text.size() - 2);
+            std::unordered_map<std::string, std::string_view> fields{};
+            std::size_t start{};
+            int depth{};
+            bool quoted{}, escaped{};
+            for (std::size_t position{}; position <= text.size(); ++position)
+            {
+                const auto character = position == text.size() ? '\0' : text[position];
+                if (quoted)
+                {
+                    if (position == text.size()) break;
+                    if (escaped) escaped = false;
+                    else if (character == '\\') escaped = true;
+                    else if (character == '"') quoted = false;
+                    continue;
+                }
+                if (character == '"') { quoted = true; continue; }
+                if (character == '(')
+                {
+                    if (++depth > 64) break;
+                    continue;
+                }
+                if (character == ')')
+                {
+                    if (--depth < 0) break;
+                    continue;
+                }
+                if (position != text.size() && (character != ',' || depth != 0)) continue;
+                if (depth != 0) break;
+                const auto field = text.substr(start, position - start);
+                const auto separator = field.find('=');
+                if (separator == std::string_view::npos || separator == 0
+                    || separator + 1 == field.size()) break;
+                const auto name = field.substr(0, separator);
+                if (!std::all_of(name.begin(), name.end(), [](unsigned char value) {
+                        return std::isalnum(value) || value == '_';
+                    }) || !fields.emplace(std::string{name}, field.substr(separator + 1)).second) break;
+                if (position == text.size()) return fields;
+                start = position + 1;
+            }
+            error = "qualification CardInfoInstance contains malformed or duplicate fields";
+            return std::nullopt;
+        }
+
+        auto qualification_card_key(std::string_view instance, std::string& error)
+            -> std::optional<std::string>
+        {
+            if (instance.empty() || instance.size() > 256U * 1024U
+                || std::any_of(instance.begin(), instance.end(), [](unsigned char value) {
+                    return value < 0x20;
+                }))
+            {
+                error = "qualification CardInfoInstance is empty, oversized or contains controls";
+                return std::nullopt;
+            }
+            const auto fields = qualification_struct_fields(instance, error);
+            if (!fields) return std::nullopt;
+            if (!fields->contains("CardInfo"))
+            {
+                error = "qualification CardInfoInstance is missing CardInfo";
+                return std::nullopt;
+            }
+            const auto info = qualification_struct_fields(fields->at("CardInfo"), error);
+            if (!info) return std::nullopt;
+            if (!info->contains("Tag"))
+            {
+                error = "qualification CardInfoInstance is missing Tag";
+                return std::nullopt;
+            }
+            const auto tag = info->at("Tag");
+            if (tag.size() < 3 || tag.front() != '"' || tag.back() != '"'
+                || !std::all_of(tag.begin() + 1, tag.end() - 1, [](unsigned char value) {
+                    return std::isalnum(value) || value == '_';
+                }))
+            {
+                error = "qualification CardInfoInstance has an invalid Tag";
+                return std::nullopt;
+            }
+            std::int32_t upgrade{};
+            if (const auto found = fields->find("upgradeLevel"); found != fields->end())
+            {
+                const auto value = found->second;
+                const auto parsed = std::from_chars(value.data(), value.data() + value.size(), upgrade);
+                if (parsed.ec != std::errc{} || parsed.ptr != value.data() + value.size()
+                    || upgrade < 0 || upgrade > 1000 || std::to_string(upgrade) != value)
+                {
+                    error = "qualification CardInfoInstance has an invalid upgradeLevel";
+                    return std::nullopt;
+                }
+            }
+            return std::string{tag.substr(1, tag.size() - 2)} + "@" + std::to_string(upgrade);
+        }
+
+        template <typename Layout>
+        auto qualification_metadata_matches(const ExactPlayerQualificationCheckpoint& checkpoint,
+                                              const Layout& layout, bool required,
+                                              std::string& error) -> bool
+        {
+            if (!required || layout.qualification_policy != ExactPlayerQualificationPolicy
+                || checkpoint.qualification_policy != layout.qualification_policy
+                || checkpoint.layout_kind != layout.kind
+                || checkpoint.layout_payload_checksum != layout.payload_checksum
+                || checkpoint.captured_at_utc != layout.captured_at_utc
+                || checkpoint.route_c_payload_checksum != layout.route_c_payload_checksum
+                || checkpoint.game_executable_sha256 != layout.game_executable_sha256
+                || checkpoint.game_executable_size != layout.game_executable_size
+                || checkpoint.source_level_name != layout.source_level_name
+                || checkpoint.wave_index != layout.wave_index)
+            {
+                error = "qualification proof does not bind the selected required player layout";
+                return false;
+            }
+            return true;
+        }
+
+        auto qualification_cards_match(const ExactPlayerQualificationCheckpoint& checkpoint,
+                                       const std::array<std::string_view, 4>& arrays,
+                                       const std::vector<ExactPlayerFieldCardState>& field_states,
+                                       std::string& error) -> bool
+        {
+            std::size_t offset{};
+            for (std::size_t zone{}; zone < arrays.size(); ++zone)
+            {
+                const auto cards = split_route_c_unreal_array(arrays[zone], error);
+                if (!cards) return false;
+                if (zone == 3 && cards->size() != field_states.size()) return false;
+                for (std::size_t index{}; index < cards->size(); ++index)
+                {
+                    if (offset >= checkpoint.cards.size())
+                    {
+                        error = "qualification proof omits a selected layout card";
+                        return false;
+                    }
+                    const auto& card = checkpoint.cards[offset++];
+                    if (card.native_location != static_cast<std::int32_t>(zone)
+                        || card.card_info_instance != (*cards)[index]
+                        || (zone != 3 && card.native_index != static_cast<std::int32_t>(index))
+                        || (zone == 3 && (card.row != field_states[index].row
+                                          || card.index != field_states[index].index)))
+                    {
+                        error = "qualification card order, full CardInfoInstance or FIELD slot disagrees with layout";
+                        return false;
+                    }
+                }
+            }
+            if (offset != checkpoint.cards.size())
+            {
+                error = "qualification proof contains extra selected layout cards";
+                return false;
+            }
+            return true;
+        }
+    }
+
+    auto exact_player_qualification_payload_checksum(
+        const ExactPlayerQualificationCheckpoint& checkpoint) -> std::string
+    {
+        std::uint64_t hash = 14695981039346656037ULL;
+        append_hash_number(hash, checkpoint.schema_version);
+        append_hash_bytes(hash, checkpoint.kind);
+        append_hash_bytes(hash, checkpoint.captured_at_utc);
+        append_hash_bytes(hash, checkpoint.route_c_payload_checksum);
+        append_hash_bytes(hash, checkpoint.game_executable_sha256);
+        append_hash_number(hash, checkpoint.game_executable_size);
+        append_hash_bytes(hash, checkpoint.source_level_name);
+        append_hash_number(hash, checkpoint.wave_index);
+        append_hash_bytes(hash, checkpoint.layout_kind);
+        append_hash_bytes(hash, checkpoint.layout_payload_checksum);
+        append_hash_bytes(hash, checkpoint.qualification_policy);
+        append_hash_number(hash, checkpoint.cards.size());
+        for (const auto count : qualification_zone_counts(checkpoint)) append_hash_number(hash, count);
+        for (const auto& card : checkpoint.cards)
+        {
+            append_hash_number(hash, card.native_location);
+            append_hash_number(hash, card.native_index);
+            append_hash_number(hash, card.row);
+            append_hash_number(hash, card.index);
+            append_hash_bytes(hash, card.card_info_instance);
+            append_hash_number(hash, card.effects.size());
+            for (const auto& effect : card.effects)
+            {
+                append_hash_number(hash, effect.ordinal);
+                append_hash_bytes(hash, effect.factory_key);
+                append_hash_bytes(hash, effect.tag);
+                append_hash_number(hash, effect.type);
+                append_hash_number(hash, effect.flags.size());
+                for (const auto flag : effect.flags) append_hash_number(hash, flag);
+                append_hash_number(hash, effect.used_once);
+                append_hash_bytes(hash, effect.profile_id);
+            }
+        }
+        std::ostringstream output{};
+        output << std::hex << std::uppercase << std::setw(16) << std::setfill('0') << hash;
+        return output.str();
+    }
+
+    auto serialize_exact_player_qualification_checkpoint(ExactPlayerQualificationCheckpoint checkpoint)
+        -> std::string
+    {
+        checkpoint.payload_checksum = exact_player_qualification_payload_checksum(checkpoint);
+        std::ostringstream output{};
+        output << "{\n";
+        const auto string_field = [&](std::string_view name, std::string_view value) {
+            output << "  \"" << name << "\": \"" << json_escape(value) << "\",\n";
+        };
+        const auto number_field = [&](std::string_view name, auto value) {
+            output << "  \"" << name << "\": " << value << ",\n";
+        };
+        number_field("schemaVersion", checkpoint.schema_version);
+        string_field("kind", checkpoint.kind);
+        string_field("capturedAtUtc", checkpoint.captured_at_utc);
+        string_field("routeCPayloadChecksum", checkpoint.route_c_payload_checksum);
+        string_field("gameExecutableSha256", checkpoint.game_executable_sha256);
+        number_field("gameExecutableSize", checkpoint.game_executable_size);
+        string_field("sourceLevelName", checkpoint.source_level_name);
+        number_field("waveIndex", checkpoint.wave_index);
+        string_field("layoutKind", checkpoint.layout_kind);
+        string_field("layoutPayloadChecksum", checkpoint.layout_payload_checksum);
+        string_field("qualificationPolicy", checkpoint.qualification_policy);
+        number_field("cardCount", checkpoint.cards.size());
+        const auto counts = qualification_zone_counts(checkpoint);
+        constexpr std::array<std::string_view, 4> count_names{
+            "handCardCount", "deckCardCount", "trashCardCount", "fieldCardCount"};
+        for (std::size_t zone{}; zone < counts.size(); ++zone) number_field(count_names[zone], counts[zone]);
+        for (std::size_t index{}; index < checkpoint.cards.size(); ++index)
+        {
+            const auto prefix = "card" + std::to_string(index);
+            const auto& card = checkpoint.cards[index];
+            number_field(prefix + "NativeLocation", card.native_location);
+            number_field(prefix + "NativeIndex", card.native_index);
+            number_field(prefix + "Row", card.row);
+            number_field(prefix + "Index", card.index);
+            string_field(prefix + "CardInfoInstance", card.card_info_instance);
+            number_field(prefix + "EffectCount", card.effects.size());
+            for (std::size_t ordinal{}; ordinal < card.effects.size(); ++ordinal)
+            {
+                const auto effect_prefix = prefix + "Effect" + std::to_string(ordinal);
+                const auto& effect = card.effects[ordinal];
+                number_field(effect_prefix + "Ordinal", effect.ordinal);
+                string_field(effect_prefix + "FactoryKey", effect.factory_key);
+                string_field(effect_prefix + "Tag", effect.tag);
+                number_field(effect_prefix + "Type", effect.type);
+                string_field(effect_prefix + "Flags", qualification_flags_text(effect.flags));
+                number_field(effect_prefix + "UsedOnce", effect.used_once);
+                string_field(effect_prefix + "ProfileId", effect.profile_id);
+            }
+        }
+        output << "  \"payloadChecksum\": \"" << checkpoint.payload_checksum << "\"\n}\n";
+        return output.str();
+    }
+
+    auto validate_exact_player_qualification_checkpoint(
+        const ExactPlayerQualificationCheckpoint& checkpoint, std::string& error) -> bool
+    {
+        if (checkpoint.schema_version != ExactPlayerQualificationSchemaVersion
+            || checkpoint.kind != ExactPlayerQualificationCheckpointKind)
+        {
+            error = "unsupported exact player-qualification schema or kind";
+            return false;
+        }
+        if (!validate_qualification_policy(checkpoint.qualification_policy, true, error)) return false;
+        if (checkpoint.captured_at_utc.empty() || checkpoint.captured_at_utc.size() > 128
+            || !is_hex_digest(checkpoint.route_c_payload_checksum, 16)
+            || !is_hex_digest(checkpoint.layout_payload_checksum, 16)
+            || !is_sha256(checkpoint.game_executable_sha256) || checkpoint.game_executable_size == 0
+            || checkpoint.source_level_name.empty() || checkpoint.source_level_name == "None"
+            || checkpoint.source_level_name.size() > 256 || checkpoint.wave_index < 0
+            || checkpoint.wave_index > 1000)
+        {
+            error = "exact player qualification has invalid metadata or layout linkage";
+            return false;
+        }
+        const auto counts = qualification_zone_counts(checkpoint);
+        if (checkpoint.cards.empty() || checkpoint.cards.size() > ExactPlayerQualificationMaximumCards
+            || counts[0] > 7 || counts[3] > 10
+            || (checkpoint.layout_kind == ExactPlayerZonesCheckpointKind
+                ? counts[2] != 0 || counts[3] != 0
+                : checkpoint.layout_kind == ExactPlayerTrashCheckpointKind
+                    ? counts[2] == 0 || counts[3] != 0
+                    : checkpoint.layout_kind == ExactPlayerFieldCheckpointKind ? counts[3] == 0 : true))
+        {
+            error = "qualification cards violate the selected layout kind or card bounds";
+            return false;
+        }
+        std::array<std::int32_t, 3> next_index{};
+        std::int32_t previous_zone{-1}, previous_slot{-1};
+        for (const auto& card : checkpoint.cards)
+        {
+            if (card.native_location < 0 || card.native_location > 3
+                || card.native_location < previous_zone)
+            {
+                error = "qualification cards have invalid or unordered native locations";
+                return false;
+            }
+            previous_zone = card.native_location;
+            if (card.native_location == 3)
+            {
+                if (card.native_index != -1 || card.row < 0 || card.row > 1
+                    || card.index < 0 || card.index > 4)
+                {
+                    error = "qualification FIELD cards have invalid, duplicate or unordered slots";
+                    return false;
+                }
+                const auto slot = card.row * 5 + card.index;
+                if (slot <= previous_slot)
+                {
+                    error = "qualification FIELD cards have duplicate or unordered slots";
+                    return false;
+                }
+                previous_slot = slot;
+            }
+            else if (card.row != -1 || card.index != -1
+                     || card.native_index != next_index[static_cast<std::size_t>(card.native_location)]++)
+            {
+                error = "qualification native indexes are not unique and contiguous or contain FIELD slots";
+                return false;
+            }
+            const auto key = qualification_card_key(card.card_info_instance, error);
+            if (!key) return false;
+            const auto expected_count = qualification::qualification_card_effect_count(*key);
+            if (!expected_count || card.effects.size() != *expected_count
+                || card.effects.size() > ExactPlayerQualificationMaximumEffectsPerCard)
+            {
+                error = "unsupported-profile: qualification card effect count has no reviewed exact profile";
+                return false;
+            }
+            for (std::size_t ordinal{}; ordinal < card.effects.size(); ++ordinal)
+            {
+                const auto& effect = card.effects[ordinal];
+                if (effect.ordinal != static_cast<std::int32_t>(ordinal)
+                    || effect.type < 0 || effect.type > 255 || effect.flags.size() > 8)
+                {
+                    error = "qualification effect ordinal, type or flag count is invalid";
+                    return false;
+                }
+                int previous_flag{-1};
+                for (const auto flag : effect.flags)
+                {
+                    if (flag > 7 || flag <= previous_flag)
+                    {
+                        error = "qualification flags are not canonical unique values 0..7";
+                        return false;
+                    }
+                    previous_flag = flag;
+                    if (flag == 0)
+                    {
+                        error = "unsupported-once: flags-baseline-v1 cannot admit ONCE";
+                        return false;
+                    }
+                }
+                if (effect.used_once != 0)
+                {
+                    error = effect.used_once == 1 ? "unsupported-used: flags-baseline-v1 requires zero used"
+                                                  : "qualification usedOnce is outside 0..1";
+                    return false;
+                }
+                const auto profile = qualification::lookup_effect_qualification_profile(
+                    *key, ordinal, effect.factory_key, effect.tag, effect.type);
+                if (!profile || effect.profile_id != profile->id)
+                {
+                    error = "unsupported-profile: qualification effect identity or profile id is not reviewed";
+                    return false;
+                }
+                if (!std::equal(effect.flags.begin(), effect.flags.end(), profile->flags.begin(), profile->flags.end()))
+                {
+                    error = "flags-profile-mismatch: qualification flags disagree with reviewed defaults";
+                    return false;
+                }
+            }
+        }
+        if (checkpoint.payload_checksum != exact_player_qualification_payload_checksum(checkpoint))
+        {
+            error = "exact player-qualification payload checksum does not match";
+            return false;
+        }
+        return true;
+    }
+
+    auto parse_exact_player_qualification_checkpoint(std::string_view json, std::string& error)
+        -> std::optional<ExactPlayerQualificationCheckpoint>
+    {
+        if (json.empty() || json.size() > RouteCMaximumFileBytes)
+        {
+            error = "exact player-qualification file is empty or exceeds the 2 MiB limit";
+            return std::nullopt;
+        }
+        constexpr auto maximum_fields = 17 + ExactPlayerQualificationMaximumCards
+            * (6 + 7 * ExactPlayerQualificationMaximumEffectsPerCard);
+        auto values = FlatJsonParser{json, maximum_fields, true}.parse(error);
+        if (!values) return std::nullopt;
+        ExactPlayerQualificationCheckpoint checkpoint{};
+        std::size_t consumed{};
+        const auto read_string = [&](std::string& target, std::string_view name) {
+            auto value = required_string(*values, name, error);
+            if (!value) return false;
+            ++consumed;
+            target = std::move(*value);
+            return true;
+        };
+        const auto read_integer = [&]<typename Number>(Number& target, std::string_view name) {
+            const auto value = required_integer<Number>(*values, name, error);
+            if (!value) return false;
+            ++consumed;
+            target = *value;
+            return true;
+        };
+        if (!read_integer(checkpoint.schema_version, "schemaVersion")
+            || !read_string(checkpoint.kind, "kind")
+            || !read_string(checkpoint.captured_at_utc, "capturedAtUtc")
+            || !read_string(checkpoint.route_c_payload_checksum, "routeCPayloadChecksum")
+            || !read_string(checkpoint.game_executable_sha256, "gameExecutableSha256")
+            || !read_integer(checkpoint.game_executable_size, "gameExecutableSize")
+            || !read_string(checkpoint.source_level_name, "sourceLevelName")
+            || !read_integer(checkpoint.wave_index, "waveIndex")
+            || !read_string(checkpoint.layout_kind, "layoutKind")
+            || !read_string(checkpoint.layout_payload_checksum, "layoutPayloadChecksum")
+            || !read_string(checkpoint.qualification_policy, "qualificationPolicy")
+            || !read_string(checkpoint.payload_checksum, "payloadChecksum")) return std::nullopt;
+        std::size_t card_count{};
+        std::array<std::size_t, 4> counts{};
+        constexpr std::array<std::string_view, 4> count_names{
+            "handCardCount", "deckCardCount", "trashCardCount", "fieldCardCount"};
+        if (!read_integer(card_count, "cardCount")) return std::nullopt;
+        for (std::size_t zone{}; zone < counts.size(); ++zone)
+        {
+            if (!read_integer(counts[zone], count_names[zone])) return std::nullopt;
+            if (counts[zone] > ExactPlayerQualificationMaximumCards)
+            {
+                error = "qualification zone card count exceeds 128";
+                return std::nullopt;
+            }
+        }
+        if (card_count > ExactPlayerQualificationMaximumCards
+            || card_count != counts[0] + counts[1] + counts[2] + counts[3])
+        {
+            error = "qualification card count exceeds 128 or disagrees with explicit zone counts";
+            return std::nullopt;
+        }
+        checkpoint.cards.reserve(card_count);
+        for (std::size_t index{}; index < card_count; ++index)
+        {
+            const auto prefix = "card" + std::to_string(index);
+            ExactPlayerQualificationCard card{};
+            std::size_t effect_count{};
+            if (!read_integer(card.native_location, prefix + "NativeLocation")
+                || !read_integer(card.native_index, prefix + "NativeIndex")
+                || !read_integer(card.row, prefix + "Row") || !read_integer(card.index, prefix + "Index")
+                || !read_string(card.card_info_instance, prefix + "CardInfoInstance")
+                || !read_integer(effect_count, prefix + "EffectCount")) return std::nullopt;
+            if (effect_count > ExactPlayerQualificationMaximumEffectsPerCard)
+            {
+                error = "qualification card effect count exceeds 64";
+                return std::nullopt;
+            }
+            card.effects.reserve(effect_count);
+            for (std::size_t ordinal{}; ordinal < effect_count; ++ordinal)
+            {
+                const auto effect_prefix = prefix + "Effect" + std::to_string(ordinal);
+                ExactPlayerQualificationEffect effect{};
+                std::string flags{};
+                if (!read_integer(effect.ordinal, effect_prefix + "Ordinal")
+                    || !read_string(effect.factory_key, effect_prefix + "FactoryKey")
+                    || !read_string(effect.tag, effect_prefix + "Tag")
+                    || !read_integer(effect.type, effect_prefix + "Type")
+                    || !read_string(flags, effect_prefix + "Flags")
+                    || !read_integer(effect.used_once, effect_prefix + "UsedOnce")
+                    || !read_string(effect.profile_id, effect_prefix + "ProfileId")) return std::nullopt;
+                auto parsed = parse_qualification_flags(flags, error);
+                if (!parsed) return std::nullopt;
+                effect.flags = std::move(*parsed);
+                card.effects.push_back(std::move(effect));
+            }
+            checkpoint.cards.push_back(std::move(card));
+        }
+        if (values->size() != consumed)
+        {
+            error = "qualification JSON contains extra or malformed dynamic fields";
+            return std::nullopt;
+        }
+        if (counts != qualification_zone_counts(checkpoint))
+        {
+            error = "qualification explicit zone counts disagree with card records";
+            return std::nullopt;
+        }
+        if (!validate_exact_player_qualification_checkpoint(checkpoint, error)) return std::nullopt;
+        return checkpoint;
+    }
+
+    auto validate_exact_player_qualification_binding(const ExactPlayerQualificationCheckpoint& checkpoint,
+                                                      const ExactPlayerZonesCheckpoint& layout,
+                                                      std::string& error) -> bool
+    {
+        return validate_exact_player_qualification_checkpoint(checkpoint, error)
+            && validate_exact_player_zones_checkpoint(layout, error)
+            && qualification_metadata_matches(checkpoint, layout,
+                layout.schema_version >= ExactPlayerZonesQualificationSchemaVersion, error)
+            && qualification_cards_match(checkpoint, {layout.player_hand, layout.player_deck, "()", "()"}, {}, error);
+    }
+
+    auto validate_exact_player_qualification_binding(const ExactPlayerQualificationCheckpoint& checkpoint,
+                                                      const ExactPlayerTrashCheckpoint& layout,
+                                                      std::string& error) -> bool
+    {
+        return validate_exact_player_qualification_checkpoint(checkpoint, error)
+            && validate_exact_player_trash_checkpoint(layout, error)
+            && qualification_metadata_matches(checkpoint, layout,
+                layout.schema_version >= ExactPlayerTrashQualificationSchemaVersion, error)
+            && qualification_cards_match(checkpoint,
+                {layout.player_hand, layout.player_deck, layout.player_trash, "()"}, {}, error);
+    }
+
+    auto validate_exact_player_qualification_binding(const ExactPlayerQualificationCheckpoint& checkpoint,
+                                                      const ExactPlayerFieldCheckpoint& layout,
+                                                      std::string& error) -> bool
+    {
+        if (!validate_exact_player_qualification_checkpoint(checkpoint, error)
+            || !validate_exact_player_field_checkpoint(layout, error)
+            || !qualification_metadata_matches(checkpoint, layout,
+                layout.schema_version >= ExactPlayerFieldQualificationSchemaVersion, error)) return false;
+        const auto states = parse_exact_player_field_states(layout.player_field_states, error);
+        return states && qualification_cards_match(checkpoint,
+            {layout.player_hand, layout.player_deck, layout.player_trash, layout.player_field}, *states, error);
     }
 
     auto exact_player_hand_health_payload_checksum(

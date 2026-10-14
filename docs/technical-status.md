@@ -1,8 +1,15 @@
 # 技术状态与已知事实
 
-> 2026-09-30 当前续接入口：[第三十八阶段](phase-38-effect-qualification-observation.md)、[第三十七阶段](phase-37-player-zone-base-health.md)及[工作进度](WIP-current-progress-2026-09-10.md)。方向仍为“小关重开 + 玩家精确恢复”，重编程与敌人精确恢复搁置。
+> 2026-10-15 当前续接入口：[第三十九阶段 A](phase-39-player-qualification-baseline.md)、[第三十八阶段](phase-38-effect-qualification-observation.md)、[第三十七阶段](phase-37-player-zone-base-health.md)及[工作进度](WIP-current-progress-2026-09-10.md)。方向仍为“小关重开 + 玩家精确恢复”，重编程与敌人精确恢复搁置。
 
-## 2026-09-30 当前状态
+## 2026-10-15 当前状态
+
+v0.40.0 实现 A 策略 flags-baseline-v1：Z6/T7/F10 要求 Q1，保存与恢复逐张绑定完整 CardInfo、原生位置、有序技能、独立构造默认 flags 与 used0。8 个精确 card identity／8 种 factory／9 个 ordinal 组合已静态审阅；未知零技能卡也拒绝。三组 Z6/T7/F10 新保存／重载与两组 T6/F9 legacy 回归均通过原 25 项玩家比较；legacy 保存时资格未知，未升级为新资格通过。三个 Q1 缺失／错绑定／坏 checksum 的实机输入在启动前拒绝玩家层，纯 Route C passed。未用与干净已用 Bow 均实际 unsupported-once；旧已用样本的首失败 mageLucia unsupported-profile 保留，不混为 ONCE 正例。
+
+生产 OFF 构建 4/4 CTest；DLL `491D3AF72358FBD6F7C92725323D0815B201DB4CCD009441D65BAD417261119F`，实际 Mod 源码 `215F69E4EB069C3187B9803F3FFE021A8DA0445E061B9D7E4ADBA586DBF4EDFA`。证据根 `QuantumProtoclMod.runtime-evidence/20261015-player-qualification`。每份原 comparison 的其余 semantic/enemy/GUID 三项按实际结果保留；原 25 项通过不等于全战场相等。回放次数为0、fullPlayerExactRestorationProven=false；Phase38 已用 ONCE 缺口未写回修复。原用户两次回归与全25项验证通过；57个工具文件冻结、23项复验通过。17个检查点与4个SaveGames逐字节还原，A里程碑游戏正常关闭，新DLL保留；后续独立继续 Phase40 B。
+
+## 2026-09-30 状态（历史记录）
+
 
 v0.39.0 新增独立 F1 `nativeEffectQualification:` 只读诊断，导出原生 usedOnce、flags 与完整身份，未改变保存或恢复算法。普通长弓 ONCE 发动后返手仍为 used=1；T6/HAND3 精确保存后恢复却变为 used=0，并能通过普通点击再次发动。既有严格比较保留三项 history 相关失败，资格验收标为 observed-qualification-mismatch，不能归入全 25 项通过。资格持久化、写回和动态 flags 仍未实现，下一步先补资格覆盖声明与保守门禁，再推进受限 ONCE 恢复。
 

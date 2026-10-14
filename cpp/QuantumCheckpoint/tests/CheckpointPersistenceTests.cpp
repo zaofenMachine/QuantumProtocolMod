@@ -2,10 +2,13 @@
 #include "PlayerCounterState.hpp"
 #include "PlayerHealthState.hpp"
 #include "PlayerRestorePlan.hpp"
+#include "EffectQualificationPolicy.hpp"
 
 #include <cstdlib>
 #include <algorithm>
+#include <array>
 #include <iostream>
+#include <limits>
 #include <string>
 
 namespace
@@ -164,6 +167,325 @@ namespace
             .player_draw_base = 4,
             .player_draw_adjustment = 0,
         };
+    }
+    auto run_qualification_tests() -> void
+    {
+        using namespace QuantumCheckpoint;
+        std::string error{};
+        auto route = sample_checkpoint();
+        route.payload_checksum = "0123456789ABCDEF";
+        constexpr std::string_view dependency = "FEDCBA9876543210";
+        auto historical_zones = sample_exact_player_zones(route);
+        historical_zones.player_hand_health_checksum = dependency;
+        historical_zones.player_deck_base_health_states = "2,2";
+        auto historical_trash = sample_exact_player_trash(route);
+        historical_trash.player_hand_health_checksum = dependency;
+        historical_trash.player_deck_base_health_states = "2,2";
+        historical_trash.player_trash_base_health_states = "2,2";
+        auto historical_field = sample_exact_player_field(route);
+        historical_field.player_hand_health_checksum = dependency;
+        historical_field.player_deck_base_health_states = "2,2";
+        historical_field.player_trash_base_health_states = "2,2";
+        historical_field.player_field_attack_states = "1,1;0,0";
+        historical_field.player_field_health_states = "2,2;2,2";
+        historical_field.player_field_counter_states = "0;0";
+        // Fixed independent historical FNV vectors, including every old layout
+        // version. A new marker must never change their bytes or fixed minima.
+        const auto historical_hashes = [&](auto layout, const auto& expected, auto checksum) {
+            for (std::size_t index{}; index < expected.size(); ++index)
+            {
+                layout.schema_version = static_cast<int>(index + 1);
+                require(checksum(layout) == expected[index], "all historical layout checksums remain unchanged");
+                layout.qualification_policy = ExactPlayerQualificationPolicy;
+                require(checksum(layout) == expected[index], "hidden legacy marker never changes historical hash bytes");
+                layout.qualification_policy.clear();
+            }
+        };
+        historical_hashes(historical_zones, std::array{
+            "A2B48645623F9AAF", "75DB16877DD36A7E", "7A50D14B4A6517F5", "90E7869CAF490B54", "B91310E09E4DC324"},
+            exact_player_zones_payload_checksum);
+        historical_hashes(historical_trash, std::array{
+            "C4C69827A52EA9A4", "6555E4D9F806783B", "F346F1D793DC7D12", "649326BE7777A7B5", "6014171BB4480CBC", "539B47E597360E3D"},
+            exact_player_trash_payload_checksum);
+        historical_hashes(historical_field, std::array{
+            "2F3E9925B59C16C4", "F7436F7E3C506149", "09B0FA55E3578F88", "73178054880B0DCB", "D70BB1CA39643E32",
+            "DFACA22DC1587E51", "4F2B99917C153734", "F5B7190AB2AF7597", "0634D5628AB3CDBC"},
+            exact_player_field_payload_checksum);
+
+        const auto remove_field = [](std::string json, std::string_view name) {
+            const auto begin = json.find("  \"" + std::string{name} + "\"");
+            require(begin != std::string::npos, "mutation field exists");
+            json.erase(begin, json.find('\n', begin) - begin + 1);
+            return json;
+        };
+        const auto replace_once = [](std::string json, std::string_view from, std::string_view to) {
+            const auto begin = json.find(from);
+            require(begin != std::string::npos, "mutation value exists");
+            json.replace(begin, from.size(), to);
+            return json;
+        };
+        const auto check_marker = [&](auto layout, int required_version, auto serialize, auto parse,
+                                      auto checksum, auto validate) {
+            layout.schema_version = required_version - 1;
+            layout.payload_checksum = checksum(layout);
+            const auto legacy_json = serialize(layout);
+            require(parse(legacy_json, error).has_value(), "last historical layout remains readable");
+            auto hidden = layout;
+            hidden.qualification_policy = ExactPlayerQualificationPolicy;
+            require(!validate(hidden, error), "historical structs reject nonempty qualification policy");
+            for (const std::string value : {"", "flags-baseline-v1"})
+            {
+                auto injected = legacy_json;
+                injected.insert(injected.rfind('}'), ",\"qualificationPolicy\":\"" + value + "\"");
+                require(!parse(injected, error), "historical JSON rejects qualification key even when empty");
+            }
+            for (const std::string extra : {"\"cardCount\":0", "\"handCardCount\":0",
+                    "\"layoutPayloadChecksum\":\"\"", "\"card0Effect0UsedOnce\":1",
+                    "\"qualificationPayloadChecksum\":\"\"", "\"playerQualificationPolicy\":\"\""})
+            {
+                auto injected = legacy_json;
+                injected.insert(injected.rfind('}'), "," + extra);
+                require(!parse(injected, error), "historical layout rejects reserved Q1 fields that its checksum cannot cover");
+            }
+            layout.schema_version = required_version;
+            require(!parse(serialize(layout), error), "new schemas require explicit nonempty policy");
+            layout.qualification_policy = ExactPlayerQualificationPolicy;
+            const auto json = serialize(layout);
+            const auto parsed = parse(json, error);
+            require(parsed && parsed->qualification_policy == ExactPlayerQualificationPolicy,
+                    "new layout qualification marker round trips");
+            require(!parse(remove_field(json, "qualificationPolicy"), error), "missing required marker is rejected");
+            for (const std::string value : {"", "flags-baseline-v2", " flags-baseline-v1"})
+            {
+                auto invalid = layout;
+                invalid.qualification_policy = value;
+                require(!parse(serialize(invalid), error), "unknown or malformed policy cannot authorize new layout");
+                require(checksum(invalid) != checksum(layout), "new policy participates in layout checksum");
+            }
+            require(!parse(replace_once(json, "flags-baseline-v1", "flags-baseline-v2"), error),
+                    "policy tampering fails without upgrading a claim");
+            require(!parse(replace_once(json, "\"schemaVersion\": " + std::to_string(required_version),
+                                            "\"schemaVersion\": " + std::to_string(required_version - 1)), error),
+                    "downgrading layout cannot hide surviving policy key");
+        };
+        check_marker(historical_zones, ExactPlayerZonesQualificationSchemaVersion,
+            serialize_exact_player_zones_checkpoint, parse_exact_player_zones_checkpoint,
+            exact_player_zones_payload_checksum, validate_exact_player_zones_checkpoint);
+        check_marker(historical_trash, ExactPlayerTrashQualificationSchemaVersion,
+            serialize_exact_player_trash_checkpoint, parse_exact_player_trash_checkpoint,
+            exact_player_trash_payload_checksum, validate_exact_player_trash_checkpoint);
+        check_marker(historical_field, ExactPlayerFieldQualificationSchemaVersion,
+            serialize_exact_player_field_checkpoint, parse_exact_player_field_checkpoint,
+            exact_player_field_payload_checksum, validate_exact_player_field_checkpoint);
+
+        const std::string apple_instance = "(CardInfo=(Tag=\"naturalApple\",DisplayName=INVTEXT(\"苹果\")),upgradeLevel=0)";
+        const std::string tool_instance = "(CardInfo=(Tag=\"spDeckEdit\"),upgradeLevel=0)";
+        const std::string lemon_instance = "(CardInfo=(Tag=\"naturalLemon\"),upgradeLevel=0)";
+        const auto effect = [&](std::string_view key, int ordinal, std::string factory, std::string tag, int type) {
+            const auto profile = qualification::lookup_effect_qualification_profile(key, ordinal, factory, tag, type);
+            require(profile.has_value(), "reviewed test profile exists");
+            return ExactPlayerQualificationEffect{.ordinal = ordinal, .factory_key = std::move(factory),
+                .tag = std::move(tag), .type = type, .flags = {profile->flags.begin(), profile->flags.end()},
+                .used_once = 0, .profile_id = std::string{profile->id}};
+        };
+        const auto apple_effect = effect("naturalApple@0", 0, "player.esper.fruit.apple", "naturalApple", 3);
+        const auto lemon_effect = effect("naturalLemon@0", 0, "player.esper.fruit.lemon", "naturalLemon", 3);
+        auto qualified_zones = historical_zones;
+        qualified_zones.schema_version = ExactPlayerZonesSchemaVersion;
+        qualified_zones.player_hand = "(" + tool_instance + ")";
+        qualified_zones.player_deck = "(" + apple_instance + "," + apple_instance + ")";
+        qualified_zones.player_deck_base_health_states = "2,2;2,2";
+        qualified_zones.qualification_policy = ExactPlayerQualificationPolicy;
+        qualified_zones.payload_checksum = exact_player_zones_payload_checksum(qualified_zones);
+        ExactPlayerQualificationCheckpoint proof{
+            .captured_at_utc = qualified_zones.captured_at_utc,
+            .route_c_payload_checksum = qualified_zones.route_c_payload_checksum,
+            .game_executable_sha256 = qualified_zones.game_executable_sha256,
+            .game_executable_size = qualified_zones.game_executable_size,
+            .source_level_name = qualified_zones.source_level_name,
+            .wave_index = qualified_zones.wave_index,
+            .layout_kind = qualified_zones.kind,
+            .layout_payload_checksum = qualified_zones.payload_checksum,
+            .qualification_policy = ExactPlayerQualificationPolicy.data(),
+            .cards = {
+                {.native_location = 0, .native_index = 0, .card_info_instance = tool_instance,
+                 .effects = {effect("spDeckEdit@0", 0, "player.special.deckedit", "spDeckEdit", 3),
+                             effect("spDeckEdit@0", 1, "player.special.deckedit_manual", "spDeckEdit_manual", 1)}},
+                {.native_location = 1, .native_index = 0, .card_info_instance = apple_instance, .effects = {apple_effect}},
+                {.native_location = 1, .native_index = 1, .card_info_instance = apple_instance, .effects = {apple_effect}}
+            }
+        };
+        proof.payload_checksum = exact_player_qualification_payload_checksum(proof);
+        const auto proof_json = serialize_exact_player_qualification_checkpoint(proof);
+        const auto parsed = parse_exact_player_qualification_checkpoint(proof_json, error);
+        require(parsed && parsed->cards == proof.cards && serialize_exact_player_qualification_checkpoint(*parsed) == proof_json,
+                "Q1 typed cards/effects, full UTF-8 CardInfo and bonded flags round trip");
+        require(validate_exact_player_qualification_binding(proof, qualified_zones, error), error.c_str());
+        require(proof_json.find("\"trashCardCount\": 0") != std::string::npos
+                    && proof_json.find("\"fieldCardCount\": 0") != std::string::npos,
+                "Q1 explicitly serializes empty covered zones");
+        const auto rejected = [&](ExactPlayerQualificationCheckpoint invalid) {
+            error.clear();
+            return !parse_exact_player_qualification_checkpoint(serialize_exact_player_qualification_checkpoint(invalid), error);
+        };
+        for (const auto& field : {"qualificationPolicy", "card0Effect0ProfileId", "card0Effect0Flags", "trashCardCount"})
+            require(!parse_exact_player_qualification_checkpoint(remove_field(proof_json, field), error),
+                    "Q1 requires every marker, effect field and explicit empty-zone count");
+        for (const std::string extra : {"\"extra\":0", "\"card00NativeLocation\":0", "\"card3NativeLocation\":1",
+                                        "\"card0Effect2Ordinal\":2", "\"card0Effect0Address\":1", "\"card0Guid\":\"old\""})
+        {
+            auto json = proof_json;
+            json.insert(json.rfind('}'), "," + extra);
+            require(!parse_exact_player_qualification_checkpoint(json, error), "Q1 rejects all extra, alias and address/GUID fields");
+        }
+        auto duplicate_json = proof_json;
+        duplicate_json.insert(duplicate_json.rfind('}'), ",\"card0Effect0Ordinal\":0");
+        require(!parse_exact_player_qualification_checkpoint(duplicate_json, error), "Q1 rejects duplicate JSON keys");
+        require(!parse_exact_player_qualification_checkpoint(replace_once(proof_json, "\"cardCount\": 3", "\"cardCount\": 03"), error),
+                "Q1 rejects malformed JSON integer spelling");
+        require(!parse_exact_player_qualification_checkpoint(replace_once(proof_json, "\"cardCount\": 3", "\"cardCount\": 3.0"), error),
+                "Q1 rejects fractional count values");
+        require(!parse_exact_player_qualification_checkpoint(replace_once(proof_json, "\"trashCardCount\": 0", "\"trashCardCount\": 1"), error),
+                "Q1 rejects inconsistent explicit empty-zone counts");
+        require(!parse_exact_player_qualification_checkpoint(replace_once(proof_json, "苹果", "果苹"), error)
+                    && error.find("checksum") != std::string::npos,
+                "Q1 hashes full CardInfo metadata beyond card identity");
+        for (const std::string flags : {"0", "6,6", "7,6", "8", "-1", "06", "6,", ",6", "6 7", "6,7,1"})
+            require(!parse_exact_player_qualification_checkpoint(replace_once(proof_json, "\"card0Effect0Flags\": \"6\"",
+                "\"card0Effect0Flags\": \"" + flags + "\""), error), "Q1 rejects ONCE, duplicate, noncanonical or out-of-range flags");
+        for (const auto flags : {std::vector<std::uint8_t>{}, {1}, {6,7}, {0,6}, {6,6}, {8}})
+        {
+            auto invalid = proof;
+            invalid.cards[0].effects[0].flags = flags;
+            require(rejected(invalid), "correct checksum cannot authorize removed or added default flags");
+        }
+        for (const auto used : {-1,1,2,256})
+        {
+            auto invalid = proof;
+            invalid.cards[0].effects[0].used_once = used;
+            require(rejected(invalid), "slice A rejects used1 and malformed used values without any writer");
+        }
+        for (int mutation{}; mutation < 19; ++mutation)
+        {
+            auto invalid = proof;
+            switch (mutation)
+            {
+            case 0: invalid.schema_version = 2; break;
+            case 1: invalid.qualification_policy = "flags-baseline-v2"; break;
+            case 2: invalid.cards[0].effects[0].ordinal = 1; break;
+            case 3: std::swap(invalid.cards[0].effects[0], invalid.cards[0].effects[1]); break;
+            case 4: invalid.cards[0].effects[0].factory_key = "unknown"; break;
+            case 5: invalid.cards[0].effects[0].tag = "unknown"; break;
+            case 6: invalid.cards[0].effects[0].type = 256; break;
+            case 7: invalid.cards[0].effects[0].profile_id = "unknown"; break;
+            case 8: invalid.cards[0].effects.clear(); break;
+            case 9: invalid.cards[0].effects.resize(65); break;
+            case 10: invalid.cards[2].native_index = 0; break;
+            case 11: invalid.cards[2].native_index = 2; break;
+            case 12: invalid.cards[0].row = 0; break;
+            case 13: invalid.cards[1].native_location = 4; break;
+            case 14: std::swap(invalid.cards[0], invalid.cards[1]); break;
+            case 15: invalid.cards[1].card_info_instance = "(Tag=\"naturalApple\")"; break;
+            case 16: invalid.cards[1].card_info_instance = "(CardInfo=(Tag=\"naturalApple\",Tag=\"naturalLemon\"))"; break;
+            case 17: invalid.cards[1].card_info_instance += ",junk"; break;
+            case 18: invalid.cards[1].card_info_instance = "(CardInfo=(Tag=\"unknown\"))"; invalid.cards[1].effects.clear(); break;
+            }
+            require(rejected(invalid), "Q1 rejects correctly checksummed malformed identity, membership, order and profile claims");
+        }
+        auto maximum = proof;
+        maximum.cards.assign(128, proof.cards[1]);
+        for (std::size_t index{}; index < maximum.cards.size(); ++index) maximum.cards[index].native_index = static_cast<int>(index);
+        require(!rejected(maximum), "128 native DECK copies are supported without imposing FIELD slot limits");
+        maximum.cards.push_back(maximum.cards.back());
+        require(rejected(maximum), "129 cards exceed the Q1 bound");
+        maximum = proof;
+        maximum.cards.assign(8, proof.cards[1]);
+        for (std::size_t index{}; index < maximum.cards.size(); ++index)
+        {
+            maximum.cards[index].native_location = 0;
+            maximum.cards[index].native_index = static_cast<int>(index);
+        }
+        require(rejected(maximum), "eight HAND records exceed the existing hand bound");
+        require(!parse_exact_player_qualification_checkpoint(std::string(RouteCMaximumFileBytes + 1, ' '), error),
+                "Q1 rejects files above 2 MiB before parsing");
+
+        const auto bind_rejected = [&](auto invalid, const auto& layout) {
+            invalid.payload_checksum = exact_player_qualification_payload_checksum(invalid);
+            return !validate_exact_player_qualification_binding(invalid, layout, error);
+        };
+        for (int mutation{}; mutation < 10; ++mutation)
+        {
+            auto invalid = proof;
+            switch (mutation)
+            {
+            case 0: invalid.captured_at_utc += "x"; break;
+            case 1: invalid.route_c_payload_checksum = "FEDCBA9876543210"; break;
+            case 2: invalid.game_executable_sha256[0] = 'A'; break;
+            case 3: ++invalid.game_executable_size; break;
+            case 4: invalid.source_level_name += "x"; break;
+            case 5: ++invalid.wave_index; break;
+            case 6: invalid.layout_payload_checksum = "FEDCBA9876543210"; break;
+            case 7: invalid.cards[1].card_info_instance = "(CardInfo=(Tag=\"naturalApple\",DisplayName=INVTEXT(\"changed\")),upgradeLevel=0)"; break;
+            case 8: invalid.cards.pop_back(); break;
+            case 9: invalid.cards.push_back(invalid.cards.back()); invalid.cards.back().native_index = 2; break;
+            }
+            require(bind_rejected(invalid, qualified_zones), "Q1 rejects mismatched metadata or incomplete full-layout bijections");
+        }
+        auto old_layout = qualified_zones;
+        old_layout.schema_version = ExactPlayerZonesQualificationSchemaVersion - 1;
+        old_layout.qualification_policy.clear();
+        old_layout.payload_checksum = exact_player_zones_payload_checksum(old_layout);
+        auto old_proof = proof;
+        old_proof.layout_payload_checksum = old_layout.payload_checksum;
+        require(bind_rejected(old_proof, old_layout), "historical layout cannot acquire a Q1 proof even with matching full cards");
+
+        auto qualified_trash = historical_trash;
+        qualified_trash.schema_version = ExactPlayerTrashSchemaVersion;
+        qualified_trash.player_deck = qualified_zones.player_deck;
+        qualified_trash.player_hand = qualified_zones.player_hand;
+        qualified_trash.player_deck_base_health_states = qualified_zones.player_deck_base_health_states;
+        qualified_trash.player_trash = "(" + lemon_instance + ")";
+        qualified_trash.qualification_policy = ExactPlayerQualificationPolicy;
+        qualified_trash.payload_checksum = exact_player_trash_payload_checksum(qualified_trash);
+        auto trash_proof = proof;
+        trash_proof.layout_kind = qualified_trash.kind;
+        trash_proof.layout_payload_checksum = qualified_trash.payload_checksum;
+        trash_proof.cards.push_back({.native_location = 2, .native_index = 0,
+            .card_info_instance = lemon_instance, .effects = {lemon_effect}});
+        trash_proof.payload_checksum = exact_player_qualification_payload_checksum(trash_proof);
+        require(validate_exact_player_qualification_binding(trash_proof, qualified_trash, error), error.c_str());
+        auto qualified_field = historical_field;
+        qualified_field.schema_version = ExactPlayerFieldSchemaVersion;
+        qualified_field.player_deck = qualified_trash.player_deck;
+        qualified_field.player_hand = qualified_trash.player_hand;
+        qualified_field.player_trash = qualified_trash.player_trash;
+        qualified_field.player_deck_base_health_states = qualified_trash.player_deck_base_health_states;
+        qualified_field.player_field = "(" + apple_instance + "," + lemon_instance + ")";
+        qualified_field.qualification_policy = ExactPlayerQualificationPolicy;
+        qualified_field.payload_checksum = exact_player_field_payload_checksum(qualified_field);
+        auto field_proof = trash_proof;
+        field_proof.layout_kind = qualified_field.kind;
+        field_proof.layout_payload_checksum = qualified_field.payload_checksum;
+        field_proof.cards.push_back({.native_location = 3, .row = 0, .index = 0,
+            .card_info_instance = apple_instance, .effects = {apple_effect}});
+        field_proof.cards.push_back({.native_location = 3, .row = 1, .index = 3,
+            .card_info_instance = lemon_instance, .effects = {lemon_effect}});
+        field_proof.payload_checksum = exact_player_qualification_payload_checksum(field_proof);
+        require(validate_exact_player_qualification_binding(field_proof, qualified_field, error), error.c_str());
+        for (int mutation{}; mutation < 6; ++mutation)
+        {
+            auto invalid = field_proof;
+            switch (mutation)
+            {
+            case 0: invalid.cards.back().row = 0; invalid.cards.back().index = 0; break;
+            case 1: invalid.cards.back().row = 2; break;
+            case 2: invalid.cards.back().index = 5; break;
+            case 3: invalid.cards.back().native_index = 0; break;
+            case 4: invalid.cards.back().row = std::numeric_limits<std::int32_t>::max(); break;
+            case 5: invalid.cards.back().index = 2; break; // Valid unique slot, wrong saved destination.
+            }
+            require(bind_rejected(invalid, qualified_field), "Q1 rejects duplicate, invalid and mismatched FIELD destinations");
+        }
     }
 }
 
@@ -1501,16 +1823,16 @@ int main()
     require(!parse_exact_player_hand_health_checkpoint(missing_hand3_counters, error),
             "HAND3 still requires aligned counter coverage from schema 2");
 
-    require(ExactPlayerZonesCheckpoint{}.schema_version == 5
-                && ExactPlayerTrashCheckpoint{}.schema_version == 6
-                && ExactPlayerFieldCheckpoint{}.schema_version == 9
+    require(ExactPlayerZonesCheckpoint{}.schema_version == 6
+                && ExactPlayerTrashCheckpoint{}.schema_version == 7
+                && ExactPlayerFieldCheckpoint{}.schema_version == 10
                 && ExactPlayerZonesBaseHealthSchemaVersion == 5
                 && ExactPlayerTrashBaseHealthSchemaVersion == 6
                 && ExactPlayerFieldBaseHealthSchemaVersion == 9
                 && ExactPlayerZonesEffectMembershipSchemaVersion == 4
                 && ExactPlayerTrashEffectMembershipSchemaVersion == 5
                 && ExactPlayerFieldEffectMembershipSchemaVersion == 8,
-            "new layouts add DECK/TRASH base records while fixed effect attestation minima remain unchanged");
+            "qualification schemas preserve fixed base-health and effect attestation minima");
     const auto check_hand_health_dependency = [&](auto legacy_layout, int dependency_version,
                                                    auto serialize, auto parse, auto checksum) {
         const auto legacy_json = serialize(legacy_layout);
@@ -1827,7 +2149,9 @@ int main()
         require(parse(serialize(large),error).has_value(),
                 "layout parsing does not impose the FIELD ten-slot limit on DECK numeric records");
         auto future = layout;
-        ++future.schema_version;
+        if constexpr (requires { layout.player_field; }) future.schema_version = ExactPlayerFieldSchemaVersion + 1;
+        else if constexpr (requires { layout.player_trash; }) future.schema_version = ExactPlayerTrashSchemaVersion + 1;
+        else future.schema_version = ExactPlayerZonesSchemaVersion + 1;
         require(!parse(serialize(future),error) && error.find("schema") != std::string::npos,
                 "unknown later versions cannot silently expand base-health coverage");
     };
@@ -1841,6 +2165,7 @@ int main()
         serialize_exact_player_field_checkpoint,parse_exact_player_field_checkpoint,
         exact_player_field_payload_checksum,validate_exact_player_field_checkpoint);
 
+    run_qualification_tests();
     std::cout << "Route C checkpoint persistence tests passed\n";
     return 0;
 }

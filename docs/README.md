@@ -1,8 +1,8 @@
 # 文档索引
 
-当前入口（2026-09-30）：方向为“小关重开 + 玩家精确恢复”，重编程与敌人精确恢复保持搁置。[第三十七阶段](phase-37-player-zone-base-health.md)完成 DECK/TRASH 基础生命与稳定捕获；[第三十八阶段](phase-38-effect-qualification-observation.md)在 v0.39.0 加入只读资格观测，实机确认已用 ONCE 在恢复后丢失并可再次发动。该缺口尚未修复，不能把恢复报告 passed 当完整玩家状态证明。
+当前入口（2026-10-15）：[第三十九阶段 A](phase-39-player-qualification-baseline.md)在 v0.40.0 增加 Z6/T7/F10＋Q1 默认资格门禁，三组新布局和两组 legacy 全 25 项玩家比较通过；ONCE、非零 used 和未知 profile 拒绝新版玩家资格层。没有资格写回，[第三十八阶段](phase-38-effect-qualification-observation.md)的已用 ONCE 丢失与历史失败仍保留。重编程与敌人精确恢复继续搁置。
 
-原用户检查点在最终观察版上通过既有全 25 项对照；原始备份、文件还原、游戏关闭与提交记录见新阶段证据目录的 validation-summary.json 和 session-cleanup-final.json。续接先读 [当前工作进度](WIP-current-progress-2026-09-10.md) 文首和 [当前技术状态](technical-status.md)，勿沿用下方历史阶段的待办。
+A 里程碑已完成原用户检查点全25项回归、57个工具文件冻结及23项复验，17个检查点与4个存档已逐字节还原，游戏正常关闭。后续继续 B；当前部署与后续停机状态以[工作进度](WIP-current-progress-2026-09-10.md)文首为准，续接同时读[技术状态](technical-status.md)。
 
 以下文件是后续维护时应优先更新的权威文档：
 
@@ -75,3 +75,5 @@
 
 - [phase-37-player-zone-base-health.md](phase-37-player-zone-base-health.md)：牌库／墓地基础生命、隐藏卡数值同步、捕获安定检查和自动保存重试。
 - [phase-38-effect-qualification-observation.md](phase-38-effect-qualification-observation.md)：只读 ONCE/flags 观测、普通返手保留资格，以及恢复后资格丢失并可再次发动的实机证据。
+
+- [phase-39-player-qualification-baseline.md](phase-39-player-qualification-baseline.md)：默认 profile 资格门禁、Q1 依赖、新布局和 legacy 实机范围、ONCE／未知 profile 捕获拒绝。

@@ -3,6 +3,7 @@
 
 #include "CheckpointSchema.hpp"
 #include "CheckpointPersistence.hpp"
+#include "EffectQualificationPolicy.hpp"
 #include "PlayerRestorePlan.hpp"
 #include "PlayerAttackState.hpp"
 #include "PlayerHealthState.hpp"
@@ -288,6 +289,12 @@ namespace QuantumCheckpoint
             std::string player_effect_membership_status{"not-applicable-no-player-layout"};
             std::string player_effect_membership_reason{};
             std::string player_effect_membership_saved_proof{"not-applicable-no-player-layout"};
+            std::optional<ExactPlayerQualificationCheckpoint> exact_player_qualification{};
+            bool player_qualification_required{}, player_qualification_startup_checked{};
+            std::string player_qualification_status{"not-applicable-no-player-layout"};
+            std::string player_qualification_reason{};
+            std::string player_qualification_saved_proof{"not-applicable-no-player-layout"};
+            std::string player_qualification_policy{};
             std::vector<PendingNativeRestoreMove> move_effect_suppressions{};
             std::size_t move_effects_suppressed{}, move_effects_restored{};
             std::vector<PendingNativeTrashMove> move_overlay_targets{};
@@ -1718,6 +1725,11 @@ namespace QuantumCheckpoint
             return route_c_checkpoint_path().parent_path() / STR("route-c-exact-player-hand-health.json");
         }
 
+        auto exact_player_qualification_checkpoint_path() -> std::filesystem::path
+        {
+            return route_c_checkpoint_path().parent_path() / STR("route-c-exact-player-qualification.json");
+        }
+
         auto exact_character_charge_checkpoint_path() -> std::filesystem::path
         {
             const auto mods_directory = std::filesystem::path{
@@ -1857,6 +1869,7 @@ namespace QuantumCheckpoint
             for (const auto& primary : {exact_spawn_plan_checkpoint_path(),
                     exact_player_zones_checkpoint_path(), exact_player_trash_checkpoint_path(),
                     exact_player_field_checkpoint_path(), exact_player_hand_health_checkpoint_path(),
+                    exact_player_qualification_checkpoint_path(),
                     exact_turn_progress_checkpoint_path(), exact_character_charge_checkpoint_path()})
             {
                 for (const auto* suffix : {STR(""), STR(".bak")})
@@ -2280,6 +2293,42 @@ namespace QuantumCheckpoint
             {
                 reason = std::string{"required hand-health supplement unavailable: "} + error.what();
                 append_route_c_trace_failure("restore.exact-player-hand-health.rejected", reason);
+                return std::nullopt;
+            }
+        }
+
+        auto try_read_exact_player_qualification_checkpoint(const RouteCCheckpoint& route_c,
+                                                             std::string& reason)
+            -> std::optional<ExactPlayerQualificationCheckpoint>
+        {
+            try
+            {
+                const auto path = exact_player_qualification_checkpoint_path();
+                std::error_code file_error{};
+                const auto size = std::filesystem::file_size(path, file_error);
+                if (file_error || size == 0 || size > RouteCMaximumFileBytes)
+                    throw std::runtime_error{"qualification supplement is missing or has an invalid size"};
+                std::ifstream input{path, std::ios::binary};
+                std::string contents(static_cast<std::size_t>(size), '\0');
+                if (!input || !input.read(contents.data(), static_cast<std::streamsize>(size)))
+                    throw std::runtime_error{"qualification supplement could not be read completely"};
+                std::string error{};
+                auto exact = parse_exact_player_qualification_checkpoint(contents, error);
+                if (!exact) throw std::runtime_error{error};
+                if (exact->route_c_payload_checksum != route_c.payload_checksum
+                    || exact->captured_at_utc != route_c.captured_at_utc
+                    || exact->game_executable_sha256 != route_c.game_executable_sha256
+                    || exact->game_executable_size != route_c.game_executable_size
+                    || exact->source_level_name != route_c.source_level_name
+                    || exact->wave_index != route_c.wave_index)
+                    throw std::runtime_error{"qualification supplement does not match Route C"};
+                reason = "linked qualification proof loaded; runtime verification pending";
+                return exact;
+            }
+            catch (const std::exception& error)
+            {
+                reason = std::string{"required qualification supplement unavailable: "} + error.what();
+                append_route_c_trace_failure("restore.player-qualification.rejected", reason);
                 return std::nullopt;
             }
         }
@@ -3632,116 +3681,141 @@ namespace QuantumCheckpoint
             return value;
         }
 
+        struct NativeCardQualificationObservation
+        {
+            NativeCardEffects membership{};
+            std::vector<NativeEffectQualification> values{};
+            std::string card_info{}, card_id{};
+            std::array<std::uint8_t, 16> card_guid{};
+            std::uint8_t location{};
+            std::uintptr_t info_getter_rva{}, id_getter_rva{};
+            auto operator==(const NativeCardQualificationObservation&) const -> bool = default;
+        };
+
+        auto observe_native_card_qualification(UObject* card_engine, UObject* object)
+            -> NativeCardQualificationObservation
+        {
+            if (GetCurrentThreadId() != g_game_thread_id.load(std::memory_order_acquire))
+                throw std::runtime_error{"effect qualification observation requires the game thread"};
+            const auto api = validated_native_move_card_api(card_engine);
+            const auto membership = read_native_card_effects(card_engine, object);
+            const auto module_base = reinterpret_cast<std::uintptr_t>(GetModuleHandleW(L"Quantum-Win64-Shipping.exe"));
+            const auto signature = [&](std::uintptr_t rva, const auto& bytes) {
+                const auto* address = reinterpret_cast<const std::uint8_t*>(module_base + rva);
+                if (!address_is_readable(address, bytes.size())
+                    || !std::equal(bytes.begin(), bytes.end(), address))
+                    throw std::runtime_error{"native effect qualification layout signature changed"};
+            };
+            // Pure used-byte getter; signatures prove fields, not calls.
+            signature(0xE32AE0, std::array<std::uint8_t, 8>{0x0F,0xB6,0x81,0x91,0,0,0,0xC3});
+            signature(0xE18510, std::array<std::uint8_t, 18>{
+                0x8B,0x81,0xA0,0,0,0,0x44,0x0F,0xB6,0xDA,0x3B,0x81,0xCC,0,0,0,0x74,0x46});
+            // Hash size+E0 and inline hash+ D0 delimit the 0x50 set
+            // header. Its raw bytes are rechecked, never traversed.
+            signature(0xE18522, std::array<std::uint8_t, 14>{
+                0x4C,0x63,0x81,0xE0,0,0,0,0x4C,0x8D,0x91,0xD0,0,0,0});
+            signature(0xE1854A, std::array<std::uint8_t, 18>{
+                0x4C,0x8B,0x81,0x98,0,0,0,0x48,0x63,0xC8,0x48,0x8D,0x14,0x49,0x45,0x38,0x1C,0x90});
+
+            // Bind the full reflected CardInfoInstance and public card ID
+            // with the same established read-only getters used by F1.
+            // Require native pure zero-input struct getters, and keep their
+            // function/return layouts fixed across both observations.
+            const auto require_getter = [&](StringViewType name, std::size_t size) {
+                auto* function = object->GetFunctionByNameInChain(name.data());
+                auto* result = function ? function->GetReturnProperty() : nullptr;
+                const auto address = function ? reinterpret_cast<std::uintptr_t>(function->GetFuncPtr()) : 0;
+                if (!function || !function->HasAllFunctionFlags(
+                        static_cast<EFunctionFlags>(FUNC_Native | FUNC_BlueprintPure))
+                    || !result || !result->IsA<FStructProperty>()
+                    || function->GetParmsSize() != size || result->GetElementSize() != size
+                    || address < module_base || address - module_base >= ExpectedGameExecutableSize
+                    || !address_is_readable(reinterpret_cast<const void*>(address), 1))
+                    throw std::runtime_error{"effect qualification card getter contract changed"};
+                for (auto* property : function->ForEachProperty())
+                    if (property->HasAnyPropertyFlags(CPF_Parm)
+                        && !property->HasAnyPropertyFlags(CPF_ReturnParm))
+                        throw std::runtime_error{"effect qualification card getter has input parameters"};
+                if (name == STR("getCardInfoInstance"))
+                {
+                    auto* type = static_cast<FStructProperty*>(result)->GetStruct();
+                    auto* info = type ? type->GetPropertyByNameInChain(STR("CardInfo")) : nullptr;
+                    auto* upgrade = type ? type->GetPropertyByNameInChain(STR("upgradeLevel")) : nullptr;
+                    if (!info || !info->IsA<FStructProperty>() || info->GetElementSize() != 0xB0
+                        || !upgrade || upgrade->GetElementSize() != 4)
+                        throw std::runtime_error{"effect qualification CardInfoInstance fields changed"};
+                }
+                return function;
+            };
+            auto* info_getter = require_getter(STR("getCardInfoInstance"), 0xB8);
+            auto* id_getter = require_getter(STR("getId"), 16);
+            const auto info_getter_address = info_getter->GetFuncPtr();
+            const auto id_getter_address = id_getter->GetFuncPtr();
+            const auto getter_text = [&](StringViewType name) {
+                const auto value = export_zero_argument_getter(object, name);
+                if (!value || value->value.empty() || value->value.size() > 1024 * 1024)
+                    throw std::runtime_error{"effect qualification card identity getter is unavailable"};
+                return value->value;
+            };
+            const auto card_info = getter_text(STR("getCardInfoInstance"));
+            const auto card_id = getter_text(STR("getId"));
+            const auto location = native_card_location(api.engine_state, membership.state, api.get_card_location);
+            if (!location || !address_is_readable(static_cast<const std::byte*>(membership.object) + 0x18, 16)
+                || read_native_card_effects(card_engine, object) != membership)
+                throw std::runtime_error{"effect qualification card identity changed before reading fields"};
+            std::array<std::uint8_t, 16> card_guid{};
+            std::memcpy(card_guid.data(), static_cast<const std::byte*>(membership.object) + 0x18, card_guid.size());
+            // FGuid text exports its A/B/C/D uint32 values as four
+            // uppercase eight-digit groups; raw GuidBytes below instead
+            // preserves memory byte order. Bind the actor getter to the
+            // native card GUID, not merely two independently stable IDs.
+            std::ostringstream native_card_id{};
+            native_card_id << std::hex << std::uppercase << std::setfill('0');
+            for (std::size_t part{}; part < 4; ++part)
+                native_card_id << std::setw(8) << read_native_value<std::uint32_t>(card_guid.data(), part * 4);
+            if (native_card_id.str() != card_id)
+                throw std::runtime_error{"effect qualification actor ID differs from the native card GUID"};
+            std::vector<NativeEffectQualification> values{};
+            for (const auto& effect : membership.descriptors)
+                values.push_back(read_native_effect_qualification(effect));
+            if (read_native_card_effects(card_engine, object) != membership)
+                throw std::runtime_error{"native effect qualification membership changed after reading fields"};
+            for (std::size_t index{}; index < values.size(); ++index)
+                if (read_native_effect_qualification(membership.descriptors[index]) != values[index])
+                    throw std::runtime_error{"native effect qualification fields changed between reads"};
+            if (require_getter(STR("getCardInfoInstance"), 0xB8) != info_getter
+                || require_getter(STR("getId"), 16) != id_getter
+                || info_getter->GetFuncPtr() != info_getter_address || id_getter->GetFuncPtr() != id_getter_address
+                || getter_text(STR("getCardInfoInstance")) != card_info || getter_text(STR("getId")) != card_id
+                || read_native_card_effects(card_engine, object) != membership
+                || native_card_location(api.engine_state, membership.state, api.get_card_location) != location
+                || !address_is_readable(static_cast<const std::byte*>(membership.object) + 0x18, card_guid.size())
+                || std::memcmp(card_guid.data(), static_cast<const std::byte*>(membership.object) + 0x18, card_guid.size()) != 0)
+                throw std::runtime_error{"native effect qualification final identity binding changed"};
+            // The final getters precede one last field read: even an
+            // unexpected getter side effect must not publish stale fields.
+            for (std::size_t index{}; index < values.size(); ++index)
+                if (read_native_effect_qualification(membership.descriptors[index]) != values[index])
+                    throw std::runtime_error{"native effect qualification fields changed during final identity getters"};
+            if (read_native_card_effects(card_engine, object) != membership)
+                throw std::runtime_error{"native effect qualification final membership changed"};
+
+            return {membership, values, card_info, card_id, card_guid, *location,
+                reinterpret_cast<std::uintptr_t>(info_getter_address) - module_base,
+                reinterpret_cast<std::uintptr_t>(id_getter_address) - module_base};
+        }
+
         auto append_native_effect_qualification(ObjectSnapshot& snapshot, UObject* object) -> void
         {
             try
             {
-                if (GetCurrentThreadId() != g_game_thread_id.load(std::memory_order_acquire))
-                    throw std::runtime_error{"effect qualification observation requires the game thread"};
                 const auto live = find_route_c_objects();
-                const auto api = validated_native_move_card_api(live.card_engine);
-                const auto membership = read_native_card_effects(live.card_engine, object);
-                const auto module_base = reinterpret_cast<std::uintptr_t>(GetModuleHandleW(L"Quantum-Win64-Shipping.exe"));
-                const auto signature = [&](std::uintptr_t rva, const auto& bytes) {
-                    const auto* address = reinterpret_cast<const std::uint8_t*>(module_base + rva);
-                    if (!address_is_readable(address, bytes.size())
-                        || !std::equal(bytes.begin(), bytes.end(), address))
-                        throw std::runtime_error{"native effect qualification layout signature changed"};
-                };
-                // Pure used-byte getter; signatures prove fields, not calls.
-                signature(0xE32AE0, std::array<std::uint8_t, 8>{0x0F,0xB6,0x81,0x91,0,0,0,0xC3});
-                signature(0xE18510, std::array<std::uint8_t, 18>{
-                    0x8B,0x81,0xA0,0,0,0,0x44,0x0F,0xB6,0xDA,0x3B,0x81,0xCC,0,0,0,0x74,0x46});
-                // Hash size+E0 and inline hash+ D0 delimit the 0x50 set
-                // header. Its raw bytes are rechecked, never traversed.
-                signature(0xE18522, std::array<std::uint8_t, 14>{
-                    0x4C,0x63,0x81,0xE0,0,0,0,0x4C,0x8D,0x91,0xD0,0,0,0});
-                signature(0xE1854A, std::array<std::uint8_t, 18>{
-                    0x4C,0x8B,0x81,0x98,0,0,0,0x48,0x63,0xC8,0x48,0x8D,0x14,0x49,0x45,0x38,0x1C,0x90});
-
-                // Bind the full reflected CardInfoInstance and public card ID
-                // with the same established read-only getters used by F1.
-                // Require native pure zero-input struct getters, and keep their
-                // function/return layouts fixed across both observations.
-                const auto require_getter = [&](StringViewType name, std::size_t size) {
-                    auto* function = object->GetFunctionByNameInChain(name.data());
-                    auto* result = function ? function->GetReturnProperty() : nullptr;
-                    const auto address = function ? reinterpret_cast<std::uintptr_t>(function->GetFuncPtr()) : 0;
-                    if (!function || !function->HasAllFunctionFlags(
-                            static_cast<EFunctionFlags>(FUNC_Native | FUNC_BlueprintPure))
-                        || !result || !result->IsA<FStructProperty>()
-                        || function->GetParmsSize() != size || result->GetElementSize() != size
-                        || address < module_base || address - module_base >= ExpectedGameExecutableSize
-                        || !address_is_readable(reinterpret_cast<const void*>(address), 1))
-                        throw std::runtime_error{"effect qualification card getter contract changed"};
-                    for (auto* property : function->ForEachProperty())
-                        if (property->HasAnyPropertyFlags(CPF_Parm)
-                            && !property->HasAnyPropertyFlags(CPF_ReturnParm))
-                            throw std::runtime_error{"effect qualification card getter has input parameters"};
-                    if (name == STR("getCardInfoInstance"))
-                    {
-                        auto* type = static_cast<FStructProperty*>(result)->GetStruct();
-                        auto* info = type ? type->GetPropertyByNameInChain(STR("CardInfo")) : nullptr;
-                        auto* upgrade = type ? type->GetPropertyByNameInChain(STR("upgradeLevel")) : nullptr;
-                        if (!info || !info->IsA<FStructProperty>() || info->GetElementSize() != 0xB0
-                            || !upgrade || upgrade->GetElementSize() != 4)
-                            throw std::runtime_error{"effect qualification CardInfoInstance fields changed"};
-                    }
-                    return function;
-                };
-                auto* info_getter = require_getter(STR("getCardInfoInstance"), 0xB8);
-                auto* id_getter = require_getter(STR("getId"), 16);
-                const auto info_getter_address = info_getter->GetFuncPtr();
-                const auto id_getter_address = id_getter->GetFuncPtr();
-                const auto getter_text = [&](StringViewType name) {
-                    const auto value = export_zero_argument_getter(object, name);
-                    if (!value || value->value.empty() || value->value.size() > 1024 * 1024)
-                        throw std::runtime_error{"effect qualification card identity getter is unavailable"};
-                    return value->value;
-                };
-                const auto card_info = getter_text(STR("getCardInfoInstance"));
-                const auto card_id = getter_text(STR("getId"));
-                const auto location = native_card_location(api.engine_state, membership.state, api.get_card_location);
-                if (!location || !address_is_readable(static_cast<const std::byte*>(membership.object) + 0x18, 16)
-                    || read_native_card_effects(live.card_engine, object) != membership)
-                    throw std::runtime_error{"effect qualification card identity changed before reading fields"};
-                std::array<std::uint8_t, 16> card_guid{};
-                std::memcpy(card_guid.data(), static_cast<const std::byte*>(membership.object) + 0x18, card_guid.size());
-                // FGuid text exports its A/B/C/D uint32 values as four
-                // uppercase eight-digit groups; raw GuidBytes below instead
-                // preserves memory byte order. Bind the actor getter to the
-                // native card GUID, not merely two independently stable IDs.
-                std::ostringstream native_card_id{};
-                native_card_id << std::hex << std::uppercase << std::setfill('0');
-                for (std::size_t part{}; part < 4; ++part)
-                    native_card_id << std::setw(8) << read_native_value<std::uint32_t>(card_guid.data(), part * 4);
-                if (native_card_id.str() != card_id)
-                    throw std::runtime_error{"effect qualification actor ID differs from the native card GUID"};
-                std::vector<NativeEffectQualification> values{};
-                for (const auto& effect : membership.descriptors)
-                    values.push_back(read_native_effect_qualification(effect));
-                if (read_native_card_effects(live.card_engine, object) != membership)
-                    throw std::runtime_error{"native effect qualification membership changed after reading fields"};
-                for (std::size_t index{}; index < values.size(); ++index)
-                    if (read_native_effect_qualification(membership.descriptors[index]) != values[index])
-                        throw std::runtime_error{"native effect qualification fields changed between reads"};
-                if (require_getter(STR("getCardInfoInstance"), 0xB8) != info_getter
-                    || require_getter(STR("getId"), 16) != id_getter
-                    || info_getter->GetFuncPtr() != info_getter_address || id_getter->GetFuncPtr() != id_getter_address
-                    || getter_text(STR("getCardInfoInstance")) != card_info || getter_text(STR("getId")) != card_id
-                    || read_native_card_effects(live.card_engine, object) != membership
-                    || native_card_location(api.engine_state, membership.state, api.get_card_location) != location
-                    || !address_is_readable(static_cast<const std::byte*>(membership.object) + 0x18, card_guid.size())
-                    || std::memcmp(card_guid.data(), static_cast<const std::byte*>(membership.object) + 0x18, card_guid.size()) != 0)
-                    throw std::runtime_error{"native effect qualification final identity binding changed"};
-                // The final getters precede one last field read: even an
-                // unexpected getter side effect must not publish stale fields.
-                for (std::size_t index{}; index < values.size(); ++index)
-                    if (read_native_effect_qualification(membership.descriptors[index]) != values[index])
-                        throw std::runtime_error{"native effect qualification fields changed during final identity getters"};
-                if (read_native_card_effects(live.card_engine, object) != membership)
-                    throw std::runtime_error{"native effect qualification final membership changed"};
-
+                const auto observed = observe_native_card_qualification(live.card_engine, object);
+                const auto& membership = observed.membership;
+                const auto& values = observed.values;
+                const auto& card_info = observed.card_info;
+                const auto& card_id = observed.card_id;
+                const auto& card_guid = observed.card_guid;
                 const auto guid_bytes = [](const auto& bytes) {
                     std::ostringstream text{};
                     text << std::hex << std::uppercase << std::setfill('0');
@@ -3783,10 +3857,10 @@ namespace QuantumCheckpoint
                     {"nativeEffectQualification:cardGuidBytes", guid_bytes(card_guid)},
                     {"nativeEffectQualification:cardInfoInstance", card_info},
                     {"nativeEffectQualification:cardInfoGetterRva", format_address(
-                        reinterpret_cast<std::uintptr_t>(info_getter_address) - module_base)},
+                        observed.info_getter_rva)},
                     {"nativeEffectQualification:cardIdGetterRva", format_address(
-                        reinterpret_cast<std::uintptr_t>(id_getter_address) - module_base)},
-                    {"nativeEffectQualification:nativeLocation", std::to_string(*location)},
+                        observed.id_getter_rva)},
+                    {"nativeEffectQualification:nativeLocation", std::to_string(observed.location)},
                     {"nativeEffectQualification:cardState", format_address(reinterpret_cast<std::uintptr_t>(membership.state))},
                     {"nativeEffectQualification:cardObject", format_address(reinterpret_cast<std::uintptr_t>(membership.object))},
                     {"nativeEffectQualification:cardController", format_address(reinterpret_cast<std::uintptr_t>(membership.controller))},
@@ -4202,6 +4276,145 @@ namespace QuantumCheckpoint
                 restore.player_effect_membership_status = "failed";
                 restore.player_effect_membership_reason = error.what();
                 append_route_c_trace_failure("restore.player-effect-membership.failed", error.what());
+                throw;
+            }
+        }
+
+        struct PlayerQualificationObservation
+        {
+            ExactPlayerQualificationCard saved{};
+            NativeCardQualificationObservation native{};
+            auto operator==(const PlayerQualificationObservation&) const -> bool = default;
+        };
+
+        auto observe_player_qualification(const RouteCBattleObjects& objects)
+            -> std::vector<PlayerQualificationObservation>
+        {
+            const auto collect = [&]() {
+                validate_player_effect_membership(objects);
+                const auto api = validated_native_move_card_on_field_api(objects.card_engine);
+                std::vector<PlayerQualificationObservation> observed{};
+                for (const std::uint8_t location : {0, 1, 2, 3})
+                {
+                    const auto cards = location < 3 ? read_native_player_zone_cards(objects.card_engine, location)
+                        : native_cards_at_location(objects.card_engine, api.location, location);
+                    for (std::size_t index{}; index < cards.size(); ++index)
+                    {
+                        PlayerQualificationObservation value{};
+                        value.native = observe_native_card_qualification(objects.card_engine, cards[index].card);
+                        if (value.native.location != location || value.native.membership.state != cards[index].state)
+                            throw std::runtime_error{"unavailable: qualification card moved during observation"};
+                        auto& saved = value.saved;
+                        saved.native_location = location;
+                        saved.native_index = location < 3 ? static_cast<std::int32_t>(index) : -1;
+                        saved.card_info_instance = value.native.card_info;
+                        if (location == 3)
+                        {
+                            const auto placement = native_card_placement(api, cards[index]);
+                            if (!placement || !is_valid_card_placement(*placement)
+                                || placement->side != 0 || placement->row > 1)
+                                throw std::runtime_error{"unavailable: qualification FIELD slot is invalid"};
+                            saved.row = placement->row;
+                            saved.index = placement->index;
+                        }
+                        // Refuse actual ONCE/used state before the profile lookup,
+                        // so even unknown dynamic ONCE additions fail explicitly.
+                        for (const auto& qualification : value.native.values)
+                        {
+                            if (qualification.flags_mask & 1)
+                                throw std::runtime_error{"unsupported-once: ONCE flag is outside flags-baseline-v1"};
+                            if (qualification.used_once != 0)
+                                throw std::runtime_error{"unsupported-used: nonzero used state is outside flags-baseline-v1"};
+                        }
+                        std::string error{};
+                        const auto identity = exact_card_identity_key_from_instance(saved.card_info_instance, error);
+                        const auto count = identity ? qualification::qualification_card_effect_count(*identity) : std::nullopt;
+                        if (!count || *count != value.native.membership.descriptors.size())
+                            throw std::runtime_error{"unsupported-profile: card upgrade or effect count has no reviewed default profile"};
+                        for (std::size_t ordinal{}; ordinal < *count; ++ordinal)
+                        {
+                            const auto& effect = value.native.membership.descriptors[ordinal];
+                            const auto& qualification = value.native.values[ordinal];
+                            const auto profile = qualification::lookup_effect_qualification_profile(
+                                *identity, ordinal, effect.factory_key, effect.tag, effect.type);
+                            if (!profile)
+                                throw std::runtime_error{"unsupported-profile: ordered factory/tag/type has no reviewed default profile"};
+                            if (!std::equal(profile->flags.begin(), profile->flags.end(),
+                                    qualification.flags.begin(), qualification.flags.end()))
+                                throw std::runtime_error{"flags-profile-mismatch: current flags differ from reviewed constructor defaults"};
+                            saved.effects.push_back({static_cast<std::int32_t>(ordinal), effect.factory_key,
+                                effect.tag, effect.type, qualification.flags, qualification.used_once, std::string{profile->id}});
+                        }
+                        observed.push_back(std::move(value));
+                        if (observed.size() > 128)
+                            throw std::runtime_error{"unavailable: qualification card count exceeds 128"};
+                    }
+                }
+                std::sort(observed.begin(), observed.end(), [](const auto& left, const auto& right) {
+                    const auto& a = left.saved; const auto& b = right.saved;
+                    if (a.native_location != b.native_location) return a.native_location < b.native_location;
+                    if (a.native_location != 3) return a.native_index < b.native_index;
+                    return a.row != b.row ? a.row < b.row : a.index < b.index;
+                });
+                return observed;
+            };
+            const auto first = collect();
+            if (collect() != first)
+                throw std::runtime_error{"unavailable: whole-player qualification changed between bound reads"};
+            return first;
+        }
+
+        auto verify_restore_player_qualification(PendingRouteCRestore& restore,
+                                                 const RouteCBattleObjects& objects,
+                                                 bool startup) -> void
+        {
+            if (!restore.exact_player_qualification) return;
+            try
+            {
+                if (!restore.move_effect_suppressions.empty()
+                    || std::any_of(restore.exact_player_field_targets.begin(), restore.exact_player_field_targets.end(),
+                        [](const auto& target) { return target.effects_suppressed; }))
+                    throw std::runtime_error{"qualification verification requested during controlled effect suppression"};
+                if (!native_restore_actions_settled(validated_native_move_card_api(objects.card_engine).engine_state))
+                    throw std::runtime_error{"qualification verification requires a settled native action queue"};
+                const auto observed = observe_player_qualification(objects);
+                const auto& saved = restore.exact_player_qualification->cards;
+                if (observed.size() != saved.size())
+                    throw std::runtime_error{"qualification card count differs from saved proof"};
+                if (startup)
+                {
+                    // Startup deliberately puts saved FIELD/TRASH into staging
+                    // zones. Match a complete multiset before any reconstruction.
+                    std::vector<bool> matched(saved.size());
+                    for (const auto& live : observed)
+                    {
+                        std::size_t index{};
+                        for (; index < saved.size(); ++index)
+                            if (!matched[index] && live.saved.card_info_instance == saved[index].card_info_instance
+                                && live.saved.effects == saved[index].effects) break;
+                        if (index == saved.size())
+                            throw std::runtime_error{"newborn qualification does not match a saved card profile"};
+                        matched[index] = true;
+                    }
+                    restore.player_qualification_status = "verified-newborn-baseline";
+                    restore.player_qualification_reason = "newborn profiles match the saved complete card multiset; final positions pending";
+                }
+                else
+                {
+                    for (std::size_t index{}; index < saved.size(); ++index)
+                        if (observed[index].saved != saved[index])
+                            throw std::runtime_error{"final qualification identity, order, flags or used state differs from saved proof"};
+                    if (restore.player_qualification_status != "verified-profile-flags-and-zero-used")
+                        append_route_c_trace("restore.player-qualification.final-verified");
+                    restore.player_qualification_status = "verified-profile-flags-and-zero-used";
+                    restore.player_qualification_reason = "saved D/H/T/F identity and reviewed profile flags match; used state is zero; other private state/history is not covered";
+                }
+            }
+            catch (const std::exception& error)
+            {
+                restore.player_qualification_status = "failed";
+                restore.player_qualification_reason = error.what();
+                append_route_c_trace_failure("restore.player-qualification.failed", error.what());
                 throw;
             }
         }
@@ -4658,13 +4871,28 @@ namespace QuantumCheckpoint
                 player_effect_membership_rejection = error.what();
                 append_route_c_trace_failure("capture.player-effect-membership.rejected", error.what());
             }
+            std::optional<std::vector<PlayerQualificationObservation>> player_qualification_observation{};
+            std::string player_qualification_rejection{};
+            try
+            {
+                if (!player_effect_membership_rejection.empty())
+                    throw std::runtime_error{player_effect_membership_rejection};
+                player_qualification_observation = observe_player_qualification(objects);
+                append_route_c_trace("capture.player-qualification.profile-baseline-verified");
+            }
+            catch (const std::exception& error)
+            {
+                player_qualification_rejection = error.what();
+                append_route_c_trace_failure("capture.player-qualification.rejected", player_qualification_rejection);
+            }
             std::optional<ExactPlayerHandHealthCheckpoint> exact_player_hand_health{};
-            std::string off_field_rejection{player_effect_membership_rejection}, hand_health_checksum{};
+            std::string off_field_rejection{player_qualification_rejection}, hand_health_checksum{};
             std::string deck_base_health_states{}, trash_base_health_states{};
             try
             {
                 if (!player_effect_membership_rejection.empty())
                     throw std::runtime_error{player_effect_membership_rejection};
+                if (!player_qualification_rejection.empty()) throw std::runtime_error{player_qualification_rejection};
                 const auto states = validate_off_field_statistics(objects, true, true, ExactPlayerHandHealthSchemaVersion, true);
                 deck_base_health_states = serialize_player_health_states(states.deck_base_health);
                 trash_base_health_states = serialize_player_health_states(states.trash_base_health);
@@ -4713,6 +4941,7 @@ namespace QuantumCheckpoint
                 }
                 append_route_c_trace("capture.exact-player-zones.controllers.found");
                 ExactPlayerZonesCheckpoint exact{};
+                exact.qualification_policy = ExactPlayerQualificationPolicy;
                 exact.captured_at_utc = checkpoint.captured_at_utc;
                 exact.route_c_payload_checksum = checkpoint.payload_checksum;
                 exact.game_executable_sha256 = checkpoint.game_executable_sha256;
@@ -4773,6 +5002,7 @@ namespace QuantumCheckpoint
                 }
                 append_route_c_trace("capture.exact-player-trash.controllers.found");
                 ExactPlayerTrashCheckpoint exact{};
+                exact.qualification_policy = ExactPlayerQualificationPolicy;
                 exact.captured_at_utc = checkpoint.captured_at_utc;
                 exact.route_c_payload_checksum = checkpoint.payload_checksum;
                 exact.game_executable_sha256 = checkpoint.game_executable_sha256;
@@ -4893,6 +5123,7 @@ namespace QuantumCheckpoint
                     });
 
                 ExactPlayerFieldCheckpoint exact{};
+                exact.qualification_policy = ExactPlayerQualificationPolicy;
                 exact.captured_at_utc = checkpoint.captured_at_utc;
                 exact.route_c_payload_checksum = checkpoint.payload_checksum;
                 exact.game_executable_sha256 = checkpoint.game_executable_sha256;
@@ -4981,6 +5212,7 @@ namespace QuantumCheckpoint
                 {
                     throw std::runtime_error{"character charge getters were not integers"};
                 }
+                if (!player_qualification_rejection.empty()) throw std::runtime_error{player_qualification_rejection};
                 ExactCharacterChargeCheckpoint exact{};
                 exact.captured_at_utc = checkpoint.captured_at_utc;
                 exact.route_c_payload_checksum = checkpoint.payload_checksum;
@@ -5027,6 +5259,7 @@ namespace QuantumCheckpoint
                     throw std::runtime_error{
                         "turn and player-draw state did not share one CardEngine"};
                 }
+                if (!player_qualification_rejection.empty()) throw std::runtime_error{player_qualification_rejection};
                 ExactTurnProgressCheckpoint exact{};
                 exact.captured_at_utc = checkpoint.captured_at_utc;
                 exact.route_c_payload_checksum = checkpoint.payload_checksum;
@@ -5071,6 +5304,57 @@ namespace QuantumCheckpoint
                     "capture.exact-turn-progress.skipped", error.what());
             }
 
+            std::optional<ExactPlayerQualificationCheckpoint> exact_player_qualification{};
+            const auto discard_player_supplements = [&]() {
+                exact_player_qualification.reset();
+                exact_player_hand_health.reset();
+                exact_player_zones.reset(); exact_player_trash.reset(); exact_player_field.reset();
+                exact_turn_progress.reset(); exact_character_charge.reset();
+            };
+            if (exact_player_zones || exact_player_trash || exact_player_field)
+            {
+                try
+                {
+                    if (!player_qualification_observation)
+                        throw std::runtime_error{"qualification observation was not captured"};
+                    ExactPlayerQualificationCheckpoint proof{};
+                    proof.captured_at_utc = checkpoint.captured_at_utc;
+                    proof.route_c_payload_checksum = checkpoint.payload_checksum;
+                    proof.game_executable_sha256 = checkpoint.game_executable_sha256;
+                    proof.game_executable_size = checkpoint.game_executable_size;
+                    proof.source_level_name = checkpoint.source_level_name;
+                    proof.wave_index = checkpoint.wave_index;
+                    proof.qualification_policy = ExactPlayerQualificationPolicy;
+                    for (const auto& card : *player_qualification_observation) proof.cards.push_back(card.saved);
+                    const auto bind = [&](const auto& layout) {
+                        proof.layout_kind = layout.kind;
+                        proof.layout_payload_checksum = layout.payload_checksum;
+                        proof.payload_checksum = exact_player_qualification_payload_checksum(proof);
+                        std::string error{};
+                        if (!validate_exact_player_qualification_checkpoint(proof, error)
+                            || !validate_exact_player_qualification_binding(proof, layout, error))
+                            throw std::runtime_error{error};
+                    };
+                    if (exact_player_field) bind(*exact_player_field);
+                    else if (exact_player_trash) bind(*exact_player_trash);
+                    else bind(*exact_player_zones);
+                    exact_player_qualification = std::move(proof);
+                    append_route_c_trace("capture.player-qualification.proof-prepared");
+                }
+                catch (const std::exception& error)
+                {
+                    player_qualification_rejection = error.what();
+                    discard_player_supplements();
+                    append_route_c_trace_failure("capture.player-qualification.proof-rejected", error.what());
+                }
+            }
+            else
+            {
+                // With no supported card layout there is no complete combat
+                // snapshot to which HAND/turn/charge can safely belong.
+                discard_player_supplements();
+            }
+
             const auto path = route_c_checkpoint_path();
             const auto main_contents = serialize_route_c_checkpoint(checkpoint);
             if (main_contents.empty() || main_contents.size() > RouteCMaximumFileBytes)
@@ -5085,6 +5369,9 @@ namespace QuantumCheckpoint
                 if (std::chrono::steady_clock::now() >= expected->deadline)
                     throw std::runtime_error{"automatic capture exceeded its fixed deadline before file replacement"};
             }
+            if (exact_player_qualification
+                && observe_player_qualification(final_objects) != *player_qualification_observation)
+                throw std::runtime_error{"player qualification changed before publication; checkpoint files were not replaced"};
             const auto final_wave = parse_int32(required_text(export_property_text(objects.spawner, STR("currentWaveIndex")), "currentWaveIndex"));
             if (!final_wave || *final_wave != checkpoint.wave_index
                 || required_text(export_property_text(objects.card_engine, STR("currentGameState")), "currentGameState") != "OPEN"
@@ -5135,12 +5422,27 @@ namespace QuantumCheckpoint
                 catch (const std::exception& error)
                 {
                     // Never publish a layout that depends on an uncommitted sidecar.
-                    exact_player_zones.reset();
-                    exact_player_trash.reset();
-                    exact_player_field.reset();
+                    player_qualification_rejection = "required HAND publication failed: " + std::string{error.what()};
+                    discard_player_supplements();
                     append_route_c_trace_failure("capture.exact-player-hand-health.write.failed", error.what());
                 }
             }
+            if (exact_player_qualification)
+            {
+                try
+                {
+                    write_file_atomically(exact_player_qualification_checkpoint_path(),
+                        serialize_exact_player_qualification_checkpoint(*exact_player_qualification));
+                    append_route_c_trace("capture.player-qualification.write.complete");
+                }
+                catch (const std::exception& error)
+                {
+                    player_qualification_rejection = "required Q1 publication failed: " + std::string{error.what()};
+                    discard_player_supplements();
+                    append_route_c_trace_failure("capture.player-qualification.write.failed", error.what());
+                }
+            }
+            bool player_layout_published{};
             if (exact_player_zones)
             {
                 try
@@ -5151,9 +5453,12 @@ namespace QuantumCheckpoint
                         serialize_exact_player_zones_checkpoint(
                             std::move(*exact_player_zones)));
                     append_route_c_trace("capture.exact-player-zones.write.complete");
+                    player_layout_published = true;
                 }
                 catch (const std::exception& error)
                 {
+                    player_qualification_rejection = "required layout publication failed: " + std::string{error.what()};
+                    discard_player_supplements();
                     append_route_c_trace_failure(
                         "capture.exact-player-zones.write.failed", error.what());
                 }
@@ -5168,9 +5473,12 @@ namespace QuantumCheckpoint
                         serialize_exact_player_trash_checkpoint(
                             std::move(*exact_player_trash)));
                     append_route_c_trace("capture.exact-player-trash.write.complete");
+                    player_layout_published = true;
                 }
                 catch (const std::exception& error)
                 {
+                    player_qualification_rejection = "required layout publication failed: " + std::string{error.what()};
+                    discard_player_supplements();
                     append_route_c_trace_failure(
                         "capture.exact-player-trash.write.failed", error.what());
                 }
@@ -5185,9 +5493,12 @@ namespace QuantumCheckpoint
                         serialize_exact_player_field_checkpoint(
                             std::move(*exact_player_field)));
                     append_route_c_trace("capture.exact-player-field.write.complete");
+                    player_layout_published = true;
                 }
                 catch (const std::exception& error)
                 {
+                    player_qualification_rejection = "required layout publication failed: " + std::string{error.what()};
+                    discard_player_supplements();
                     append_route_c_trace_failure(
                         "capture.exact-player-field.write.failed", error.what());
                 }
@@ -5226,6 +5537,13 @@ namespace QuantumCheckpoint
                         "capture.exact-turn-progress.write.failed", error.what());
                 }
             }
+            append_route_c_trace_failure("capture.coverage",
+                std::string{"semanticRestart=saved playerQualification="}
+                    + (player_layout_published ? "profile-flags-and-zero-used" : "unsupported-no-player-layout")
+                    + " fullPlayerExactRestorationProven=false reason=" + player_qualification_rejection);
+            Output::send<LogLevel::Default>(STR("[QuantumCheckpoint] Saved coverage: semantic restart; player qualification={}; full player state is not proven. {}\n"),
+                player_layout_published ? STR("profile-flags-and-zero-used") : STR("unsupported-no-player-layout"),
+                to_wstring(player_qualification_rejection));
             return path;
         }
 
@@ -5353,6 +5671,18 @@ namespace QuantumCheckpoint
                    << json_escape(restore.player_effect_membership_reason) << "\",\n"
                    << "  \"exactPlayerEffectMembershipSavedProof\": \""
                    << json_escape(restore.player_effect_membership_saved_proof) << "\",\n"
+                   << "  \"playerQualificationRequired\": " << (restore.player_qualification_required ? "true" : "false") << ",\n"
+                   << "  \"playerQualificationSavedProof\": \"" << json_escape(restore.player_qualification_saved_proof) << "\",\n"
+                   << "  \"playerQualificationStatus\": \"" << json_escape(restore.player_qualification_status) << "\",\n"
+                   << "  \"playerQualificationReason\": \"" << json_escape(restore.player_qualification_reason) << "\",\n"
+                   << "  \"playerQualificationPolicy\": \"" << json_escape(restore.player_qualification_policy) << "\",\n"
+                   << "  \"routeCPayloadChecksum\": \"" << json_escape(restore.checkpoint.payload_checksum) << "\",\n"
+                   << "  \"playerQualificationProofChecksum\": \""
+                   << (restore.exact_player_qualification ? restore.exact_player_qualification->payload_checksum : "") << "\",\n"
+                   << "  \"playerQualificationLayoutChecksum\": \""
+                   << (restore.exact_player_qualification ? restore.exact_player_qualification->layout_payload_checksum : "") << "\",\n"
+                   << "  \"playerOnceReplayCount\": 0,\n"
+                   << "  \"fullPlayerExactRestorationProven\": false,\n"
                    << "  \"playerOffFieldStatisticsRequired\": "
                    << (restore.off_field_statistics_covered ? "true" : "false") << ",\n"
                    << "  \"playerOffFieldStatisticsScope\": \""
@@ -6559,6 +6889,8 @@ namespace QuantumCheckpoint
             auto completed = std::move(*g_pending_route_c_restore);
             completed.status = std::move(status);
             completed.reason = std::move(reason);
+            completed.reason += "; player qualification=" + completed.player_qualification_status
+                + "; full player state is not proven";
 
             // Every terminal path, including timeout and unexpected exceptions,
             // must release temporary effect suppression before discarding targets.
@@ -6684,7 +7016,11 @@ namespace QuantumCheckpoint
             g_pending_route_c_restore.reset();
             try
             {
+                append_route_c_trace_failure("restore.finish",
+                    "status=" + completed.status + " checkpoint=" + completed.checkpoint.payload_checksum
+                        + " playerQualification=" + completed.player_qualification_status);
                 const auto path = write_route_c_restore_report(completed);
+                append_route_c_trace_failure("restore.report-written", to_string(path.filename().wstring()));
                 Output::send<LogLevel::Verbose>(
                     STR("[QuantumCheckpoint] Route C restore {}: {}; report: {}\n"),
                     to_wstring(completed.status),
@@ -6757,6 +7093,45 @@ namespace QuantumCheckpoint
                     "exact player zones were superseded by the linked player-trash supplement";
                 exact_player_zones.reset();
                 append_route_c_trace("restore.exact-player-trash.supersedes-clean-zones");
+            }
+            const bool player_qualification_required = exact_player_field
+                ? exact_player_field->schema_version >= ExactPlayerFieldQualificationSchemaVersion
+                : exact_player_trash ? exact_player_trash->schema_version >= ExactPlayerTrashQualificationSchemaVersion
+                : exact_player_zones && exact_player_zones->schema_version >= ExactPlayerZonesQualificationSchemaVersion;
+            const bool qualification_layout_present = exact_player_field || exact_player_trash || exact_player_zones;
+            std::optional<ExactPlayerQualificationCheckpoint> exact_player_qualification{};
+            std::string player_qualification_policy{player_qualification_required ? ExactPlayerQualificationPolicy : ""};
+            std::string player_qualification_status{qualification_layout_present ? "legacy-bounded" : "not-applicable-no-player-layout"};
+            std::string player_qualification_saved_proof{qualification_layout_present ? "unknown-saved-state" : "not-applicable-no-player-layout"};
+            std::string player_qualification_reason{qualification_layout_present
+                ? "legacy layout preserves only its historical bounded scope; saved flags and used state are unknown"
+                : semantic_only ? "semantic fallback has no player qualification claim; " + fallback_reason
+                : "ordinary Route C has no accepted player layout or qualification claim"};
+            bool invalid_qualification_dependency{};
+            if (player_qualification_required)
+            {
+                exact_player_qualification = try_read_exact_player_qualification_checkpoint(checkpoint, player_qualification_reason);
+                std::string binding_error{};
+                const bool bound = exact_player_qualification && (exact_player_field
+                    ? validate_exact_player_qualification_binding(*exact_player_qualification, *exact_player_field, binding_error)
+                    : exact_player_trash
+                        ? validate_exact_player_qualification_binding(*exact_player_qualification, *exact_player_trash, binding_error)
+                        : validate_exact_player_qualification_binding(*exact_player_qualification, *exact_player_zones, binding_error));
+                if (!bound)
+                {
+                    invalid_qualification_dependency = true;
+                    player_qualification_status = "rejected-before-startup";
+                    player_qualification_saved_proof = "required-proof-rejected";
+                    player_qualification_reason += "; " + binding_error;
+                    exact_player_qualification.reset();
+                    append_route_c_trace_failure("restore.player-qualification.binding-rejected", player_qualification_reason);
+                }
+                else
+                {
+                    player_qualification_status = "pending";
+                    player_qualification_saved_proof = "validated-Q1-layout-binding";
+                    append_route_c_trace("restore.player-qualification.proof-loaded");
+                }
             }
             std::optional<ExactPlayerHandHealthCheckpoint> exact_player_hand_health{};
             std::string hand_health_reason{semantic_only ? "ordinary Route C fallback does not restore hand health"
@@ -6849,9 +7224,10 @@ namespace QuantumCheckpoint
             const bool missing_turn_for_cards = (exact_player_field || exact_player_trash) && !exact_turn_progress;
             const bool missing_cards_for_turn = exact_turn_progress
                 && !exact_player_field && !exact_player_trash && !exact_player_zones;
-            if (legacy_turn || missing_turn_for_cards || missing_cards_for_turn || invalid_hand_health_dependency)
+            if (legacy_turn || missing_turn_for_cards || missing_cards_for_turn || invalid_hand_health_dependency || invalid_qualification_dependency)
             {
-                fallback_reason = invalid_hand_health_dependency ? hand_health_reason : legacy_turn
+                fallback_reason = invalid_qualification_dependency ? player_qualification_reason
+                    : invalid_hand_health_dependency ? hand_health_reason : legacy_turn
                     ? "legacy turn supplement has no native countdown/modifier"
                     : missing_turn_for_cards
                         ? "field/trash supplement requires valid native turn progress"
@@ -6868,6 +7244,12 @@ namespace QuantumCheckpoint
                 exact_player_zones.reset();
                 exact_character_charge.reset();
                 exact_player_hand_health.reset();
+                exact_player_qualification.reset();
+                if (player_qualification_status == "pending")
+                {
+                    player_qualification_status = "disabled-with-player-layout";
+                    player_qualification_reason = fallback_reason;
+                }
                 off_field_statistics_covered = false;
                 if (!invalid_hand_health_dependency) hand_health_status = "disabled-with-player-layout";
                 if (hand_counter_status == "pending" || hand_counter_status == "not-applicable-empty-hand")
@@ -7013,6 +7395,24 @@ namespace QuantumCheckpoint
                 {
                     hand_counter_status = "disabled-with-player-layout";
                     hand_counter_reason = "no accepted exact player-card layout remains";
+                }
+            }
+            if (!exact_player_field && !exact_player_trash && !exact_player_zones)
+            {
+                if (exact_turn_progress || exact_character_charge)
+                {
+                    fallback_reason = "no accepted exact player layout remains after startup planning; dependent turn and charge disabled";
+                    exact_turn_progress_reason = fallback_reason;
+                    exact_character_charge_reason = fallback_reason;
+                    exact_turn_progress.reset();
+                    exact_character_charge.reset();
+                    append_route_c_trace_failure("restore.combat-supplements.planning-disabled", fallback_reason);
+                }
+                if (exact_player_qualification)
+                {
+                    exact_player_qualification.reset();
+                    player_qualification_status = "disabled-with-player-layout";
+                    player_qualification_reason = "no accepted player layout remains after startup planning";
                 }
             }
             std::string loot_error{};
@@ -7165,6 +7565,12 @@ namespace QuantumCheckpoint
                 .player_effect_membership_saved_proof = !player_effect_membership_requested
                     ? "not-applicable-no-player-layout"
                     : player_effect_membership_attested ? "attested-by-layout-schema" : "legacy-unknown",
+                .exact_player_qualification = std::move(exact_player_qualification),
+                .player_qualification_required = player_qualification_required,
+                .player_qualification_status = std::move(player_qualification_status),
+                .player_qualification_reason = std::move(player_qualification_reason),
+                .player_qualification_saved_proof = std::move(player_qualification_saved_proof),
+                .player_qualification_policy = std::move(player_qualification_policy),
             });
 
             try
@@ -10596,6 +11002,20 @@ namespace QuantumCheckpoint
                     if (restore.player_effect_membership_status == "verified-native-definition-membership")
                         append_route_c_trace("restore.player-effect-membership.startup-verified");
                 }
+                if (!restore.player_qualification_startup_checked)
+                {
+                    if (restore.exact_player_qualification
+                        && !native_restore_actions_settled(validated_native_move_card_api(objects.card_engine).engine_state))
+                    {
+                        restore.startup_open_since.reset();
+                        restore.startup_settled = false;
+                        return; // Keep the original restore deadline; pending is not a mismatch.
+                    }
+                    verify_restore_player_qualification(restore, objects, true);
+                    restore.player_qualification_startup_checked = true;
+                    if (restore.exact_player_qualification)
+                        append_route_c_trace("restore.player-qualification.newborn-verified");
+                }
                 if (!advance_player_hand_staging(restore, objects, now))
                 {
                     return;
@@ -10777,6 +11197,7 @@ namespace QuantumCheckpoint
                 // Never finish with missing/unreadable UI state even when the
                 // native membership and numeric restore have already verified.
                 verify_restore_move_overlays(restore, objects.card_engine);
+                verify_restore_player_qualification(restore, objects, false);
                 const auto final_zones = find_route_c_player_zone_objects(
                     static_cast<const void*>(objects.card_engine->GetWorld()));
                 const auto verify_final_zones = [&](const auto& exact) {
@@ -10799,7 +11220,9 @@ namespace QuantumCheckpoint
                         throw std::runtime_error{"player trash drifted during final stability window"};
                     }
                 }
-                if ((restore.exact_spawn_plan && restore.exact_spawn_plan_status != "verified")
+                if ((restore.exact_player_qualification
+                        && restore.player_qualification_status != "verified-profile-flags-and-zero-used")
+                    || (restore.exact_spawn_plan && restore.exact_spawn_plan_status != "verified")
                     || ((restore.exact_player_zones || restore.exact_player_trash || restore.exact_player_field)
                         && restore.player_effect_membership_status != "verified-native-definition-membership")
                     || (restore.exact_player_hand_health && restore.hand_health_status != "verified-native-health")
@@ -14669,9 +15092,9 @@ namespace QuantumCheckpoint
         QuantumCheckpointMod()
         {
             ModName = STR("QuantumCheckpoint");
-            ModVersion = STR("0.39.0");
+            ModVersion = STR("0.40.0");
 #if defined(QUANTUM_CHECKPOINT_RUNTIME_TEST_FIXTURES)
-            ModVersion = STR("0.39.0-test-fixtures");
+            ModVersion = STR("0.40.0-test-fixtures");
 #endif
             ModDescription = STR("Route C checkpoint with optional exact-state supplements");
             ModAuthors = STR("zaofenMachine and contributors");

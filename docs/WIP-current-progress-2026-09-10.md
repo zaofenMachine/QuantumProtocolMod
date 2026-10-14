@@ -1,6 +1,16 @@
 # QuantumCheckpoint 当前工作进度（临时续接记录）
 
-> 2026-09-30 本轮沿“小关重开＋玩家精确恢复”继续，按用户要求在周额度剩余约 10% 时收尾。当前入口为第三十八阶段；下方均保留各阶段发生时的记录，不代表最新部署和停机状态。
+> 2026-10-15 当前沿“小关重开＋受限玩家恢复”持续推进，本轮额度收尾阈值改为剩余30%。Phase39 A 已完成下述实机范围，root 继续 Phase40 B，不因本条立即停止。下方旧阶段均是当时记录，不代表当前部署／停机状态。
+
+## 2026-10-15 第三十九阶段 A：资格默认来源门禁里程碑完成
+
+当前 v0.40.0，OFF 4/4 CTest，DLL `491D3AF72358FBD6F7C92725323D0815B201DB4CCD009441D65BAD417261119F`，实际编译 Mod 源码 `215F69E4EB069C3187B9803F3FFE021A8DA0445E061B9D7E4ADBA586DBF4EDFA`。Z6/T7/F10＋Q1 的三个真实捕获／恢复样本与 T6/F9 的两个 legacy 样本均通过原25项玩家比较；其他 semantic/enemy/GUID 三项按原 comparison 逐项保留，不外推敌人或完整玩家私有历史。
+
+三个必需 Q1 缺失／错绑定／坏 checksum 均实际 rejected-before-startup、preflight-route-c passed，无玩家布局／数值写入。基础 Bow unused 和 clean-used 两组实际 unsupported-once、旧依赖清空；prior used 样本实际先遇到 mageLucia unsupported-profile，独立保留。A 没有 used/flags writer，playerOnceReplayCount=0；Phase38 的 ONCE 恢复缺口仍是历史未修复结论。详情见[第三十九阶段 A](phase-39-player-qualification-baseline.md)。
+
+证据根 `QuantumProtoclMod.runtime-evidence/20261015-player-qualification`。原用户检查点两次回归、全25项验证通过；17个checkpoint和4个SaveGames按本轮fresh backup逐字节还原，主checksum `81095982711C71E2`，游戏正常关闭，新DLL保留，未操作Genesis。57个冻结工具文件、278个固定外部文件及23项冻结复验通过，入口为 `validation-summary.json`、`phase39-frozen-revalidation-20261014T193454988868Z/revalidation-index.json`、`session-cleanup.json`，提交与远端核验另记 `commit-and-push.json`。这只是A里程碑，后续B测试结束还需独立收尾。
+
+下一步继续 Phase40 B：只审阅基础 sakuraBow@0 的一次 native true 回放，保留明确 schema／policy 分支、完整源 proof、所有 owner/signature/queue/位置与全玩家前后守卫；未用源不写、同名副本按下标、失败不重试并仅一次语义回退。升级 Bow、Quarter 动态 ONCE、flags writer、重编程和敌人恢复仍不扩域；静态设计／签名证据不是支持声明。
 
 ## 2026-09-30 第三十八阶段：资格缺口已复现，本轮已收尾
 
