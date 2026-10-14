@@ -291,13 +291,14 @@ namespace
         const auto apple_effect = effect("naturalApple@0", 0, "player.esper.fruit.apple", "naturalApple", 3);
         const auto lemon_effect = effect("naturalLemon@0", 0, "player.esper.fruit.lemon", "naturalLemon", 3);
         auto qualified_zones = historical_zones;
-        qualified_zones.schema_version = ExactPlayerZonesSchemaVersion;
+        qualified_zones.schema_version = ExactPlayerZonesQualificationSchemaVersion;
         qualified_zones.player_hand = "(" + tool_instance + ")";
         qualified_zones.player_deck = "(" + apple_instance + "," + apple_instance + ")";
         qualified_zones.player_deck_base_health_states = "2,2;2,2";
         qualified_zones.qualification_policy = ExactPlayerQualificationPolicy;
         qualified_zones.payload_checksum = exact_player_zones_payload_checksum(qualified_zones);
         ExactPlayerQualificationCheckpoint proof{
+            .schema_version = ExactPlayerQualificationBaselineSchemaVersion,
             .captured_at_utc = qualified_zones.captured_at_utc,
             .route_c_payload_checksum = qualified_zones.route_c_payload_checksum,
             .game_executable_sha256 = qualified_zones.game_executable_sha256,
@@ -316,6 +317,9 @@ namespace
             }
         };
         proof.payload_checksum = exact_player_qualification_payload_checksum(proof);
+        require(qualified_zones.payload_checksum == "837379379206DF5E"
+                    && proof.payload_checksum == "74E89D4D3F6EA1CB",
+                "fixed Phase39 Z6 and Qschema1 FNV vectors remain byte-compatible under B runtime");
         const auto proof_json = serialize_exact_player_qualification_checkpoint(proof);
         const auto parsed = parse_exact_player_qualification_checkpoint(proof_json, error);
         require(parsed && parsed->cards == proof.cards && serialize_exact_player_qualification_checkpoint(*parsed) == proof_json,
@@ -440,13 +444,14 @@ namespace
         require(bind_rejected(old_proof, old_layout), "historical layout cannot acquire a Q1 proof even with matching full cards");
 
         auto qualified_trash = historical_trash;
-        qualified_trash.schema_version = ExactPlayerTrashSchemaVersion;
+        qualified_trash.schema_version = ExactPlayerTrashQualificationSchemaVersion;
         qualified_trash.player_deck = qualified_zones.player_deck;
         qualified_trash.player_hand = qualified_zones.player_hand;
         qualified_trash.player_deck_base_health_states = qualified_zones.player_deck_base_health_states;
         qualified_trash.player_trash = "(" + lemon_instance + ")";
         qualified_trash.qualification_policy = ExactPlayerQualificationPolicy;
         qualified_trash.payload_checksum = exact_player_trash_payload_checksum(qualified_trash);
+        require(qualified_trash.payload_checksum == "6599DDACA977629F", "fixed Phase39 T7 FNV remains unchanged");
         auto trash_proof = proof;
         trash_proof.layout_kind = qualified_trash.kind;
         trash_proof.layout_payload_checksum = qualified_trash.payload_checksum;
@@ -455,7 +460,7 @@ namespace
         trash_proof.payload_checksum = exact_player_qualification_payload_checksum(trash_proof);
         require(validate_exact_player_qualification_binding(trash_proof, qualified_trash, error), error.c_str());
         auto qualified_field = historical_field;
-        qualified_field.schema_version = ExactPlayerFieldSchemaVersion;
+        qualified_field.schema_version = ExactPlayerFieldQualificationSchemaVersion;
         qualified_field.player_deck = qualified_trash.player_deck;
         qualified_field.player_hand = qualified_trash.player_hand;
         qualified_field.player_trash = qualified_trash.player_trash;
@@ -463,6 +468,7 @@ namespace
         qualified_field.player_field = "(" + apple_instance + "," + lemon_instance + ")";
         qualified_field.qualification_policy = ExactPlayerQualificationPolicy;
         qualified_field.payload_checksum = exact_player_field_payload_checksum(qualified_field);
+        require(qualified_field.payload_checksum == "65F22A164D117FFC", "fixed Phase39 F10 FNV remains unchanged");
         auto field_proof = trash_proof;
         field_proof.layout_kind = qualified_field.kind;
         field_proof.layout_payload_checksum = qualified_field.payload_checksum;
@@ -486,6 +492,215 @@ namespace
             }
             require(bind_rejected(invalid, qualified_field), "Q1 rejects duplicate, invalid and mismatched FIELD destinations");
         }
+
+        // B is an explicit new promise, never a global relaxation of A profiles.
+        using namespace qualification;
+        require(is_supported_qualification_policy(ExactPlayerQualificationPolicy)
+                    && is_supported_qualification_policy(ExactPlayerQualificationBowOncePolicy)
+                    && !is_supported_qualification_policy("flags-baseline-bow-once-v3")
+                    && qualification_proof_schema_for_policy(ExactPlayerQualificationPolicy) == 1
+                    && qualification_proof_schema_for_policy(ExactPlayerQualificationBowOncePolicy) == 2
+                    && !qualification_proof_schema_for_policy(""),
+                "only exact published A/B policies dispatch to exact proof schemas");
+        require(!supports_qualification_card_profile("sakuraBow@0")
+                    && !qualification_card_effect_count("sakuraBow@0", ExactPlayerQualificationPolicy)
+                    && supports_qualification_card_profile("sakuraBow@0", ExactPlayerQualificationBowOncePolicy)
+                    && qualification_card_effect_count("sakuraBow@0", ExactPlayerQualificationBowOncePolicy) == 1
+                    && !supports_qualification_card_profile("sakuraBow@1", ExactPlayerQualificationBowOncePolicy)
+                    && !supports_qualification_card_profile("unknown@0", ExactPlayerQualificationBowOncePolicy)
+                    && !supports_qualification_card_profile("naturalApple@0", "unknown"),
+                "B adds exactly base Bow and default profile APIs remain A");
+        const auto bow_profile = lookup_effect_qualification_profile("sakuraBow@0", 0,
+            "player.aurora.sakura.sakurabow", "sakuraBow", 1, ExactPlayerQualificationBowOncePolicy);
+        require(bow_profile && bow_profile->permits_used_once_replay
+                    && bow_profile->id == "phase40-bow-once-v2:player.aurora.sakura.sakurabow"
+                    && bow_profile->flags.size() == 1 && bow_profile->flags[0] == 0,
+                "base Bow B profile matches independently reviewed id and exact ONCE default");
+        require(!lookup_effect_qualification_profile("sakuraBow@0", 0,
+                    "player.aurora.sakura.sakurabow", "sakuraBow", 1)
+                    && !lookup_effect_qualification_profile("sakuraBow@1", 0,
+                    "player.aurora.sakura.sakurabow.u1", "sakuraBow", 1, ExactPlayerQualificationBowOncePolicy)
+                    && !lookup_effect_qualification_profile("sakuraBow@0", 1,
+                    "player.aurora.sakura.sakurabow", "sakuraBow", 1, ExactPlayerQualificationBowOncePolicy),
+                "A, upgraded Bow and wrong ordinal never acquire replay permission");
+        for (const auto& card : proof.cards)
+        {
+            const auto key = exact_card_identity_key_from_instance(card.card_info_instance, error);
+            require(key.has_value(), "existing A test card identity remains readable");
+            require(qualification_card_effect_count(*key, ExactPlayerQualificationPolicy)
+                        == qualification_card_effect_count(*key, ExactPlayerQualificationBowOncePolicy),
+                    "B retains existing A exact effect counts");
+            for (const auto& effect : card.effects)
+            {
+                const auto a_profile = lookup_effect_qualification_profile(*key, effect.ordinal,
+                    effect.factory_key, effect.tag, effect.type, ExactPlayerQualificationPolicy);
+                const auto b_profile = lookup_effect_qualification_profile(*key, effect.ordinal,
+                    effect.factory_key, effect.tag, effect.type, ExactPlayerQualificationBowOncePolicy);
+                require(a_profile && b_profile && !a_profile->permits_used_once_replay
+                            && !b_profile->permits_used_once_replay && a_profile->id == b_profile->id
+                            && std::equal(a_profile->flags.begin(), a_profile->flags.end(), b_profile->flags.begin(), b_profile->flags.end()),
+                        "existing A profile ids/flags remain identical and cannot replay used under B");
+            }
+        }
+        const auto version_pair = [&](auto a_layout, auto a_proof, int b_version, auto serialize, auto parse, auto checksum) {
+            const auto a_policy = qualification_policy_for_layout(a_layout.kind, a_layout.schema_version);
+            require(a_policy && *a_policy == ExactPlayerQualificationPolicy,
+                    "fixed A layout maps only to its original policy");
+            auto b_layout = a_layout;
+            b_layout.schema_version = b_version;
+            require(!parse(serialize(b_layout), error), "new B layout cannot retain A marker");
+            b_layout.qualification_policy = ExactPlayerQualificationBowOncePolicy;
+            b_layout.payload_checksum = checksum(b_layout);
+            const auto b_policy = qualification_policy_for_layout(b_layout.kind, b_layout.schema_version);
+            require(b_policy && *b_policy == ExactPlayerQualificationBowOncePolicy
+                        && parse(serialize(b_layout), error).has_value(), "B layout marker round trips at its exact version");
+            auto wrong_a = a_layout;
+            wrong_a.qualification_policy = ExactPlayerQualificationBowOncePolicy;
+            require(!parse(serialize(wrong_a), error), "old A layout cannot carry a valid B policy even with recalculated checksum");
+            auto a_for_b = a_proof;
+            a_for_b.layout_kind = b_layout.kind;
+            a_for_b.layout_payload_checksum = b_layout.payload_checksum;
+            require(bind_rejected(a_for_b, b_layout), "schema1 A proof cannot bind B layout");
+            auto b_for_a = a_proof;
+            b_for_a.schema_version = ExactPlayerQualificationBowOnceSchemaVersion;
+            b_for_a.qualification_policy = ExactPlayerQualificationBowOncePolicy;
+            b_for_a.layout_kind = a_layout.kind;
+            b_for_a.layout_payload_checksum = a_layout.payload_checksum;
+            require(bind_rejected(b_for_a, a_layout), "schema2 B proof cannot bind A layout");
+            auto future = b_layout;
+            ++future.schema_version;
+            require(!qualification_policy_for_layout(future.kind, future.schema_version)
+                        && !parse(serialize(future), error), "future layout cannot inherit B policy by a minimum-version comparison");
+            require(!qualification_policy_for_layout(a_layout.kind, a_layout.schema_version - 1),
+                    "historical pre-A layout has no inferred qualification policy");
+        };
+        version_pair(qualified_zones, proof, ExactPlayerZonesBowOnceQualificationSchemaVersion,
+            serialize_exact_player_zones_checkpoint, parse_exact_player_zones_checkpoint, exact_player_zones_payload_checksum);
+        version_pair(qualified_trash, trash_proof, ExactPlayerTrashBowOnceQualificationSchemaVersion,
+            serialize_exact_player_trash_checkpoint, parse_exact_player_trash_checkpoint, exact_player_trash_payload_checksum);
+        version_pair(qualified_field, field_proof, ExactPlayerFieldBowOnceQualificationSchemaVersion,
+            serialize_exact_player_field_checkpoint, parse_exact_player_field_checkpoint, exact_player_field_payload_checksum);
+
+        const std::string bow_instance = "(CardInfo=(Tag=\"sakuraBow\",Level=1,upgradeLevels=((attack=1,health=1,effects=(\"player.aurora.sakura.sakurabow\")))),upgradeLevel=0)";
+        auto b_zones = qualified_zones;
+        b_zones.schema_version = ExactPlayerZonesBowOnceQualificationSchemaVersion;
+        b_zones.qualification_policy = ExactPlayerQualificationBowOncePolicy;
+        b_zones.player_hand = "(" + bow_instance + "," + bow_instance + ")";
+        b_zones.payload_checksum = exact_player_zones_payload_checksum(b_zones);
+        ExactPlayerQualificationEffect bow_effect{.ordinal = 0, .factory_key = "player.aurora.sakura.sakurabow",
+            .tag = "sakuraBow", .type = 1, .flags = {0}, .used_once = 1,
+            .profile_id = "phase40-bow-once-v2:player.aurora.sakura.sakurabow"};
+        auto b_proof = proof;
+        b_proof.schema_version = ExactPlayerQualificationBowOnceSchemaVersion;
+        b_proof.qualification_policy = ExactPlayerQualificationBowOncePolicy;
+        b_proof.layout_payload_checksum = b_zones.payload_checksum;
+        b_proof.cards = {
+            {.native_location = 0, .native_index = 0, .card_info_instance = bow_instance, .effects = {bow_effect}},
+            {.native_location = 0, .native_index = 1, .card_info_instance = bow_instance, .effects = {bow_effect}},
+            proof.cards[1], proof.cards[2]
+        };
+        b_proof.cards[1].effects[0].used_once = 0;
+        b_proof.payload_checksum = exact_player_qualification_payload_checksum(b_proof);
+        require(b_zones.payload_checksum == "D647A9E15DFC2255" && b_proof.payload_checksum == "526FF9469A5AF087",
+                "schema2 retains checksum field order and hashes the actual positional source used state");
+        const auto b_json = serialize_exact_player_qualification_checkpoint(b_proof);
+        const auto b_parsed = parse_exact_player_qualification_checkpoint(b_json, error);
+        require(b_parsed && b_parsed->cards == b_proof.cards
+                    && b_parsed->cards[0].effects[0].used_once == 1
+                    && b_parsed->cards[1].effects[0].used_once == 0
+                    && validate_exact_player_qualification_binding(*b_parsed, b_zones, error),
+                "same-name B Bows preserve distinct source used1/used0 at exact native HAND indexes");
+        auto unused_b = b_proof;
+        unused_b.cards[0].effects[0].used_once = 0;
+        unused_b.payload_checksum = exact_player_qualification_payload_checksum(unused_b);
+        require(!rejected(unused_b) && validate_exact_player_qualification_binding(unused_b, b_zones, error)
+                    && unused_b.payload_checksum == "95C6B1A3688D6A0E"
+                    && unused_b.payload_checksum != b_proof.payload_checksum,
+                "B source0 is accepted and hashed separately without normalizing saved source1");
+        auto swapped_b = b_proof;
+        std::swap(swapped_b.cards[0].effects[0].used_once, swapped_b.cards[1].effects[0].used_once);
+        require(exact_player_qualification_payload_checksum(swapped_b) == "B99D09FEDBBC4E39"
+                    && exact_player_qualification_payload_checksum(swapped_b) != b_proof.payload_checksum
+                    && !validate_exact_player_qualification_checkpoint(swapped_b, error),
+                "swapping same-name source used values changes positional proof checksum");
+        require(!parse_exact_player_qualification_checkpoint(replace_once(b_json,
+                    "\"card0Effect0UsedOnce\": 1", "\"card0Effect0UsedOnce\": 0"), error)
+                    && error.find("checksum") != std::string::npos,
+                "source used tampering cannot silently become source0");
+        for (int mutation{}; mutation < 17; ++mutation)
+        {
+            auto invalid = b_proof;
+            switch (mutation)
+            {
+            case 0: invalid.schema_version = ExactPlayerQualificationBaselineSchemaVersion; break;
+            case 1: invalid.qualification_policy = ExactPlayerQualificationPolicy; break;
+            case 2: invalid.schema_version = 3; break;
+            case 3: invalid.qualification_policy = "flags-baseline-bow-once-v3"; break;
+            case 4: invalid.cards[0].effects[0].used_once = 2; break;
+            case 5: invalid.cards[0].effects[0].flags.clear(); break;
+            case 6: invalid.cards[0].effects[0].flags = {0,6}; break;
+            case 7: invalid.cards[0].effects[0].factory_key += ".u1"; break;
+            case 8: invalid.cards[0].card_info_instance = "(CardInfo=(Tag=\"sakuraBow\"),upgradeLevel=1)"; break;
+            case 9: invalid.cards[0].effects[0].ordinal = 1; break;
+            case 10: invalid.cards[0].effects[0].type = 3; break;
+            case 11: invalid.cards[0].effects[0].profile_id = "phase39-default-v1:player.aurora.sakura.sakurabow"; break;
+            case 12: invalid.cards[0].effects.push_back(invalid.cards[0].effects[0]); break;
+            case 13: invalid.cards[1].native_index = 0; break;
+            case 14: invalid.cards[0].card_info_instance = "(CardInfo=(Tag=\"Quarter\"))"; break;
+            case 15: invalid.cards[2].effects[0].used_once = 1; break;
+            case 16: invalid.cards[2].effects[0].flags = {0}; break;
+            }
+            require(rejected(invalid), "B rejects cross-policy schemas, unsupported Bow identity, dynamic flags and non-Bow used1");
+        }
+        auto a_bow = b_proof;
+        a_bow.schema_version = ExactPlayerQualificationBaselineSchemaVersion;
+        a_bow.qualification_policy = ExactPlayerQualificationPolicy;
+        a_bow.cards[0].effects[0].used_once = 0;
+        require(rejected(a_bow), "A still refuses even unused base Bow after B profile is added");
+        auto no_bow_b = proof;
+        no_bow_b.schema_version = ExactPlayerQualificationBowOnceSchemaVersion;
+        no_bow_b.qualification_policy = ExactPlayerQualificationBowOncePolicy;
+        auto plain_b_layout = qualified_zones;
+        plain_b_layout.schema_version = ExactPlayerZonesBowOnceQualificationSchemaVersion;
+        plain_b_layout.qualification_policy = ExactPlayerQualificationBowOncePolicy;
+        plain_b_layout.payload_checksum = exact_player_zones_payload_checksum(plain_b_layout);
+        no_bow_b.layout_payload_checksum = plain_b_layout.payload_checksum;
+        no_bow_b.payload_checksum = exact_player_qualification_payload_checksum(no_bow_b);
+        require(validate_exact_player_qualification_binding(no_bow_b, plain_b_layout, error)
+                    && validate_exact_player_qualification_binding(proof, qualified_zones, error),
+                "B fruit-only captures and unchanged explicit A captures remain separately supported");
+
+        // Keep the old FIELD card whitelist: Bow is in HAND, fruits in FIELD.
+        auto b_trash = qualified_trash;
+        b_trash.schema_version = ExactPlayerTrashBowOnceQualificationSchemaVersion;
+        b_trash.qualification_policy = ExactPlayerQualificationBowOncePolicy;
+        b_trash.player_hand = b_zones.player_hand;
+        b_trash.payload_checksum = exact_player_trash_payload_checksum(b_trash);
+        auto b_trash_proof = b_proof;
+        b_trash_proof.layout_kind = b_trash.kind;
+        b_trash_proof.layout_payload_checksum = b_trash.payload_checksum;
+        b_trash_proof.cards.push_back(trash_proof.cards.back());
+        b_trash_proof.payload_checksum = exact_player_qualification_payload_checksum(b_trash_proof);
+        require(validate_exact_player_qualification_binding(b_trash_proof, b_trash, error), "B T8 binds HAND Bows and unchanged native TRASH");
+        auto b_field = qualified_field;
+        b_field.schema_version = ExactPlayerFieldBowOnceQualificationSchemaVersion;
+        b_field.qualification_policy = ExactPlayerQualificationBowOncePolicy;
+        b_field.player_hand = b_zones.player_hand;
+        b_field.payload_checksum = exact_player_field_payload_checksum(b_field);
+        auto b_field_proof = b_trash_proof;
+        b_field_proof.layout_kind = b_field.kind;
+        b_field_proof.layout_payload_checksum = b_field.payload_checksum;
+        b_field_proof.cards.push_back(field_proof.cards[field_proof.cards.size()-2]);
+        b_field_proof.cards.push_back(field_proof.cards.back());
+        b_field_proof.payload_checksum = exact_player_qualification_payload_checksum(b_field_proof);
+        require(validate_exact_player_qualification_binding(b_field_proof, b_field, error), "B F11 binds HAND Bows and unchanged FIELD destinations");
+        auto wrong_b_slot = b_field_proof;
+        wrong_b_slot.cards.back().index = 2;
+        require(bind_rejected(wrong_b_slot, b_field), "B qualification retains exact FIELD row/index binding");
+        auto bowed_field = b_field;
+        bowed_field.player_field = "(" + bow_instance + "," + lemon_instance + ")";
+        require(!parse_exact_player_field_checkpoint(serialize_exact_player_field_checkpoint(bowed_field), error),
+                "new Bow qualification does not broaden the existing plain-fruit FIELD reconstruction range");
     }
 }
 
@@ -1823,9 +2038,17 @@ int main()
     require(!parse_exact_player_hand_health_checkpoint(missing_hand3_counters, error),
             "HAND3 still requires aligned counter coverage from schema 2");
 
-    require(ExactPlayerZonesCheckpoint{}.schema_version == 6
-                && ExactPlayerTrashCheckpoint{}.schema_version == 7
-                && ExactPlayerFieldCheckpoint{}.schema_version == 10
+    require(ExactPlayerZonesCheckpoint{}.schema_version == 7
+                && ExactPlayerTrashCheckpoint{}.schema_version == 8
+                && ExactPlayerFieldCheckpoint{}.schema_version == 11
+                && ExactPlayerQualificationCheckpoint{}.schema_version == 2
+                && ExactPlayerQualificationBaselineSchemaVersion == 1
+                && ExactPlayerZonesQualificationSchemaVersion == 6
+                && ExactPlayerTrashQualificationSchemaVersion == 7
+                && ExactPlayerFieldQualificationSchemaVersion == 10
+                && ExactPlayerZonesBowOnceQualificationSchemaVersion == 7
+                && ExactPlayerTrashBowOnceQualificationSchemaVersion == 8
+                && ExactPlayerFieldBowOnceQualificationSchemaVersion == 11
                 && ExactPlayerZonesBaseHealthSchemaVersion == 5
                 && ExactPlayerTrashBaseHealthSchemaVersion == 6
                 && ExactPlayerFieldBaseHealthSchemaVersion == 9

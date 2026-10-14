@@ -1,6 +1,18 @@
 # QuantumCheckpoint 当前工作进度（临时续接记录）
 
-> 2026-10-15 当前沿“小关重开＋受限玩家恢复”持续推进，本轮额度收尾阈值改为剩余30%。Phase39 A 已完成下述实机范围，root 继续 Phase40 B，不因本条立即停止。下方旧阶段均是当时记录，不代表当前部署／停机状态。
+> 2026-10-15 当前沿“小关重开＋受限玩家恢复”持续推进，本轮额度收尾阈值为剩余30%。Phase40 基础长弓切片已完成下述实机范围、冻结复验和独立清理；接着处理角色能力状态边界。下方旧阶段均是当时记录，不代表后续部署／停机状态。
+
+## 2026-10-15 第四十阶段：基础长弓 ONCE 原生回放
+
+当前 v0.41.0，生产 OFF 4/4 CTest，DLL `455F5575B3DC86A6B89E6A838511A144764496725368BF706F6344C7484AEE5D`，实际编译 Mod 源码 `78D2EB1EBFA7C38AAF5A2449C64E7719CFD094BB6E3765ED75EF9DF8182F1D96`。新 Z7/T8/F11＋Q2 支持基础长弓 used0/1，已用源只调用一次受守卫的 native true，未用源不写。资格策略 B 不等于重编程路线 B；重编程和敌人精确恢复仍搁置。
+
+六组新恢复原25项均通过：单张未用、单张已用、同名双张混合、双张均已用、普通苹果 FIELD 共存、长弓 TRASH；回放次数0/1/1/2/1/1。三类必需资格证明缺失／坏 checksum／A policy 错配实机拒绝，纯 Route C passed。三个 fresh-process Q1 兼容案例与原用户 legacy 回归通过，原旧档资格仍unknown。御币自然刷新对照和恢复后普通操作端点记录完成；未宣称完整点击区间无动作、UI／私有历史、动态ONCE、升级长弓或长弓FIELD支持。详见[第四十阶段](phase-40-bow-once-replay.md)。
+
+保留三次旧进程 A 兼容24/25失败，唯一必需差异为characterResourceEqual（abilityOk False→True）。当前与A构建中的充能恢复函数一致，不核验该资格位；同DLL正常重启后这三组25/25。该bool与0/6并存，不能简单认定满充因果。两次技能数组为空的自然源尝试也独立保留，不能当used0/1正例。
+
+证据根 `QuantumProtoclMod.runtime-evidence/20261015-bow-once-replay`。原用户主checksum `81095982711C71E2`；独立fresh backup含17个checkpoint、4个SaveGames和旧A DLL。69个工具文件冻结、31项复验通过（含三个原24/25失败的忠实复算）；最终17个checkpoint和4个SaveGames逐字节还原，新455F DLL保留，游戏正常关闭。入口为 `validation-summary.json`、`phase40-frozen-revalidation-20261014T211550805192Z/revalidation-index.json`、`session-cleanup.json`；提交推送另记 `commit-and-push.json`。不得修改r39/r40冻结原始文件或继续往已固定case目录加文件。
+
+后续先读 `runtime/phase41-ability-readiness-investigation.md` 的只读结论，再决定最小保守门禁；所有新证据使用独立Phase41目录和fresh backup，不复用本轮session。不要直接写许可bool、调用未审阅setter或清空能力卡。只读静态证据表明getter读取角色槽原生allow字节，不能把它当成“当前充能满”或“槽中有能力牌”的简单计算。
 
 ## 2026-10-15 第三十九阶段 A：资格默认来源门禁里程碑完成
 

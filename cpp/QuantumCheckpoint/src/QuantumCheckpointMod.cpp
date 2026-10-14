@@ -4,6 +4,7 @@
 #include "CheckpointSchema.hpp"
 #include "CheckpointPersistence.hpp"
 #include "EffectQualificationPolicy.hpp"
+#include "BowOnceNativeSignature.hpp"
 #include "PlayerRestorePlan.hpp"
 #include "PlayerAttackState.hpp"
 #include "PlayerHealthState.hpp"
@@ -99,6 +100,20 @@ namespace QuantumCheckpoint
             AwaitingVerification,
             AwaitingPostRestoreStability,
         };
+
+        enum class PlayerOnceReplayPhase { NotApplicable, NotAttempted, Attempting, Completed, Failed };
+        auto player_once_replay_phase_name(PlayerOnceReplayPhase phase) -> std::string_view
+        {
+            switch (phase)
+            {
+            case PlayerOnceReplayPhase::NotApplicable: return "not-applicable";
+            case PlayerOnceReplayPhase::NotAttempted: return "not-attempted";
+            case PlayerOnceReplayPhase::Attempting: return "attempting";
+            case PlayerOnceReplayPhase::Completed: return "completed";
+            case PlayerOnceReplayPhase::Failed: return "failed";
+            }
+            return "invalid";
+        }
 
         auto route_c_restore_phase_name(RouteCRestorePhase phase) -> std::string_view
         {
@@ -295,6 +310,8 @@ namespace QuantumCheckpoint
             std::string player_qualification_reason{};
             std::string player_qualification_saved_proof{"not-applicable-no-player-layout"};
             std::string player_qualification_policy{};
+            PlayerOnceReplayPhase player_once_replay_phase{PlayerOnceReplayPhase::NotApplicable};
+            std::size_t player_once_replay_count{}, player_once_replay_target_count{};
             std::vector<PendingNativeRestoreMove> move_effect_suppressions{};
             std::size_t move_effects_suppressed{}, move_effects_restored{};
             std::vector<PendingNativeTrashMove> move_overlay_targets{};
@@ -4282,14 +4299,18 @@ namespace QuantumCheckpoint
 
         struct PlayerQualificationObservation
         {
+            UObject* actor{};
             ExactPlayerQualificationCard saved{};
             NativeCardQualificationObservation native{};
             auto operator==(const PlayerQualificationObservation&) const -> bool = default;
         };
 
-        auto observe_player_qualification(const RouteCBattleObjects& objects)
+        auto observe_player_qualification(const RouteCBattleObjects& objects,
+                                           std::string_view policy = ExactPlayerQualificationPolicy)
             -> std::vector<PlayerQualificationObservation>
         {
+            if (!qualification::is_supported_qualification_policy(policy))
+                throw std::runtime_error{"unsupported qualification observation policy"};
             const auto collect = [&]() {
                 validate_player_effect_membership(objects);
                 const auto api = validated_native_move_card_on_field_api(objects.card_engine);
@@ -4301,6 +4322,7 @@ namespace QuantumCheckpoint
                     for (std::size_t index{}; index < cards.size(); ++index)
                     {
                         PlayerQualificationObservation value{};
+                        value.actor = cards[index].card;
                         value.native = observe_native_card_qualification(objects.card_engine, cards[index].card);
                         if (value.native.location != location || value.native.membership.state != cards[index].state)
                             throw std::runtime_error{"unavailable: qualification card moved during observation"};
@@ -4321,14 +4343,14 @@ namespace QuantumCheckpoint
                         // so even unknown dynamic ONCE additions fail explicitly.
                         for (const auto& qualification : value.native.values)
                         {
-                            if (qualification.flags_mask & 1)
+                            if (policy == ExactPlayerQualificationPolicy && (qualification.flags_mask & 1))
                                 throw std::runtime_error{"unsupported-once: ONCE flag is outside flags-baseline-v1"};
-                            if (qualification.used_once != 0)
+                            if (policy == ExactPlayerQualificationPolicy && qualification.used_once != 0)
                                 throw std::runtime_error{"unsupported-used: nonzero used state is outside flags-baseline-v1"};
                         }
                         std::string error{};
                         const auto identity = exact_card_identity_key_from_instance(saved.card_info_instance, error);
-                        const auto count = identity ? qualification::qualification_card_effect_count(*identity) : std::nullopt;
+                        const auto count = identity ? qualification::qualification_card_effect_count(*identity, policy) : std::nullopt;
                         if (!count || *count != value.native.membership.descriptors.size())
                             throw std::runtime_error{"unsupported-profile: card upgrade or effect count has no reviewed default profile"};
                         for (std::size_t ordinal{}; ordinal < *count; ++ordinal)
@@ -4336,12 +4358,27 @@ namespace QuantumCheckpoint
                             const auto& effect = value.native.membership.descriptors[ordinal];
                             const auto& qualification = value.native.values[ordinal];
                             const auto profile = qualification::lookup_effect_qualification_profile(
-                                *identity, ordinal, effect.factory_key, effect.tag, effect.type);
+                                *identity, ordinal, effect.factory_key, effect.tag, effect.type, policy);
                             if (!profile)
                                 throw std::runtime_error{"unsupported-profile: ordered factory/tag/type has no reviewed default profile"};
+                            if ((qualification.flags_mask & 1) && !profile->permits_used_once_replay)
+                                throw std::runtime_error{"unsupported-once: this profile has no ONCE replay coverage"};
+                            if (qualification.used_once != 0 && !profile->permits_used_once_replay)
+                                throw std::runtime_error{"unsupported-used: this profile requires zero used state"};
                             if (!std::equal(profile->flags.begin(), profile->flags.end(),
                                     qualification.flags.begin(), qualification.flags.end()))
                                 throw std::runtime_error{"flags-profile-mismatch: current flags differ from reviewed constructor defaults"};
+                            if (profile->permits_used_once_replay)
+                            {
+                                // Bow's only reviewed derived parameter is fixed damage4.
+                                // Match its immutable selected definition even in FIELD.
+                                (void)defined_player_card_statistics(objects.game_instance, cards[index].card, true);
+                                const auto base = reinterpret_cast<std::uintptr_t>(GetModuleHandleW(L"Quantum-Win64-Shipping.exe"));
+                                if (!base || !address_is_readable(effect.object, 0x198)
+                                    || read_native_value<std::uintptr_t>(effect.object, 0) != base + bow_once::VtableRva
+                                    || read_native_value<std::int32_t>(effect.object, 0x190) != 4)
+                                    throw std::runtime_error{"unsupported-profile: base Bow vtable or fixed damage changed"};
+                            }
                             saved.effects.push_back({static_cast<std::int32_t>(ordinal), effect.factory_key,
                                 effect.tag, effect.type, qualification.flags, qualification.used_once, std::string{profile->id}});
                         }
@@ -4377,8 +4414,12 @@ namespace QuantumCheckpoint
                     throw std::runtime_error{"qualification verification requested during controlled effect suppression"};
                 if (!native_restore_actions_settled(validated_native_move_card_api(objects.card_engine).engine_state))
                     throw std::runtime_error{"qualification verification requires a settled native action queue"};
-                const auto observed = observe_player_qualification(objects);
+                const auto observed = observe_player_qualification(objects, restore.exact_player_qualification->qualification_policy);
                 const auto& saved = restore.exact_player_qualification->cards;
+                auto newborn = saved;
+                if (restore.exact_player_qualification->qualification_policy == ExactPlayerQualificationBowOncePolicy)
+                    for (auto& card : newborn)
+                        for (auto& effect : card.effects) effect.used_once = 0;
                 if (observed.size() != saved.size())
                     throw std::runtime_error{"qualification card count differs from saved proof"};
                 if (startup)
@@ -4390,8 +4431,8 @@ namespace QuantumCheckpoint
                     {
                         std::size_t index{};
                         for (; index < saved.size(); ++index)
-                            if (!matched[index] && live.saved.card_info_instance == saved[index].card_info_instance
-                                && live.saved.effects == saved[index].effects) break;
+                            if (!matched[index] && live.saved.card_info_instance == newborn[index].card_info_instance
+                                && live.saved.effects == newborn[index].effects) break;
                         if (index == saved.size())
                             throw std::runtime_error{"newborn qualification does not match a saved card profile"};
                         matched[index] = true;
@@ -4401,13 +4442,19 @@ namespace QuantumCheckpoint
                 }
                 else
                 {
+                    const bool bow_policy = restore.exact_player_qualification->qualification_policy == ExactPlayerQualificationBowOncePolicy;
+                    if (bow_policy && restore.player_once_replay_phase != PlayerOnceReplayPhase::Completed)
+                        throw std::runtime_error{"final qualification cannot pass before the single replay batch completes"};
                     for (std::size_t index{}; index < saved.size(); ++index)
                         if (observed[index].saved != saved[index])
                             throw std::runtime_error{"final qualification identity, order, flags or used state differs from saved proof"};
-                    if (restore.player_qualification_status != "verified-profile-flags-and-zero-used")
+                    const auto status = bow_policy ? "verified-profile-flags-and-bow-once-used" : "verified-profile-flags-and-zero-used";
+                    if (restore.player_qualification_status != status)
                         append_route_c_trace("restore.player-qualification.final-verified");
-                    restore.player_qualification_status = "verified-profile-flags-and-zero-used";
-                    restore.player_qualification_reason = "saved D/H/T/F identity and reviewed profile flags match; used state is zero; other private state/history is not covered";
+                    restore.player_qualification_status = status;
+                    restore.player_qualification_reason = bow_policy
+                        ? "saved D/H/T/F identity, reviewed flags and base Bow used state match; UI/private history and accepted-click dispatch are not proven"
+                        : "saved D/H/T/F identity and reviewed profile flags match; used state is zero; other private state/history is not covered";
                 }
             }
             catch (const std::exception& error)
@@ -4877,7 +4924,7 @@ namespace QuantumCheckpoint
             {
                 if (!player_effect_membership_rejection.empty())
                     throw std::runtime_error{player_effect_membership_rejection};
-                player_qualification_observation = observe_player_qualification(objects);
+                player_qualification_observation = observe_player_qualification(objects, ExactPlayerQualificationBowOncePolicy);
                 append_route_c_trace("capture.player-qualification.profile-baseline-verified");
             }
             catch (const std::exception& error)
@@ -4941,7 +4988,7 @@ namespace QuantumCheckpoint
                 }
                 append_route_c_trace("capture.exact-player-zones.controllers.found");
                 ExactPlayerZonesCheckpoint exact{};
-                exact.qualification_policy = ExactPlayerQualificationPolicy;
+                exact.qualification_policy = ExactPlayerQualificationBowOncePolicy;
                 exact.captured_at_utc = checkpoint.captured_at_utc;
                 exact.route_c_payload_checksum = checkpoint.payload_checksum;
                 exact.game_executable_sha256 = checkpoint.game_executable_sha256;
@@ -5002,7 +5049,7 @@ namespace QuantumCheckpoint
                 }
                 append_route_c_trace("capture.exact-player-trash.controllers.found");
                 ExactPlayerTrashCheckpoint exact{};
-                exact.qualification_policy = ExactPlayerQualificationPolicy;
+                exact.qualification_policy = ExactPlayerQualificationBowOncePolicy;
                 exact.captured_at_utc = checkpoint.captured_at_utc;
                 exact.route_c_payload_checksum = checkpoint.payload_checksum;
                 exact.game_executable_sha256 = checkpoint.game_executable_sha256;
@@ -5123,7 +5170,7 @@ namespace QuantumCheckpoint
                     });
 
                 ExactPlayerFieldCheckpoint exact{};
-                exact.qualification_policy = ExactPlayerQualificationPolicy;
+                exact.qualification_policy = ExactPlayerQualificationBowOncePolicy;
                 exact.captured_at_utc = checkpoint.captured_at_utc;
                 exact.route_c_payload_checksum = checkpoint.payload_checksum;
                 exact.game_executable_sha256 = checkpoint.game_executable_sha256;
@@ -5324,7 +5371,7 @@ namespace QuantumCheckpoint
                     proof.game_executable_size = checkpoint.game_executable_size;
                     proof.source_level_name = checkpoint.source_level_name;
                     proof.wave_index = checkpoint.wave_index;
-                    proof.qualification_policy = ExactPlayerQualificationPolicy;
+                    proof.qualification_policy = ExactPlayerQualificationBowOncePolicy;
                     for (const auto& card : *player_qualification_observation) proof.cards.push_back(card.saved);
                     const auto bind = [&](const auto& layout) {
                         proof.layout_kind = layout.kind;
@@ -5370,7 +5417,7 @@ namespace QuantumCheckpoint
                     throw std::runtime_error{"automatic capture exceeded its fixed deadline before file replacement"};
             }
             if (exact_player_qualification
-                && observe_player_qualification(final_objects) != *player_qualification_observation)
+                && observe_player_qualification(final_objects, exact_player_qualification->qualification_policy) != *player_qualification_observation)
                 throw std::runtime_error{"player qualification changed before publication; checkpoint files were not replaced"};
             const auto final_wave = parse_int32(required_text(export_property_text(objects.spawner, STR("currentWaveIndex")), "currentWaveIndex"));
             if (!final_wave || *final_wave != checkpoint.wave_index
@@ -5437,7 +5484,7 @@ namespace QuantumCheckpoint
                 }
                 catch (const std::exception& error)
                 {
-                    player_qualification_rejection = "required Q1 publication failed: " + std::string{error.what()};
+                    player_qualification_rejection = "required qualification publication failed: " + std::string{error.what()};
                     discard_player_supplements();
                     append_route_c_trace_failure("capture.player-qualification.write.failed", error.what());
                 }
@@ -5539,10 +5586,10 @@ namespace QuantumCheckpoint
             }
             append_route_c_trace_failure("capture.coverage",
                 std::string{"semanticRestart=saved playerQualification="}
-                    + (player_layout_published ? "profile-flags-and-zero-used" : "unsupported-no-player-layout")
+                    + (player_layout_published ? "profile-flags-and-bow-once-used" : "unsupported-no-player-layout")
                     + " fullPlayerExactRestorationProven=false reason=" + player_qualification_rejection);
             Output::send<LogLevel::Default>(STR("[QuantumCheckpoint] Saved coverage: semantic restart; player qualification={}; full player state is not proven. {}\n"),
-                player_layout_published ? STR("profile-flags-and-zero-used") : STR("unsupported-no-player-layout"),
+                player_layout_published ? STR("profile-flags-and-bow-once-used") : STR("unsupported-no-player-layout"),
                 to_wstring(player_qualification_rejection));
             return path;
         }
@@ -5681,7 +5728,12 @@ namespace QuantumCheckpoint
                    << (restore.exact_player_qualification ? restore.exact_player_qualification->payload_checksum : "") << "\",\n"
                    << "  \"playerQualificationLayoutChecksum\": \""
                    << (restore.exact_player_qualification ? restore.exact_player_qualification->layout_payload_checksum : "") << "\",\n"
-                   << "  \"playerOnceReplayCount\": 0,\n"
+                   << "  \"playerQualificationProofSchema\": "
+                   << (restore.exact_player_qualification ? restore.exact_player_qualification->schema_version : 0) << ",\n"
+                   << "  \"playerOnceReplayStatus\": \"" << player_once_replay_phase_name(restore.player_once_replay_phase) << "\",\n"
+                   << "  \"playerOnceReplayTargetCount\": " << restore.player_once_replay_target_count << ",\n"
+                   << "  \"playerOnceReplayCount\": " << restore.player_once_replay_count << ",\n"
+                   << "  \"playerQualificationUiStatus\": \"not-proven-native-only\",\n"
                    << "  \"fullPlayerExactRestorationProven\": false,\n"
                    << "  \"playerOffFieldStatisticsRequired\": "
                    << (restore.off_field_statistics_covered ? "true" : "false") << ",\n"
@@ -6649,6 +6701,216 @@ namespace QuantumCheckpoint
             return result;
         }
 
+        struct PlayerOnceReplaySnapshot
+        {
+            std::vector<PlayerQualificationObservation> qualifications{};
+            std::vector<std::string> gameplay{};
+            std::string globals{}, queue{};
+            auto operator==(const PlayerOnceReplaySnapshot&) const -> bool = default;
+        };
+
+        auto require_player_once_replay_layers(const PendingRouteCRestore& restore) -> void
+        {
+            if (restore.phase != RouteCRestorePhase::AwaitingVerification
+                || !restore.player_qualification_startup_checked
+                || restore.player_qualification_status != "verified-newborn-baseline"
+                || restore.player_effect_membership_status != "verified-native-definition-membership"
+                || restore.zone_base_health_status != "verified-native-base-health"
+                || (restore.exact_spawn_plan && restore.exact_spawn_plan_status != "verified")
+                || (restore.exact_player_zones && restore.exact_player_zones_status != "verified")
+                || (restore.exact_player_trash && restore.exact_player_trash_status != "verified")
+                || (restore.exact_player_field && (restore.exact_player_field_status != "verified-position-health"
+                    || restore.field_attack_status != "verified-native-attack"
+                    || restore.field_health_status != "verified-native-health"
+                    || restore.field_counter_status != "verified-native-counters"))
+                || (restore.exact_player_hand_health && (restore.hand_health_status != "verified-native-health"
+                    || restore.hand_counter_status != "verified-native-counters"))
+                || (restore.exact_turn_progress && restore.exact_turn_progress_status != "verified")
+                || (restore.exact_character_charge && restore.exact_character_charge_status != "verified")
+                || !restore.move_effect_suppressions.empty()
+                || std::any_of(restore.exact_player_field_targets.begin(), restore.exact_player_field_targets.end(),
+                    [](const auto& target) { return target.effects_suppressed; }))
+                throw std::runtime_error{"ONCE replay requires every accepted layout/numeric layer verified and all suppression released"};
+        }
+
+        auto read_player_once_replay_snapshot(const RouteCBattleObjects& objects) -> PlayerOnceReplaySnapshot
+        {
+            PlayerOnceReplaySnapshot result{};
+            const auto api = validated_native_move_card_api(objects.card_engine);
+            if (!native_restore_actions_settled(api.engine_state, &result.queue))
+                throw std::runtime_error{"ONCE replay snapshot requires a settled native queue"};
+            result.qualifications = observe_player_qualification(objects, ExactPlayerQualificationBowOncePolicy);
+            for (const auto& card : result.qualifications)
+                result.gameplay.push_back(overlay_gameplay_observation(card.actor));
+            const auto append = [&](const auto& value) {
+                std::ostringstream text{}; text << value;
+                const auto string = text.str();
+                result.globals += std::to_string(string.size()) + ":" + string;
+            };
+            const auto turn = read_validated_battle_turn(objects.card_engine, objects.spawner);
+            const auto zones = find_route_c_player_zone_objects(objects.card_engine->GetWorld());
+            if (!zones.deck || !objects.character_card_slot)
+                throw std::runtime_error{"ONCE replay scalar observation lacks deck or character slot"};
+            const auto draw = read_validated_draw_delay(zones.deck, objects.card_engine);
+            append(turn.engine_state); append(turn.native_turn); append(turn.getter_turn); append(turn.wave_alert_counter);
+            append(draw.engine_state); append(draw.deck_state); append(draw.deck_state_controller);
+            append(draw.base); append(draw.adjustment); append(draw.computed); append(draw.getter);
+            for (const auto getter : {STR("getCurrentHealth"), STR("getMaxHealth")})
+                append(required_getter_text(objects.card_engine, getter));
+            for (const auto getter : {STR("getCurrentCharacterCardCharge"), STR("getAmountPerCharacterCard"), STR("isCharacterAbilityOk")})
+                append(required_getter_text(objects.character_card_slot, getter));
+            append(required_text(export_property_text(zones.deck, STR("currentCanClickToDraw")), "draw cache"));
+            append(required_text(export_property_text(objects.spawner, STR("currentWaveIndex")), "wave index"));
+            append(required_text(export_property_text(objects.spawner, STR("autoSpawn")), "auto spawn"));
+            std::string final_queue{};
+            if (!native_restore_actions_settled(api.engine_state, &final_queue) || final_queue != result.queue
+                || observe_player_qualification(objects, ExactPlayerQualificationBowOncePolicy) != result.qualifications)
+                throw std::runtime_error{"ONCE replay snapshot changed during qualification/scalar reads"};
+            return result;
+        }
+
+        using SetEffectUsedTrue = void(__fastcall*)(void*, bool);
+        auto validated_bow_once_setter(const PlayerQualificationObservation& card, std::size_t ordinal) -> SetEffectUsedTrue
+        {
+            if (GetCurrentThreadId() != g_game_thread_id.load(std::memory_order_acquire)
+                || !fingerprint_matches_supported_game(executable_fingerprint())
+                || ordinal != 0 || card.saved.effects.size() != 1 || card.native.values.size() != 1)
+                throw std::runtime_error{"ONCE replay target is outside the exact base Bow contract"};
+            std::string error{};
+            const auto key = exact_card_identity_key_from_instance(card.saved.card_info_instance, error);
+            const auto& saved = card.saved.effects[ordinal];
+            const auto profile = key ? qualification::lookup_effect_qualification_profile(*key, ordinal,
+                saved.factory_key, saved.tag, saved.type, ExactPlayerQualificationBowOncePolicy) : std::nullopt;
+            const auto& effect = card.native.membership.descriptors.at(ordinal);
+            const auto base = reinterpret_cast<std::uintptr_t>(GetModuleHandleW(L"Quantum-Win64-Shipping.exe"));
+            const auto* entry = reinterpret_cast<const std::uint8_t*>(base + bow_once::SetterRva);
+            if (!profile || !profile->permits_used_once_replay || saved.used_once != 0
+                || saved.flags != std::vector<std::uint8_t>{0} || card.native.values[ordinal].used_once != 0
+                || !base || !address_is_readable(entry, bow_once::SetterBytes.size())
+                || !std::equal(bow_once::SetterBytes.begin(), bow_once::SetterBytes.end(), entry)
+                || !address_is_readable(effect.object, 0x198)
+                || !address_is_writable(static_cast<const std::byte*>(effect.object) + 0x91, 1)
+                || read_native_value<std::uint8_t>(effect.object, 0x91) != 0
+                || read_native_value<std::uintptr_t>(effect.object, 0) != base + bow_once::VtableRva
+                || read_native_value<std::int32_t>(effect.object, 0x190) != 4)
+                throw std::runtime_error{"ONCE replay signature, flags, fresh used0 or Bow implementation guard failed"};
+            return reinterpret_cast<SetEffectUsedTrue>(base + bow_once::SetterRva);
+        }
+
+        auto advance_player_once_replay(PendingRouteCRestore& restore, const RouteCBattleObjects& objects) -> bool
+        {
+            if (!restore.exact_player_qualification
+                || restore.exact_player_qualification->qualification_policy != ExactPlayerQualificationBowOncePolicy)
+                return true;
+            if (restore.player_once_replay_phase == PlayerOnceReplayPhase::Completed) return true;
+            if (restore.player_once_replay_phase != PlayerOnceReplayPhase::NotAttempted)
+                throw std::runtime_error{"ONCE replay is never retried after an attempt or partial failure"};
+            try
+            {
+                require_player_once_replay_layers(restore);
+                const auto api = validated_native_move_card_api(objects.card_engine);
+                if (!native_restore_actions_settled(api.engine_state)) return false; // Fixed restore deadline remains in force.
+                if (!ensure_route_c_capture_delete_listener())
+                    throw std::runtime_error{"ONCE replay lifetime listener could not be initialized"};
+                const auto delete_epoch = g_route_c_capture_delete_listener.epoch.load(std::memory_order_seq_cst);
+                const auto registered = registered_overlay_objects();
+                auto* world = reinterpret_cast<UObject*>(objects.card_engine->GetWorld());
+                const auto world_identity = pin_route_c_capture_object(world, nullptr, registered);
+                const auto engine_identity = pin_route_c_capture_object(objects.card_engine, world, registered);
+                const auto spawner_identity = pin_route_c_capture_object(objects.spawner, world, registered);
+                if (!world_identity.weak_verified || !engine_identity.weak_verified)
+                    throw std::runtime_error{"ONCE replay has no verified world/engine weak identity"};
+                const auto guard = [&] {
+                    const auto& listener = g_route_c_capture_delete_listener;
+                    if (!listener.ready.load(std::memory_order_seq_cst) || listener.shutdown.load(std::memory_order_seq_cst)
+                        || listener.failed.load(std::memory_order_seq_cst) || !listener.registered.load(std::memory_order_seq_cst)
+                        || listener.epoch.load(std::memory_order_seq_cst) != delete_epoch
+                        || restore.intercepted_world != world || restore.intercepted_spawner != objects.spawner
+                        || !same_route_c_capture_object(world_identity, world, nullptr, registered)
+                        || !same_route_c_capture_object(engine_identity, objects.card_engine, world, registered)
+                        || !same_route_c_capture_object(spawner_identity, objects.spawner, world, registered)
+                        || required_text(export_property_text(objects.card_engine, STR("currentGameState")), "game state") != "OPEN"
+                        || required_text(export_property_text(objects.card_engine, STR("mActiveCardSelectionPrompt")), "selection prompt") != "None"
+                        || required_text(export_property_text(objects.card_engine, STR("mActiveCardPlacementPrompt")), "placement prompt") != "None")
+                        throw std::runtime_error{"ONCE replay world/lifetime/OPEN/prompt guard changed"};
+                };
+                guard();
+                auto expected = read_player_once_replay_snapshot(objects);
+                if (read_player_once_replay_snapshot(objects) != expected)
+                    throw std::runtime_error{"ONCE replay whole-player baseline is not stable"};
+                const auto& source = restore.exact_player_qualification->cards;
+                if (source.size() != expected.qualifications.size())
+                    throw std::runtime_error{"ONCE replay whole-player source population differs"};
+                std::vector<std::pair<std::size_t, std::size_t>> targets{};
+                std::vector<RouteCCaptureObjectIdentity> actors{};
+                for (std::size_t ci{}; ci < source.size(); ++ci)
+                {
+                    auto newborn = source[ci];
+                    for (auto& effect : newborn.effects) effect.used_once = 0;
+                    if (expected.qualifications[ci].saved != newborn)
+                        throw std::runtime_error{"ONCE replay final location/CardInfo/member binding or newborn used0 differs"};
+                    actors.push_back(pin_route_c_capture_object(expected.qualifications[ci].actor, world, registered));
+                    for (std::size_t ei{}; ei < source[ci].effects.size(); ++ei)
+                        if (source[ci].effects[ei].used_once == 1)
+                        {
+                            (void)validated_bow_once_setter(expected.qualifications[ci], ei);
+                            targets.emplace_back(ci, ei);
+                        }
+                }
+                restore.player_once_replay_target_count = targets.size();
+                const auto bound_read = [&] {
+                    guard();
+                    for (std::size_t i{}; i < actors.size(); ++i)
+                        if (!same_route_c_capture_object(actors[i], expected.qualifications[i].actor, world, registered))
+                            throw std::runtime_error{"ONCE replay actor identity changed"};
+                    const auto observed = read_player_once_replay_snapshot(objects);
+                    guard();
+                    if (observed != expected)
+                        throw std::runtime_error{"ONCE replay observed an unplanned identity/flags/numeric/counter/queue delta"};
+                };
+                bound_read();
+                // Mark before any call, including a zero-target batch. No path
+                // clears this marker, writes false, or rearms after a failure.
+                restore.player_once_replay_phase = PlayerOnceReplayPhase::Attempting;
+                append_route_c_trace_failure("restore.player-once-replay.begin", "targets=" + std::to_string(targets.size())
+                    + " proof=" + restore.exact_player_qualification->payload_checksum);
+                for (const auto& [ci, ei] : targets)
+                {
+                    bound_read();
+                    auto& target = expected.qualifications[ci];
+                    std::ostringstream guid{};
+                    guid << std::hex << std::uppercase << std::setfill('0');
+                    for (auto byte : target.native.membership.descriptors[ei].guid) guid << std::setw(2) << unsigned(byte);
+                    const auto detail = "card=" + std::to_string(ci) + " zone=" + std::to_string(target.saved.native_location)
+                        + " nativeIndex=" + std::to_string(target.saved.native_index) + " row=" + std::to_string(target.saved.row)
+                        + " index=" + std::to_string(target.saved.index) + " ordinal=" + std::to_string(ei)
+                        + " cardId=" + target.native.card_id + " effectGuid=" + guid.str();
+                    append_route_c_trace_failure("restore.player-once-replay.target-before", detail + " used=0");
+                    guard();
+                    const auto setter = validated_bow_once_setter(target, ei);
+                    setter(const_cast<void*>(target.native.membership.descriptors[ei].object), true);
+                    ++restore.player_once_replay_count;
+                    target.saved.effects[ei].used_once = 1;
+                    target.native.values[ei].used_once = 1;
+                    bound_read();
+                    append_route_c_trace_failure("restore.player-once-replay.target-after", detail + " used=1");
+                }
+                bound_read();
+                restore.player_once_replay_phase = PlayerOnceReplayPhase::Completed;
+                append_route_c_trace_failure("restore.player-once-replay.complete", "count=" + std::to_string(restore.player_once_replay_count)
+                    + " proof=" + restore.exact_player_qualification->payload_checksum);
+                return true;
+            }
+            catch (const std::exception& error)
+            {
+                restore.player_once_replay_phase = PlayerOnceReplayPhase::Failed;
+                restore.player_qualification_status = "failed";
+                restore.player_qualification_reason = error.what();
+                append_route_c_trace_failure("restore.player-once-replay.failed", error.what());
+                throw; // Existing restore handler performs its single semantic fallback.
+            }
+        }
+
         using SynchronizeCardNumericUi = void(__fastcall*)(UObject*);
 
         auto validated_native_card_numeric_ui_synchronizer() -> SynchronizeCardNumericUi
@@ -7100,7 +7362,9 @@ namespace QuantumCheckpoint
                 : exact_player_zones && exact_player_zones->schema_version >= ExactPlayerZonesQualificationSchemaVersion;
             const bool qualification_layout_present = exact_player_field || exact_player_trash || exact_player_zones;
             std::optional<ExactPlayerQualificationCheckpoint> exact_player_qualification{};
-            std::string player_qualification_policy{player_qualification_required ? ExactPlayerQualificationPolicy : ""};
+            std::string player_qualification_policy = !player_qualification_required ? ""
+                : exact_player_field ? exact_player_field->qualification_policy
+                : exact_player_trash ? exact_player_trash->qualification_policy : exact_player_zones->qualification_policy;
             std::string player_qualification_status{qualification_layout_present ? "legacy-bounded" : "not-applicable-no-player-layout"};
             std::string player_qualification_saved_proof{qualification_layout_present ? "unknown-saved-state" : "not-applicable-no-player-layout"};
             std::string player_qualification_reason{qualification_layout_present
@@ -7129,7 +7393,8 @@ namespace QuantumCheckpoint
                 else
                 {
                     player_qualification_status = "pending";
-                    player_qualification_saved_proof = "validated-Q1-layout-binding";
+                    player_qualification_saved_proof = exact_player_qualification->schema_version == ExactPlayerQualificationBowOnceSchemaVersion
+                        ? "validated-Q2-layout-binding" : "validated-Q1-layout-binding";
                     append_route_c_trace("restore.player-qualification.proof-loaded");
                 }
             }
@@ -7508,6 +7773,9 @@ namespace QuantumCheckpoint
             const bool exact_character_charge_available = exact_character_charge.has_value();
             const bool exact_turn_progress_available = exact_turn_progress.has_value();
             g_pending_route_c_capture.reset();
+            const auto once_replay_phase = exact_player_qualification
+                && exact_player_qualification->qualification_policy == ExactPlayerQualificationBowOncePolicy
+                ? PlayerOnceReplayPhase::NotAttempted : PlayerOnceReplayPhase::NotApplicable;
             g_pending_route_c_restore.emplace(PendingRouteCRestore{
                 .checkpoint = std::move(checkpoint),
                 .exact_spawn_plan = std::move(exact_spawn_plan),
@@ -7571,6 +7839,7 @@ namespace QuantumCheckpoint
                 .player_qualification_reason = std::move(player_qualification_reason),
                 .player_qualification_saved_proof = std::move(player_qualification_saved_proof),
                 .player_qualification_policy = std::move(player_qualification_policy),
+                .player_once_replay_phase = once_replay_phase,
             });
 
             try
@@ -11171,6 +11440,7 @@ namespace QuantumCheckpoint
 
                 if (restore.phase == RouteCRestorePhase::AwaitingVerification)
                 {
+                    if (!advance_player_once_replay(restore, objects)) return;
                     if (restore.auto_spawn_suppressed)
                     {
                         import_property_text(objects.spawner,
@@ -11221,7 +11491,8 @@ namespace QuantumCheckpoint
                     }
                 }
                 if ((restore.exact_player_qualification
-                        && restore.player_qualification_status != "verified-profile-flags-and-zero-used")
+                        && restore.player_qualification_status != (restore.exact_player_qualification->qualification_policy == ExactPlayerQualificationBowOncePolicy
+                            ? "verified-profile-flags-and-bow-once-used" : "verified-profile-flags-and-zero-used"))
                     || (restore.exact_spawn_plan && restore.exact_spawn_plan_status != "verified")
                     || ((restore.exact_player_zones || restore.exact_player_trash || restore.exact_player_field)
                         && restore.player_effect_membership_status != "verified-native-definition-membership")
@@ -15092,9 +15363,9 @@ namespace QuantumCheckpoint
         QuantumCheckpointMod()
         {
             ModName = STR("QuantumCheckpoint");
-            ModVersion = STR("0.40.0");
+            ModVersion = STR("0.41.0");
 #if defined(QUANTUM_CHECKPOINT_RUNTIME_TEST_FIXTURES)
-            ModVersion = STR("0.40.0-test-fixtures");
+            ModVersion = STR("0.41.0-test-fixtures");
 #endif
             ModDescription = STR("Route C checkpoint with optional exact-state supplements");
             ModAuthors = STR("zaofenMachine and contributors");

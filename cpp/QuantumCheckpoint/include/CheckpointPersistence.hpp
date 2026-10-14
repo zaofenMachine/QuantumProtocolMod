@@ -104,7 +104,8 @@ namespace QuantumCheckpoint
         -> std::optional<ExactPlayerQualificationCheckpoint>;
     auto validate_exact_player_qualification_checkpoint(
         const ExactPlayerQualificationCheckpoint& checkpoint, std::string& error) -> bool;
-    // Validate both payloads, metadata, complete zone order/full CardInfoInstance,
+    // Validate exact A(schema1)/B(schema2) policy and layout version pairing,
+    // both payloads, metadata, complete zone order/full CardInfoInstance,
     // and FIELD destinations. Historical layouts cannot acquire a Q1 proof.
     auto validate_exact_player_qualification_binding(
         const ExactPlayerQualificationCheckpoint& checkpoint,

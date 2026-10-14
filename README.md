@@ -2,9 +2,9 @@
 
 《Quantum Protocol》局内检查点 Mod 的可行性研究与实验原型。
 
-当前 v0.40.0 沿用路线 C“普通地牢小关语义重开”，叠加受限的玩家精确恢复：原生牌序、手牌数量、场格、生命与攻击修正、计数器、抽牌进度，以及春生成的一张额外苹果。恢复在游戏线程执行，精确层失败后重新加载一次纯 Route C。
+当前 v0.41.0 沿用路线 C“普通地牢小关语义重开”，叠加受限的玩家精确恢复：原生牌序、手牌数量、场格、生命与攻击修正、计数器、抽牌进度，以及春生成的一张额外苹果。恢复在游戏线程执行，精确层失败后重新加载一次纯 Route C。
 
-v0.40.0 增加玩家资格默认来源门禁：新布局 Z6/T7/F10 必须绑定 Q1，逐技能实际 flags 精确符合已审阅构造默认值、无 ONCE 且 used=0，才能获得独立资格通过。三组真实新布局和两组 legacy 回归均通过原 25 项玩家检查；旧档明确 legacy-bounded，保存时资格未知。基础 Bow 未用／已用均拒绝新版玩家精确层，主 Route C 与适用的未来 spawn 计划仍可保存。没有 ONCE 或 flags 写回；[第三十八阶段](docs/phase-38-effect-qualification-observation.md)的资格丢失历史仍保留。完整范围见[第三十九阶段 A](docs/phase-39-player-qualification-baseline.md)。
+v0.41.0 在默认资格门禁上新增基础长弓 ONCE 恢复：Z7/T8/F11 绑定 Q2，按原生位置区分同名副本；已用长弓仅通过受守卫的原生 true 调用恢复，未用来源不写，flags 不写。六组新恢复、三个新进程 Q1 兼容案例及原用户旧档回归通过原 25 项玩家检查。旧进程另有三个 24/25 失败，角色 abilityOk 不一致，原始差异保留；当前不覆盖完整角色能力状态。旧 Q1 含义不变，legacy 保存时资格仍未知。原生资格通过不代表技能私有历史或完整 UI 恢复，详见[第四十阶段](docs/phase-40-bow-once-replay.md)；此前 [A 策略](docs/phase-39-player-qualification-baseline.md)和[资格丢失实验](docs/phase-38-effect-qualification-observation.md)保留各自历史结论。
 
 ## 当前结论
 
@@ -25,6 +25,7 @@ HAND schema 3 按原生下标保存基础生命、HEALTH 修正与 generic 计�
 
 第三十七阶段保留了旧 UI 缓存缺口、技能历史不一致和自动捕获遗漏的原始失败，未将它们归一化为通过。最终生产构建与 DEV 夹具各 4/4 CTest；正式恢复、正常换波自动保存及真实 pending 动作重试分开验收，PROCESSING 等待仍缺实机覆盖。当前阶段证据位于 `QuantumProtoclMod.runtime-evidence/20260930-player-state`，完整范围和归档索引见阶段文档。敌人精确状态、技能私有历史、LEVEL 修正、独立生命调整及 STORAGE/能力卡运行态仍不覆盖；重编程路线继续搁置。详见：
 
+- [基础长弓 ONCE 回放与 Q2](docs/phase-40-bow-once-replay.md)
 - [玩家资格默认来源门禁与 Q1](docs/phase-39-player-qualification-baseline.md)
 - [技能资格观测与 ONCE 恢复缺口](docs/phase-38-effect-qualification-observation.md)
 - [牌库／墓地基础生命与稳定捕获](docs/phase-37-player-zone-base-health.md)

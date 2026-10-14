@@ -383,11 +383,13 @@ namespace QuantumCheckpoint
             return true;
         }
 
-        auto validate_qualification_policy(std::string_view policy, bool required,
+        auto validate_qualification_policy(std::string_view policy, int schema_version,
+                                           std::string_view layout_kind,
                                            std::string& error) -> bool
         {
-            if (required ? policy == ExactPlayerQualificationPolicy : policy.empty()) return true;
-            error = required ? "player qualification requires flags-baseline-v1 policy"
+            const auto expected = qualification::qualification_policy_for_layout(layout_kind, schema_version);
+            if (expected ? policy == *expected : policy.empty()) return true;
+            error = expected ? "player qualification layout requires exact policy: " + std::string{*expected}
                              : "legacy player layout cannot claim qualification coverage";
             return false;
         }
@@ -1910,7 +1912,7 @@ namespace QuantumCheckpoint
         if (!validate_off_field_base_health_records(deck->size(), checkpoint.player_deck_base_health_states,
                 checkpoint.schema_version >= ExactPlayerZonesBaseHealthSchemaVersion, error)) return false;
         if (!validate_qualification_policy(checkpoint.qualification_policy,
-                checkpoint.schema_version >= ExactPlayerZonesQualificationSchemaVersion, error)) return false;
+                checkpoint.schema_version, checkpoint.kind, error)) return false;
         if (checkpoint.payload_checksum != exact_player_zones_payload_checksum(checkpoint))
         {
             error = "exact player-zones payload checksum does not match";
@@ -2168,7 +2170,7 @@ namespace QuantumCheckpoint
             || !validate_off_field_base_health_records(trash->size(), checkpoint.player_trash_base_health_states,
                 checkpoint.schema_version >= ExactPlayerTrashBaseHealthSchemaVersion, error)) return false;
         if (!validate_qualification_policy(checkpoint.qualification_policy,
-                checkpoint.schema_version >= ExactPlayerTrashQualificationSchemaVersion, error)) return false;
+                checkpoint.schema_version, checkpoint.kind, error)) return false;
         if (checkpoint.payload_checksum != exact_player_trash_payload_checksum(checkpoint))
         {
             error = "exact player-trash payload checksum does not match";
@@ -2493,7 +2495,7 @@ namespace QuantumCheckpoint
             || !validate_off_field_base_health_records(trash->size(), checkpoint.player_trash_base_health_states,
                 checkpoint.schema_version >= ExactPlayerFieldBaseHealthSchemaVersion, error)) return false;
         if (!validate_qualification_policy(checkpoint.qualification_policy,
-                checkpoint.schema_version >= ExactPlayerFieldQualificationSchemaVersion, error)) return false;
+                checkpoint.schema_version, checkpoint.kind, error)) return false;
         if (checkpoint.payload_checksum != exact_player_field_payload_checksum(checkpoint))
         {
             error = "exact player-field payload checksum does not match";
@@ -2763,7 +2765,8 @@ namespace QuantumCheckpoint
                                               const Layout& layout, bool required,
                                               std::string& error) -> bool
         {
-            if (!required || layout.qualification_policy != ExactPlayerQualificationPolicy
+            const auto expected_policy = qualification::qualification_policy_for_layout(layout.kind, layout.schema_version);
+            if (!required || !expected_policy || layout.qualification_policy != *expected_policy
                 || checkpoint.qualification_policy != layout.qualification_policy
                 || checkpoint.layout_kind != layout.kind
                 || checkpoint.layout_payload_checksum != layout.payload_checksum
@@ -2919,13 +2922,13 @@ namespace QuantumCheckpoint
     auto validate_exact_player_qualification_checkpoint(
         const ExactPlayerQualificationCheckpoint& checkpoint, std::string& error) -> bool
     {
-        if (checkpoint.schema_version != ExactPlayerQualificationSchemaVersion
+        const auto expected_schema = qualification::qualification_proof_schema_for_policy(checkpoint.qualification_policy);
+        if (!expected_schema || checkpoint.schema_version != *expected_schema
             || checkpoint.kind != ExactPlayerQualificationCheckpointKind)
         {
-            error = "unsupported exact player-qualification schema or kind";
+            error = "unsupported or mismatched exact player-qualification policy/schema/kind";
             return false;
         }
-        if (!validate_qualification_policy(checkpoint.qualification_policy, true, error)) return false;
         if (checkpoint.captured_at_utc.empty() || checkpoint.captured_at_utc.size() > 128
             || !is_hex_digest(checkpoint.route_c_payload_checksum, 16)
             || !is_hex_digest(checkpoint.layout_payload_checksum, 16)
@@ -2984,7 +2987,7 @@ namespace QuantumCheckpoint
             }
             const auto key = qualification_card_key(card.card_info_instance, error);
             if (!key) return false;
-            const auto expected_count = qualification::qualification_card_effect_count(*key);
+            const auto expected_count = qualification::qualification_card_effect_count(*key, checkpoint.qualification_policy);
             if (!expected_count || card.effects.size() != *expected_count
                 || card.effects.size() > ExactPlayerQualificationMaximumEffectsPerCard)
             {
@@ -3009,23 +3012,40 @@ namespace QuantumCheckpoint
                         return false;
                     }
                     previous_flag = flag;
-                    if (flag == 0)
+                    if (flag == 0 && checkpoint.qualification_policy == ExactPlayerQualificationPolicy)
                     {
                         error = "unsupported-once: flags-baseline-v1 cannot admit ONCE";
                         return false;
                     }
                 }
-                if (effect.used_once != 0)
+                if (effect.used_once < 0 || effect.used_once > 1)
                 {
-                    error = effect.used_once == 1 ? "unsupported-used: flags-baseline-v1 requires zero used"
-                                                  : "qualification usedOnce is outside 0..1";
+                    error = "qualification usedOnce is outside 0..1";
+                    return false;
+                }
+                if (effect.used_once != 0 && checkpoint.qualification_policy == ExactPlayerQualificationPolicy)
+                {
+                    error = "unsupported-used: flags-baseline-v1 requires zero used";
                     return false;
                 }
                 const auto profile = qualification::lookup_effect_qualification_profile(
-                    *key, ordinal, effect.factory_key, effect.tag, effect.type);
+                    *key, ordinal, effect.factory_key, effect.tag, effect.type, checkpoint.qualification_policy);
                 if (!profile || effect.profile_id != profile->id)
                 {
                     error = "unsupported-profile: qualification effect identity or profile id is not reviewed";
+                    return false;
+                }
+                if (!profile->permits_used_once_replay
+                    && std::find(effect.flags.begin(), effect.flags.end(), std::uint8_t{0}) != effect.flags.end())
+                {
+                    error = "unsupported-once: only the exact B base Bow profile admits ONCE";
+                    return false;
+                }
+                if (effect.used_once != 0 && !profile->permits_used_once_replay)
+                {
+                    error = checkpoint.qualification_policy == ExactPlayerQualificationPolicy
+                        ? "unsupported-used: flags-baseline-v1 requires zero used"
+                        : "unsupported-used: non-Bow profiles require zero used";
                     return false;
                 }
                 if (!std::equal(effect.flags.begin(), effect.flags.end(), profile->flags.begin(), profile->flags.end()))

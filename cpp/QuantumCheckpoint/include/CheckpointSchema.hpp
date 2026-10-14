@@ -31,19 +31,28 @@ namespace QuantumCheckpoint
     inline constexpr int ExactPlayerZonesQualificationSchemaVersion = 6;
     inline constexpr int ExactPlayerTrashQualificationSchemaVersion = 7;
     inline constexpr int ExactPlayerFieldQualificationSchemaVersion = 10;
-    inline constexpr int ExactPlayerQualificationSchemaVersion = 1;
+    // Phase39 A remains schema1. Phase40 B has an independent policy/schema;
+    // never change the meaning or checksum order of an existing A record.
+    inline constexpr int ExactPlayerQualificationBaselineSchemaVersion = 1;
+    inline constexpr int ExactPlayerQualificationBowOnceSchemaVersion = 2;
+    inline constexpr int ExactPlayerZonesBowOnceQualificationSchemaVersion = 7;
+    inline constexpr int ExactPlayerTrashBowOnceQualificationSchemaVersion = 8;
+    inline constexpr int ExactPlayerFieldBowOnceQualificationSchemaVersion = 11;
+    inline constexpr int ExactPlayerQualificationSchemaVersion = 2;
     inline constexpr std::string_view ExactPlayerQualificationCheckpointKind =
         "route-c-exact-player-qualification";
     inline constexpr std::string_view ExactPlayerQualificationPolicy = "flags-baseline-v1";
+    inline constexpr std::string_view ExactPlayerQualificationBowOncePolicy =
+        "flags-baseline-bow-once-v2";
     inline constexpr std::size_t ExactPlayerQualificationMaximumCards = 128;
     inline constexpr std::size_t ExactPlayerQualificationMaximumEffectsPerCard = 64;
-    inline constexpr int ExactPlayerZonesSchemaVersion = 6;
+    inline constexpr int ExactPlayerZonesSchemaVersion = 7;
     inline constexpr std::string_view ExactPlayerZonesCheckpointKind =
         "route-c-exact-player-zones";
-    inline constexpr int ExactPlayerTrashSchemaVersion = 7;
+    inline constexpr int ExactPlayerTrashSchemaVersion = 8;
     inline constexpr std::string_view ExactPlayerTrashCheckpointKind =
         "route-c-exact-player-trash";
-    inline constexpr int ExactPlayerFieldSchemaVersion = 10;
+    inline constexpr int ExactPlayerFieldSchemaVersion = 11;
     inline constexpr std::string_view ExactPlayerFieldCheckpointKind =
         "route-c-exact-player-field";
     // Fixed minimum for replaying HAND base-HP gains; keep older schemas default-only.

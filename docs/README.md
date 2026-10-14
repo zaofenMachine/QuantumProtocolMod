@@ -1,8 +1,8 @@
 # 文档索引
 
-当前入口（2026-10-15）：[第三十九阶段 A](phase-39-player-qualification-baseline.md)在 v0.40.0 增加 Z6/T7/F10＋Q1 默认资格门禁，三组新布局和两组 legacy 全 25 项玩家比较通过；ONCE、非零 used 和未知 profile 拒绝新版玩家资格层。没有资格写回，[第三十八阶段](phase-38-effect-qualification-observation.md)的已用 ONCE 丢失与历史失败仍保留。重编程与敌人精确恢复继续搁置。
+当前入口（2026-10-15）：[第四十阶段](phase-40-bow-once-replay.md)在 v0.41.0 增加 Z7/T8/F11＋Q2 基础长弓 ONCE 原生回放，六组新恢复通过原25项玩家检查；三个新进程 Q1 兼容案例与原用户旧档回归也通过。三个旧进程兼容失败保留为24/25，唯一必需差异为角色 abilityOk。新能力限于已审阅基础长弓，不放开 flags、任意 ONCE、完整 UI／私有历史。重编程与敌人精确恢复继续搁置。
 
-A 里程碑已完成原用户检查点全25项回归、57个工具文件冻结及23项复验，17个检查点与4个存档已逐字节还原，游戏正常关闭。后续继续 B；当前部署与后续停机状态以[工作进度](WIP-current-progress-2026-09-10.md)文首为准，续接同时读[技术状态](technical-status.md)。
+[第三十九阶段 A](phase-39-player-qualification-baseline.md)的 Q1 默认门禁与旧档未知来源语义不变；[第三十八阶段](phase-38-effect-qualification-observation.md)及此前原始失败不改写。当前部署、冻结清理和后续任务以[工作进度](WIP-current-progress-2026-09-10.md)文首为准，续接同时读[技术状态](technical-status.md)。
 
 以下文件是后续维护时应优先更新的权威文档：
 
@@ -77,3 +77,4 @@ A 里程碑已完成原用户检查点全25项回归、57个工具文件冻结�
 - [phase-38-effect-qualification-observation.md](phase-38-effect-qualification-observation.md)：只读 ONCE/flags 观测、普通返手保留资格，以及恢复后资格丢失并可再次发动的实机证据。
 
 - [phase-39-player-qualification-baseline.md](phase-39-player-qualification-baseline.md)：默认 profile 资格门禁、Q1 依赖、新布局和 legacy 实机范围、ONCE／未知 profile 捕获拒绝。
+- [phase-40-bow-once-replay.md](phase-40-bow-once-replay.md)：基础长弓的 Q2 原生 ONCE 回放、同名副本绑定、自然刷新对照、旧版兼容及角色能力状态缺口。
