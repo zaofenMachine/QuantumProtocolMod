@@ -1,5 +1,9 @@
 # 文档索引
 
+日常操作入口：[使用指南](user-guide.md)。包含实际保存／读取按键、自动保存时机、状态工具、恢复报告解释和当前资格范围；历史阶段报告保留当时实验结论。
+
+下一切片的待验证方案：[自动保存 PROCESSING 等待](next-automatic-capture-validation.md)，不代表已有实测覆盖。
+
 当前入口（2026-10-15）：[第四十六阶段](phase-46-checkpoint-status.md)。独立只读状态工具支持中文和JSON，分别显示历史保存结果与当前文件对应关系，80项纯测试及12次CLI检查通过并由冻结副本复验。23个现场文件保持一致，未启动游戏或更换DLL，不判断恢复准入。部署仍为[第四十五阶段](phase-45-capture-outcome.md)的v0.45.0保存回执版；此前[第四十四阶段](phase-44-bow-field-coverage.md)双弓同排／HAND7及[第四十三阶段](phase-43-bow-field-pair.md)四种used组合证据保留。
 
 历史里程碑：[第四十一阶段](phase-41-character-allowance-guard.md)在 v0.42.0 增加 C3 角色资源证明，保存并核对实际许可 False／True，保留 C1 未知、C2 False-only 的原有含义。五组 C3 和两个 C2／兼容正例通过原25项；许可双向不匹配实际拒绝并单次回退。角色许可始终只读，能力牌、满充、完整 UI／私有历史不扩域。重编程与敌人精确恢复继续搁置。

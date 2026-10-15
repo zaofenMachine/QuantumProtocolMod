@@ -4,11 +4,13 @@
 
 ## 2026-10-15 第四十六阶段：只读保存状态已验收
 
+代码和文档已提交推送 `cd373ac45569e42257a4cf735433f7644cc967e1`，当次远端HEAD核对一致。随后补充[日常使用指南](user-guide.md)，修正README操作区旧v0.40/Q1-only限制和历史机制被当成当前新捕获范围的歧义；按真实按键注册、自动保存调度、报告生成和资格表核对，未改变代码或扩大实测声明。
+
 新增 `scripts/Get-CheckpointStatus.ps1` 及相邻模块，支持 `-GameRoot`／`-ModRoot`、中文输出与 `-Json`；PowerShell7.2+，实测7.6.5。将回执历史结果与当前磁盘关系分开，处理无回执legacy、陈旧／损坏／缺失文件、来源路径差异、类型／依赖矛盾及两次采样变化。只读固定路径，不判断恢复准入；所有结果保留两项恢复证明false。详见[第四十六阶段](phase-46-checkpoint-status.md)。
 
 最终80项纯测试、9个阶段45材料离线案例和3个现场CLI入口通过；7个工具／设计文件、138个本轮证据冻结后再次复验80＋12，输出语义一致。manifest `943D8EC707B29811AAEC60C8925FEF9242485EFA05A0443757D0ACC51D5544A0`；复验入口 `phase46-frozen-revalidation-20261015T051414304050Z/revalidation-index.json`，SHA `05EB1402AA52864A752155C1D2DC42B5859757FC91A26FF18B04B54B45DD838B`。证据根 `QuantumProtoclMod.runtime-evidence/20261015-checkpoint-status`。
 
-17CP＋4SaveGames＋DLL＋latest回执共23文件及原数据文件集合均未变；本阶段无游戏操作／DLL构建，保留v0.45.0 D526BAEF…E5A13。现场回执为上阶段manual4拒绝，而当前CP为已还原的原用户legacy，因此显示no-publication／当前来源未由该回执证明，符合事实。冻结工具和case禁止改写。下一项整理日常使用和结果解释；继续优先当前路线，自动保存与故障回退尚缺的实测另开独立切片，不扩敌人／重编程。
+17CP＋4SaveGames＋DLL＋latest回执共23文件及原数据文件集合均未变；本阶段无游戏操作／DLL构建，保留v0.45.0 D526BAEF…E5A13。现场回执为上阶段manual4拒绝，而当前CP为已还原的原用户legacy，因此显示no-publication／当前来源未由该回执证明，符合事实。冻结工具和case禁止改写。下一轮先按[自动保存续测方案](next-automatic-capture-validation.md)补PROCESSING无提示等待：普通换波最多3次完整候选，未命中则先补最小只读见证；已有DEV busy夹具不能算PROCESSING正例。生命周期／监听失效和发布故障另开独立切片，不为制造覆盖放宽门禁，不扩敌人／重编程。
 
 ## 2026-10-15 第四十五阶段：保存结果回执已收尾
 
