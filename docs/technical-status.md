@@ -1,8 +1,16 @@
 # 技术状态与已知事实
 
-> 2026-10-15 当前续接入口：[第四十一阶段](phase-41-character-allowance-guard.md)及[工作进度](WIP-current-progress-2026-09-10.md)。方向仍为“小关重开 + 玩家精确恢复”，重编程与敌人精确恢复搁置。
+> 2026-10-15 当前续接入口：[第四十二阶段](phase-42-bow-field-placement.md)及[工作进度](WIP-current-progress-2026-09-10.md)。方向仍为“小关重开 + 玩家精确恢复”，重编程与敌人精确恢复搁置。
 
 ## 2026-10-15 当前状态
+
+v0.43.0 在独立 F12 准入中支持一张基础长弓位于 PLAYER FIELD，D/H/T 无其他长弓，默认攻击／生命／等级1、无修正、计数0、active=True。Q2含义不变，普通果实继续F11。新增每次出牌的完整原生对象／共享控制块／效果／flags身份守卫，数量临时抑制期间只读验证，任何漂移拒绝；日志失败与身份失败分开锁存，仅终结清理可在原身份重新验证后释放抑制。未增加native原语。
+
+五个F12场地案例、一个F11兼容例及原用户两次回归均25/25，三种Q2异常输入在重建前拒绝，原12/25差异保留。两个普通操作控制分别证实unused同实例used0→1及used点击后的所检查状态不变，不声称完整点击区间dispatch。角色资源独立C3 False未满充通过；正常发动后的False/COMPLETE来源仍不支持，不能用回手重出后的True/NONE来源代替。
+
+生产OFF4/4CTest，最终DLL `6924C976FF1CCE2E2C778059DBE6543DA4B37A5F1C3C50EB59B316E8426C7C6E`，实际Mod源码 `4897A1F79E88DE5FD97F35C72E0FD03AEEE2417EA95D78A6C256A4DDD68009CF`。证据根 `QuantumProtoclMod.runtime-evidence/20261015-bow-field-placement`；65文件冻结、29项复验、21原数据还原和正常停机完成。下一项只读评估恰两Bow均FIELD，保留现有数值与active边界。
+
+## 2026-10-15 第四十一阶段（历史里程碑）
 
 v0.42.0 新捕获角色资源 C3（observed-allowance-match-v1），保存规范 False／True 并在恢复前后匹配；C1 旧数值语义与许可 unknown、C2 False-only 均独立保留。只支持未满充。唯一 PLAYER 角色槽、mCardEngine 归属、world/engine/slot weak identity、getter 原生签名和返回 ABI 经守卫，双次采样与原生字节相符。没有调用许可 setter 或直接写字节，能力牌状态明确 not-covered。
 

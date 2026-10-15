@@ -74,6 +74,13 @@ namespace QuantumCheckpoint
         -> std::optional<ExactPlayerFieldCheckpoint>;
     auto validate_exact_player_field_checkpoint(
         const ExactPlayerFieldCheckpoint& checkpoint, std::string& error) -> bool;
+    // F12 only: one base Bow in FIELD, default numeric records, turn-active true.
+    // No checksum/metadata requirement: planners also use temporary execution
+    // views. Other layout versions retain their existing admission unchanged.
+    // Full immutable definition, live level/turn counters and ownership remain
+    // runtime checks; this scope validator does not manufacture that proof.
+    auto validate_player_field_bow_placement_scope(
+        const ExactPlayerFieldCheckpoint& checkpoint, std::string& error) -> bool;
     auto exact_player_field_startup_decklist(std::string_view active_decklist,
                                              std::string_view player_deck,
                                              std::string_view player_hand,

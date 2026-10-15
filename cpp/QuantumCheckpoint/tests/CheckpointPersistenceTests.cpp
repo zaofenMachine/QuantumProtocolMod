@@ -571,6 +571,8 @@ namespace
             require(bind_rejected(b_for_a, a_layout), "schema2 B proof cannot bind A layout");
             auto future = b_layout;
             ++future.schema_version;
+            if constexpr (requires { future.player_field; })
+                future.schema_version = ExactPlayerFieldSchemaVersion + 1;
             require(!qualification_policy_for_layout(future.kind, future.schema_version)
                         && !parse(serialize(future), error), "future layout cannot inherit B policy by a minimum-version comparison");
             require(!qualification_policy_for_layout(a_layout.kind, a_layout.schema_version - 1),
@@ -703,6 +705,181 @@ namespace
         bowed_field.player_field = "(" + bow_instance + "," + lemon_instance + ")";
         require(!parse_exact_player_field_checkpoint(serialize_exact_player_field_checkpoint(bowed_field), error),
                 "new Bow qualification does not broaden the existing plain-fruit FIELD reconstruction range");
+    }
+
+    auto run_bow_field_placement_tests() -> void
+    {
+        using namespace QuantumCheckpoint;
+        std::string error{};
+        require(ExactPlayerFieldCheckpoint{}.schema_version == ExactPlayerFieldBowOnceQualificationSchemaVersion
+                    && ExactPlayerFieldSchemaVersion == ExactPlayerFieldBowPlacementSchemaVersion
+                    && ExactPlayerFieldBowOnceQualificationSchemaVersion == 11
+                    && ExactPlayerFieldQualificationSchemaVersion == 10,
+                "F12 ceiling preserves F11 default and fixed A/B admission versions");
+        require(!supports_plain_player_field_card("sakuraBow")
+                    && qualification::qualification_policy_for_layout(ExactPlayerFieldCheckpointKind, 12)
+                        == ExactPlayerQualificationBowOncePolicy
+                    && !qualification::qualification_policy_for_layout(ExactPlayerFieldCheckpointKind, 13),
+                "F12 maps explicitly to unchanged B while plain overlap policy stays unchanged");
+        auto route = sample_checkpoint();
+        route.payload_checksum = "0123456789ABCDEF";
+        const std::string bow = "(CardInfo=(Tag=\"sakuraBow\",Level=1,upgradeLevels=((attack=1,health=1,effects=(\"player.aurora.sakura.sakurabow\")))),upgradeLevel=0)";
+        const std::string apple = "(CardInfo=(Tag=\"naturalApple\",Level=1,upgradeLevels=((attack=2,health=2,effects=(\"player.esper.fruit.apple\")))))";
+        auto field = sample_exact_player_field(route);
+        field.schema_version = ExactPlayerFieldBowPlacementSchemaVersion;
+        field.player_deck = field.player_hand = field.player_trash = "()";
+        field.player_field = "(" + bow + ")";
+        field.player_field_states = "1,1,1,1";
+        field.player_field_attack_states = field.player_field_health_states = "1,1";
+        field.player_field_counter_states = "0";
+        field.qualification_policy = ExactPlayerQualificationBowOncePolicy;
+        field.payload_checksum = exact_player_field_payload_checksum(field);
+        const auto json = serialize_exact_player_field_checkpoint(field);
+        const auto parsed = parse_exact_player_field_checkpoint(json, error);
+        require(parsed && serialize_exact_player_field_checkpoint(*parsed) == json
+                    && validate_player_field_bow_placement_scope(*parsed, error)
+                    && json.find("fieldCardPolicy") == std::string::npos,
+                "F12 round trips original FIELD fields with one default base Bow and no new policy field");
+        for (const auto version : {1,2,3,4,5,6,7,8,9,10,11,13})
+        {
+            auto old = field;
+            old.schema_version = version;
+            require(!parse_exact_player_field_checkpoint(serialize_exact_player_field_checkpoint(old), error),
+                    "old FIELD schemas and unknown F13 cannot acquire Bow placement even with recalculated checksum");
+        }
+        auto proof = ExactPlayerQualificationCheckpoint{
+            .schema_version = ExactPlayerQualificationBowOnceSchemaVersion,
+            .captured_at_utc = field.captured_at_utc,
+            .route_c_payload_checksum = field.route_c_payload_checksum,
+            .game_executable_sha256 = field.game_executable_sha256,
+            .game_executable_size = field.game_executable_size,
+            .source_level_name = field.source_level_name,
+            .wave_index = field.wave_index,
+            .layout_kind = field.kind,
+            .layout_payload_checksum = field.payload_checksum,
+            .qualification_policy = std::string{ExactPlayerQualificationBowOncePolicy},
+            .cards = {{.native_location = 3, .row = 1, .index = 1, .card_info_instance = bow,
+                .effects = {{.ordinal = 0, .factory_key = "player.aurora.sakura.sakurabow", .tag = "sakuraBow",
+                    .type = 1, .flags = {0}, .used_once = 0,
+                    .profile_id = "phase40-bow-once-v2:player.aurora.sakura.sakurabow"}}}}
+        };
+        for (const auto used : {0,1})
+        {
+            proof.cards[0].effects[0].used_once = used;
+            proof.payload_checksum = exact_player_qualification_payload_checksum(proof);
+            const auto q = parse_exact_player_qualification_checkpoint(serialize_exact_player_qualification_checkpoint(proof), error);
+            require(q && q->cards == proof.cards && validate_exact_player_qualification_binding(*q, field, error),
+                    "unchanged Q2 binds natural source0/source1 Bow at its exact F12 FIELD slot");
+        }
+        const auto binding_rejects = [&](auto invalid) {
+            invalid.payload_checksum = exact_player_qualification_payload_checksum(invalid);
+            return !validate_exact_player_qualification_binding(invalid, field, error);
+        };
+        auto wrong = proof; wrong.cards[0].index = 2;
+        require(binding_rejects(wrong), "F12 Q2 cannot move source used state to another FIELD slot");
+        wrong = proof; wrong.layout_payload_checksum = "FEDCBA9876543210";
+        require(binding_rejects(wrong), "F12 Q2 cannot bind a different selected layout checksum");
+        wrong = proof; wrong.captured_at_utc = "2000-01-01T00:00:00Z";
+        require(binding_rejects(wrong), "F12 retains exact capture-time binding");
+        wrong = proof; wrong.schema_version = 1; wrong.qualification_policy = ExactPlayerQualificationPolicy;
+        require(binding_rejects(wrong), "F12 cannot accept A Q1 or reinterpret its used contract");
+        wrong = proof; wrong.cards[0].effects[0].flags = {0,1};
+        require(binding_rejects(wrong), "F12 does not broaden exact Bow flags");
+        wrong = proof; wrong.cards[0].effects[0].used_once = 2;
+        require(binding_rejects(wrong), "F12 does not broaden Q2 used values");
+        wrong = proof; wrong.cards[0].card_info_instance = "(CardInfo=(Tag=\"sakuraBow\"),upgradeLevel=1)";
+        require(binding_rejects(wrong), "F12 cannot bind an upgraded Bow profile");
+
+        const std::vector<PlayerRestoreCandidate> from_hand{{"sakuraBow@0",0}}, from_deck{{"sakuraBow@0",1}};
+        for (const auto& candidates : {from_hand, from_deck})
+        {
+            const auto staged = plan_player_hand_staging(field, candidates, 7, error);
+            const auto placed = plan_player_field_restore(field, candidates, error, 7);
+            require(staged && placed && placed->field_candidates == std::vector<std::size_t>{0},
+                    "F12 plans one Bow from native HAND or DECK without identity-only global lookup");
+        }
+        const auto rejected = [&](auto invalid) {
+            invalid.payload_checksum = exact_player_field_payload_checksum(invalid);
+            require(!validate_player_field_bow_placement_scope(invalid,error)
+                        && !parse_exact_player_field_checkpoint(serialize_exact_player_field_checkpoint(invalid),error)
+                        && !plan_player_hand_staging(invalid,from_hand,7,error)
+                        && !plan_player_field_restore(invalid,from_hand,error,7),
+                    "F12 persistence and direct planners reject the same narrow scope violation");
+        };
+        for (int mutation{}; mutation < 18; ++mutation)
+        {
+            auto invalid = field;
+            switch (mutation)
+            {
+            case 0: invalid.player_field = "(" + apple + ")"; break;
+            case 1: invalid.player_hand = "(" + bow + ")"; break;
+            case 2: invalid.player_deck = "(" + bow + ")"; break;
+            case 3: invalid.player_trash = "(" + bow + ")"; break;
+            case 4:
+                invalid.player_field = "(" + bow + "," + bow + ")";
+                invalid.player_field_states = "0,0,1,1;1,1,1,1";
+                invalid.player_field_attack_states = invalid.player_field_health_states = "1,1;1,1";
+                invalid.player_field_counter_states = "0;0"; break;
+            case 5: invalid.player_field = "((CardInfo=(Tag=\"sakuraBow\"),upgradeLevel=1))"; break;
+            case 6: invalid.player_field_attack_states = "2,2"; break;
+            case 7: invalid.player_field_attack_states = "1,2|fieldBuff,1,-1,0"; break;
+            case 8: invalid.player_field_health_states = "2,2"; break;
+            case 9: invalid.player_field_health_states = "1,2|fieldHp,1,-1,0"; break;
+            case 10: invalid.player_field_states = "1,1,2,1"; break;
+            case 11: invalid.player_field_counter_states = "1"; break;
+            case 12: invalid.player_field_counter_states = "0|genericSpecial,1"; break;
+            case 13: invalid.player_field_attack_states = ""; break;
+            case 14: invalid.player_field_states = "1,5,1,1"; break;
+            case 15: invalid.qualification_policy = ExactPlayerQualificationPolicy; break;
+            case 16: invalid.player_field = "(" + bow + ",(CardInfo=(Tag=\"spDeckEdit\")))"; break;
+            case 17: invalid.player_field_states = "1,1,1,0"; break;
+            }
+            rejected(invalid);
+        }
+        auto mixed = field;
+        mixed.player_field = "(" + apple + "," + bow + ")";
+        mixed.player_field_states = "0,0,2,1;1,4,1,1";
+        mixed.player_field_attack_states = mixed.player_field_health_states = "2,2;1,1";
+        mixed.player_field_counter_states = "0;0";
+        mixed.payload_checksum = exact_player_field_payload_checksum(mixed);
+        require(parse_exact_player_field_checkpoint(serialize_exact_player_field_checkpoint(mixed),error).has_value(),
+                "F12 retains aligned fruit numerics and accepts default Bow at a legal boundary slot");
+        auto mixed_proof = proof;
+        mixed_proof.layout_payload_checksum = mixed.payload_checksum;
+        mixed_proof.cards[0].row = 1; mixed_proof.cards[0].index = 4;
+        mixed_proof.cards.insert(mixed_proof.cards.begin(), ExactPlayerQualificationCard{
+            .native_location=3,.row=0,.index=0,.card_info_instance=apple,
+            .effects={{.ordinal=0,.factory_key="player.esper.fruit.apple",.tag="naturalApple",.type=3,
+                .profile_id="phase39-default-v1:player.esper.fruit.apple"}}});
+        mixed_proof.payload_checksum = exact_player_qualification_payload_checksum(mixed_proof);
+        require(validate_exact_player_qualification_binding(mixed_proof,mixed,error),
+                "F12 fruit/Bow mixture retains Q2 complete CardInfo and exact coordinate ordering");
+
+        auto full = field;
+        full.player_hand = "(";
+        for (std::size_t index{}; index<7; ++index) { if (index) full.player_hand += ','; full.player_hand += apple; }
+        full.player_hand += ')';
+        const std::vector<PlayerRestoreCandidate> initial_full{
+            {"sakuraBow@0",1},{"naturalApple@0",1},{"naturalApple@0",1},
+            {"naturalApple@0",0},{"naturalApple@0",0},{"naturalApple@0",0},{"naturalApple@0",0},{"naturalApple@0",0}};
+        const auto full_plan = plan_player_hand_staging(full,initial_full,7,error);
+        require(full_plan && full_plan->moves.size()==12 && full_plan->before_field_move_count==11,
+                "F12 full HAND retains the existing deferred final-card staging prefix");
+        auto execution = full;
+        execution.player_deck = "(" + apple + ")";
+        execution.player_hand = "(";
+        for (std::size_t index{}; index<6; ++index) { if (index) execution.player_hand += ','; execution.player_hand += apple; }
+        execution.player_hand += ')';
+        const std::vector<PlayerRestoreCandidate> deferred{
+            {"sakuraBow@0",1},{"naturalApple@0",1},{"naturalApple@0",0},{"naturalApple@0",0},
+            {"naturalApple@0",0},{"naturalApple@0",0},{"naturalApple@0",0},{"naturalApple@0",0}};
+        const auto deferred_plan = plan_player_field_restore(execution,deferred,error,7);
+        require(deferred_plan && deferred_plan->field_candidates==std::vector<std::size_t>{0},
+                "F12 scope accepts a deferred execution view without requiring its stale saved checksum");
+        auto bad_candidate = from_hand; bad_candidate[0].identity = "sakuraBow@1";
+        require(!plan_player_field_restore(field,bad_candidate,error,7), "F12 cannot assign an upgraded live candidate");
+        bad_candidate = from_hand; bad_candidate[0].location = 2;
+        require(!plan_player_field_restore(field,bad_candidate,error,7), "F12 does not treat live TRASH as a staged field target");
     }
 
     auto run_character_allowance_tests() -> void
@@ -1451,7 +1628,7 @@ int main()
                 && full_hand_staging->before_field_move_count == 11,
             "a full hand defers its last card until the native field staging slot is no longer needed");
     auto attested_field_staging_layout = full_hand_layout;
-    attested_field_staging_layout.schema_version = ExactPlayerFieldSchemaVersion;
+    attested_field_staging_layout.schema_version = ExactPlayerFieldBowOnceQualificationSchemaVersion;
     const auto attested_field_staging = plan_player_hand_staging(
         attested_field_staging_layout, initial_full_hand, 7, error);
     require(attested_field_staging
@@ -2423,7 +2600,9 @@ int main()
         empty_hand.player_hand_health_checksum = attested.player_hand_health_checksum;
         require(!parse(serialize(empty_hand), error),
                 "new proof versions reject a sidecar dependency on an empty HAND");
-        require(!parse(change_version(attested_json, decltype(layout){}.schema_version + 1), error)
+        int future_version = decltype(layout){}.schema_version + 1;
+        if constexpr (requires { layout.player_field; }) future_version = ExactPlayerFieldSchemaVersion + 1;
+        require(!parse(change_version(attested_json, future_version), error)
                     && error.find("schema") != std::string::npos,
                 "future layout versions remain unsupported rather than inheriting capture-proof claims");
     };
@@ -2594,6 +2773,7 @@ int main()
         exact_player_field_payload_checksum,validate_exact_player_field_checkpoint);
 
     run_qualification_tests();
+    run_bow_field_placement_tests();
     run_character_allowance_tests();
     std::cout << "Route C checkpoint persistence tests passed\n";
     return 0;

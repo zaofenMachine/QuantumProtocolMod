@@ -12,6 +12,8 @@ namespace QuantumCheckpoint
         std::string& error) -> std::optional<PlayerHandStagingPlan>
     {
         error.clear();
+        if (!validate_player_field_bow_placement_scope(layout, error))
+            return std::nullopt;
         const auto keys = [&](const std::string& text)
             -> std::optional<std::vector<std::string>> {
             const auto cards = split_route_c_unreal_array(text, error);
@@ -101,6 +103,8 @@ namespace QuantumCheckpoint
         std::size_t hand_limit = 0) -> std::optional<PlayerFieldRestorePlan>
     {
         error.clear();
+        if (!validate_player_field_bow_placement_scope(checkpoint, error))
+            return std::nullopt;
         const auto keys = [&](const std::string& array)
             -> std::optional<std::vector<std::string>> {
             const auto cards = split_route_c_unreal_array(array, error);

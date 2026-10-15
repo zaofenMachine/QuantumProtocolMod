@@ -34,7 +34,9 @@ inline constexpr std::optional<std::string_view> qualification_policy_for_layout
         return ExactPlayerQualificationPolicy;
     if ((kind == ExactPlayerZonesCheckpointKind && schema_version == ExactPlayerZonesBowOnceQualificationSchemaVersion)
         || (kind == ExactPlayerTrashCheckpointKind && schema_version == ExactPlayerTrashBowOnceQualificationSchemaVersion)
-        || (kind == ExactPlayerFieldCheckpointKind && schema_version == ExactPlayerFieldBowOnceQualificationSchemaVersion))
+        || (kind == ExactPlayerFieldCheckpointKind
+            && (schema_version == ExactPlayerFieldBowOnceQualificationSchemaVersion
+                || schema_version == ExactPlayerFieldBowPlacementSchemaVersion)))
         return ExactPlayerQualificationBowOncePolicy;
     return std::nullopt;
 }

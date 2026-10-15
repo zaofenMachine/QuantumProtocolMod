@@ -1,6 +1,16 @@
 # QuantumCheckpoint 当前工作进度（临时续接记录）
 
-> 2026-10-15 当前沿“小关重开＋受限玩家恢复”持续推进，本轮额度收尾阈值为剩余约30%。Phase41 角色资源许可守卫已完成下述实机范围、冻结复验和独立清理；下一项只读评估基础长弓 PLAYER FIELD 准入。下方旧阶段均是当时记录，不代表后续部署／停机状态。
+> 2026-10-15 当前沿“小关重开＋受限玩家恢复”推进，周额度收尾阈值仍为剩余约30%。Phase42 单长弓场上恢复已完成冻结复验、原存档还原和停机；下一项评估两张长弓均在FIELD。下方旧阶段是当时记录，不代表后续部署状态。
+
+## 2026-10-15 第四十二阶段：基础长弓场上恢复已收尾
+
+当前v0.43.0，生产OFF4/4CTest。F12仅一张baseBow位于FIELD，默认数值／active=True，Q2原义不变；F11继续普通果实。完整原生对象身份守卫跨越count0抑制与出牌，日志完整写入；证据失败与身份漂移分别锁存，终结清理不恢复成功声明。详见[第四十二阶段](phase-42-bow-field-placement.md)。
+
+五个F12实际正例、一个F11兼容例和原用户两次回归均25/25；三个Q2负例均preflight拒绝，12/25原结果保留；两个普通操作端点独立计数。冻结65文件，固定2957外部文件／210目录集合，manifest `CC89A387F3FB9C5BEDEE577721678BB9AEEA0267B4ED01EE680018B41AA27EC6`。29项复验通过：12独立审计、15原28项比较、2合成自测。入口 `phase42-frozen-revalidation-20261015T014709316527Z/revalidation-index.json`，证据根 `QuantumProtoclMod.runtime-evidence/20261015-bow-field-placement`。
+
+最终DLL `6924C976FF1CCE2E2C778059DBE6543DA4B37A5F1C3C50EB59B316E8426C7C6E`，Mod源码 `4897A1F79E88DE5FD97F35C72E0FD03AEEE2417EA95D78A6C256A4DDD68009CF`。独立cleanup已正常关闭游戏，原17CP＋4SaveGames逐字节恢复，main `81095982711C71E2`；新DLL保留，Genesis未操作。summary SHA `82F3C8DDB9CC6D0AF09EAC1F947D830CCD7109F3A9E7EBD2DAF9718B821C143B`，cleanup SHA `26EBAD9576F3D48E71CFBF6B042D49D13E885B378071164877419A318C113DE1`，提交推送另记 `commit-and-push.json`。所有冻结case／source／build目录禁止新增或改写。
+
+下一片先读 `runtime/phase43-next-scope-review.md`：恰两张Bow均FIELD可复用已测placement与multi-target replay，但必须独立逐卡身份／槽位绑定、顺序抑制解除和0/1/2回放验收，F12旧含义不能放宽。直接发动后的inactive来源为False/COMPLETE，而本轮used来源为True/NONE；原25比较包含UI actionState，不能仅放开布尔值、改比较器或新增未审UI setter。跨HAND/TRASH/FIELD副本、新profile、敌人及重编程均后置。新阶段必须fresh backup、新证据根、新工具版本，旧A/B/C/42保持不变。
 
 ## 2026-10-15 第四十一阶段：角色资源许可守卫已收尾
 

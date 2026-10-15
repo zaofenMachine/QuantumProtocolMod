@@ -144,6 +144,74 @@ namespace QuantumCheckpoint
             std::uint8_t origin{};
         };
 
+        struct NativeEffectDescriptor
+        {
+            std::string tag{};
+            std::uint8_t type{};
+            std::string factory_key{};
+            const void* object{};
+            const void* controller{};
+            std::array<std::uint8_t, 16> guid{};
+
+            auto operator==(const NativeEffectDescriptor&) const -> bool = default;
+        };
+
+        struct NativeCardEffects
+        {
+            std::int32_t count{}, capacity{};
+            std::vector<NativeEffectDescriptor> descriptors{};
+            const void* state{};
+            const void* object{};
+            const void* controller{};
+            const void* array{};
+
+            auto operator==(const NativeCardEffects&) const -> bool = default;
+        };
+
+        struct NativeEffectQualificationEntry
+        {
+            const void* address{};
+            std::array<std::uint8_t, 12> bytes{};
+            auto operator==(const NativeEffectQualificationEntry&) const -> bool = default;
+        };
+
+        struct NativeEffectQualification
+        {
+            std::uint8_t used_once{};
+            std::array<std::uint8_t, 0x50> flags_header{};
+            std::vector<std::uint32_t> allocation_words{};
+            std::vector<NativeEffectQualificationEntry> entries{};
+            std::vector<std::uint8_t> flags{};
+            std::uint8_t flags_mask{};
+            auto operator==(const NativeEffectQualification&) const -> bool = default;
+        };
+
+        struct NativeCardQualificationObservation
+        {
+            NativeCardEffects membership{};
+            std::vector<NativeEffectQualification> values{};
+            std::string card_info{}, card_id{};
+            std::array<std::uint8_t, 16> card_guid{};
+            std::uint8_t location{};
+            std::uintptr_t info_getter_rva{}, id_getter_rva{};
+            auto operator==(const NativeCardQualificationObservation&) const -> bool = default;
+        };
+
+        struct RouteCCaptureObjectIdentity
+        {
+            UObject* object{};
+            std::int32_t internal_index{};
+            std::string full_name{};
+            FWeakObjectPtr weak{};
+            bool weak_verified{};
+        };
+
+        struct BowFieldDescriptorWitness
+        {
+            RouteCCaptureObjectIdentity world{}, engine{}, card{};
+            NativeCardQualificationObservation original{};
+        };
+
         struct PendingNativeFieldMove
         {
             UObject* card{};
@@ -160,6 +228,11 @@ namespace QuantumCheckpoint
             bool target_turn_active{};
             bool turn_active_written{};
             bool effects_suppressed{};
+            bool bow_field_witness_required{};
+            bool bow_field_witness_failed{};
+            bool bow_field_identity_failed{};
+            std::string bow_field_expected_info{};
+            std::optional<BowFieldDescriptorWitness> bow_field_witness{};
         };
 
         struct PendingNativeRestoreMove
@@ -169,15 +242,6 @@ namespace QuantumCheckpoint
             const void* shared_controller{};
             std::uint8_t destination{};
             std::chrono::steady_clock::time_point queued_at{};
-        };
-
-        struct RouteCCaptureObjectIdentity
-        {
-            UObject* object{};
-            std::int32_t internal_index{};
-            std::string full_name{};
-            FWeakObjectPtr weak{};
-            bool weak_verified{};
         };
 
         struct CharacterResourceObservation
@@ -1841,6 +1905,54 @@ namespace QuantumCheckpoint
             }
         }
 
+        // Dedicated F12 witness evidence: complete bounded record or an explicit exception.
+        // Ordinary crash-breadcrumb tracing retains its existing truncation/noexcept contract.
+        auto append_bow_field_witness_trace(std::string_view event, std::string_view reason) -> void
+        {
+            constexpr std::size_t MaximumDetailBytes = 4096;
+            constexpr std::size_t MaximumLineBytes = 8192;
+            if (!event.starts_with("restore.bow-field-witness.") || event.size() > 96
+                || reason.empty() || reason.size() > MaximumDetailBytes
+                || event.find_first_of("\r\n\0", 0, 3) != std::string_view::npos
+                || reason.find_first_of("\r\n\0", 0, 3) != std::string_view::npos)
+                throw std::runtime_error{"Bow FIELD witness trace exceeds its bounded single-line contract"};
+            SYSTEMTIME utc{};
+            GetSystemTime(&utc);
+            std::array<char, 128> prefix{};
+            const int prefix_length = std::snprintf(prefix.data(), prefix.size(),
+                "%04u-%02u-%02uT%02u:%02u:%02u.%03uZ pid=%lu tid=%lu ",
+                static_cast<unsigned>(utc.wYear), static_cast<unsigned>(utc.wMonth),
+                static_cast<unsigned>(utc.wDay), static_cast<unsigned>(utc.wHour),
+                static_cast<unsigned>(utc.wMinute), static_cast<unsigned>(utc.wSecond),
+                static_cast<unsigned>(utc.wMilliseconds), static_cast<unsigned long>(GetCurrentProcessId()),
+                static_cast<unsigned long>(GetCurrentThreadId()));
+            if (prefix_length <= 0 || static_cast<std::size_t>(prefix_length) >= prefix.size())
+                throw std::runtime_error{"Bow FIELD witness trace timestamp formatting failed"};
+            const auto length = static_cast<std::size_t>(prefix_length) + event.size() + 8 + reason.size() + 2;
+            if (length > MaximumLineBytes)
+                throw std::runtime_error{"Bow FIELD witness trace record exceeds its line bound"};
+            std::string line{};
+            line.reserve(length);
+            line.append(prefix.data(), static_cast<std::size_t>(prefix_length));
+            line.append(event); line += " reason="; line.append(reason); line += "\r\n";
+            if (line.size() != length)
+                throw std::runtime_error{"Bow FIELD witness trace record length differs"};
+            const auto mods_directory = std::filesystem::path{UE4SSProgram::get_program().get_mods_directory()};
+            const auto path = mods_directory / STR("QuantumCheckpoint") / STR("route-c-trace.log");
+            const HANDLE file = CreateFileW(path.c_str(), FILE_APPEND_DATA,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_ALWAYS,
+                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH, nullptr);
+            if (file == INVALID_HANDLE_VALUE)
+                throw std::runtime_error{"Bow FIELD witness trace file could not be opened"};
+            DWORD written{};
+            const bool complete = WriteFile(file, line.data(), static_cast<DWORD>(line.size()), &written, nullptr)
+                && written == line.size();
+            const bool flushed = complete && FlushFileBuffers(file);
+            const bool closed = CloseHandle(file);
+            if (!complete || !flushed || !closed)
+                throw std::runtime_error{"Bow FIELD witness trace was not completely written/flushed/closed"};
+        }
+
         auto append_route_c_trace_failure(std::string_view event, std::string_view reason) noexcept
             -> void
         {
@@ -3402,32 +3514,9 @@ namespace QuantumCheckpoint
             catch (const std::exception& error) { snapshot.properties.push_back({"nativeCounters:readError",error.what()}); }
         }
 
-        struct NativeEffectDescriptor
-        {
-            std::string tag{};
-            std::uint8_t type{};
-            std::string factory_key{};
-            const void* object{};
-            const void* controller{};
-            std::array<std::uint8_t, 16> guid{};
-
-            auto operator==(const NativeEffectDescriptor&) const -> bool = default;
-        };
-
-        struct NativeCardEffects
-        {
-            std::int32_t count{}, capacity{};
-            std::vector<NativeEffectDescriptor> descriptors{};
-            const void* state{};
-            const void* object{};
-            const void* controller{};
-            const void* array{};
-
-            auto operator==(const NativeCardEffects&) const -> bool = default;
-        };
-
         auto read_native_card_effects(UObject* card_engine, UObject* object,
-                                      ObjectSnapshot* diagnostic = nullptr) -> NativeCardEffects
+                                      ObjectSnapshot* diagnostic = nullptr,
+                                      const NativeCardEffects* suppressed_saved = nullptr) -> NativeCardEffects
         {
             if (GetCurrentThreadId() != g_game_thread_id.load(std::memory_order_acquire))
                 throw std::runtime_error{"native effects observation requires the game thread"};
@@ -3475,8 +3564,17 @@ namespace QuantumCheckpoint
                                      sizeof(void*) + sizeof(std::int32_t) * 2))
                 throw std::runtime_error{"native effect array header is unreadable"};
             const auto* data = read_native_value<const void*>(card, NativeCardEffectListPointerOffset);
-            const auto count = read_native_value<std::int32_t>(card, NativeCardEffectListCountOffset);
+            const auto physical_count = read_native_value<std::int32_t>(card, NativeCardEffectListCountOffset);
+            if (suppressed_saved && (diagnostic || physical_count != 0
+                || suppressed_saved->count != 1 || suppressed_saved->capacity < suppressed_saved->count
+                || suppressed_saved->capacity > 256 || suppressed_saved->state != state
+                || suppressed_saved->object != card || suppressed_saved->controller != owner
+                || suppressed_saved->array != data || suppressed_saved->descriptors.size() != 1))
+                throw std::runtime_error{"suppressed Bow descriptor read is not bound to its saved owner/header"};
+            const auto count = suppressed_saved ? suppressed_saved->count : physical_count;
             const auto capacity = read_native_value<std::int32_t>(card, NativeCardEffectListCapacityOffset);
+            if (suppressed_saved && capacity != suppressed_saved->capacity)
+                throw std::runtime_error{"suppressed Bow descriptor capacity changed"};
             if (diagnostic)
             {
                 diagnostic->properties.push_back({"nativeEffects:count", std::to_string(count)});
@@ -3545,7 +3643,7 @@ namespace QuantumCheckpoint
                 || read_native_value<const void*>(state, CardStateSharedControllerOffset) != owner
                 || read_native_value<std::int32_t>(owner, sizeof(void*)) != owner_count
                 || read_native_value<const void*>(card, NativeCardEffectListPointerOffset) != data
-                || read_native_value<std::int32_t>(card, NativeCardEffectListCountOffset) != count
+                || read_native_value<std::int32_t>(card, NativeCardEffectListCountOffset) != physical_count
                 || read_native_value<std::int32_t>(card, NativeCardEffectListCapacityOffset) != capacity)
                 throw std::runtime_error{"native effect owner or array changed during observation"};
             return observed;
@@ -3647,24 +3745,6 @@ namespace QuantumCheckpoint
 
         // Phase 38 observation prototype only. Keep this independent of the
         // persisted effect descriptor and all exact capture/restore predicates.
-        struct NativeEffectQualificationEntry
-        {
-            const void* address{};
-            std::array<std::uint8_t, 12> bytes{};
-            auto operator==(const NativeEffectQualificationEntry&) const -> bool = default;
-        };
-
-        struct NativeEffectQualification
-        {
-            std::uint8_t used_once{};
-            std::array<std::uint8_t, 0x50> flags_header{};
-            std::vector<std::uint32_t> allocation_words{};
-            std::vector<NativeEffectQualificationEntry> entries{};
-            std::vector<std::uint8_t> flags{};
-            std::uint8_t flags_mask{};
-            auto operator==(const NativeEffectQualification&) const -> bool = default;
-        };
-
         auto read_native_effect_qualification(const NativeEffectDescriptor& effect)
             -> NativeEffectQualification
         {
@@ -3726,24 +3806,14 @@ namespace QuantumCheckpoint
             return value;
         }
 
-        struct NativeCardQualificationObservation
-        {
-            NativeCardEffects membership{};
-            std::vector<NativeEffectQualification> values{};
-            std::string card_info{}, card_id{};
-            std::array<std::uint8_t, 16> card_guid{};
-            std::uint8_t location{};
-            std::uintptr_t info_getter_rva{}, id_getter_rva{};
-            auto operator==(const NativeCardQualificationObservation&) const -> bool = default;
-        };
-
-        auto observe_native_card_qualification(UObject* card_engine, UObject* object)
+        auto observe_native_card_qualification(UObject* card_engine, UObject* object,
+                                                const NativeCardEffects* suppressed_saved = nullptr)
             -> NativeCardQualificationObservation
         {
             if (GetCurrentThreadId() != g_game_thread_id.load(std::memory_order_acquire))
                 throw std::runtime_error{"effect qualification observation requires the game thread"};
             const auto api = validated_native_move_card_api(card_engine);
-            const auto membership = read_native_card_effects(card_engine, object);
+            const auto membership = read_native_card_effects(card_engine, object, nullptr, suppressed_saved);
             const auto module_base = reinterpret_cast<std::uintptr_t>(GetModuleHandleW(L"Quantum-Win64-Shipping.exe"));
             const auto signature = [&](std::uintptr_t rva, const auto& bytes) {
                 const auto* address = reinterpret_cast<const std::uint8_t*>(module_base + rva);
@@ -3806,7 +3876,7 @@ namespace QuantumCheckpoint
             const auto card_id = getter_text(STR("getId"));
             const auto location = native_card_location(api.engine_state, membership.state, api.get_card_location);
             if (!location || !address_is_readable(static_cast<const std::byte*>(membership.object) + 0x18, 16)
-                || read_native_card_effects(card_engine, object) != membership)
+                || read_native_card_effects(card_engine, object, nullptr, suppressed_saved) != membership)
                 throw std::runtime_error{"effect qualification card identity changed before reading fields"};
             std::array<std::uint8_t, 16> card_guid{};
             std::memcpy(card_guid.data(), static_cast<const std::byte*>(membership.object) + 0x18, card_guid.size());
@@ -3823,7 +3893,7 @@ namespace QuantumCheckpoint
             std::vector<NativeEffectQualification> values{};
             for (const auto& effect : membership.descriptors)
                 values.push_back(read_native_effect_qualification(effect));
-            if (read_native_card_effects(card_engine, object) != membership)
+            if (read_native_card_effects(card_engine, object, nullptr, suppressed_saved) != membership)
                 throw std::runtime_error{"native effect qualification membership changed after reading fields"};
             for (std::size_t index{}; index < values.size(); ++index)
                 if (read_native_effect_qualification(membership.descriptors[index]) != values[index])
@@ -3832,7 +3902,7 @@ namespace QuantumCheckpoint
                 || require_getter(STR("getId"), 16) != id_getter
                 || info_getter->GetFuncPtr() != info_getter_address || id_getter->GetFuncPtr() != id_getter_address
                 || getter_text(STR("getCardInfoInstance")) != card_info || getter_text(STR("getId")) != card_id
-                || read_native_card_effects(card_engine, object) != membership
+                || read_native_card_effects(card_engine, object, nullptr, suppressed_saved) != membership
                 || native_card_location(api.engine_state, membership.state, api.get_card_location) != location
                 || !address_is_readable(static_cast<const std::byte*>(membership.object) + 0x18, card_guid.size())
                 || std::memcmp(card_guid.data(), static_cast<const std::byte*>(membership.object) + 0x18, card_guid.size()) != 0)
@@ -3842,7 +3912,7 @@ namespace QuantumCheckpoint
             for (std::size_t index{}; index < values.size(); ++index)
                 if (read_native_effect_qualification(membership.descriptors[index]) != values[index])
                     throw std::runtime_error{"native effect qualification fields changed during final identity getters"};
-            if (read_native_card_effects(card_engine, object) != membership)
+            if (read_native_card_effects(card_engine, object, nullptr, suppressed_saved) != membership)
                 throw std::runtime_error{"native effect qualification final membership changed"};
 
             return {membership, values, card_info, card_id, card_guid, *location,
@@ -5276,6 +5346,7 @@ namespace QuantumCheckpoint
                     PlayerCounterState counter_state{};
                 };
                 std::vector<CapturedFieldCard> captured_cards{};
+                bool captures_field_bow{};
                 for (const auto& card : native_cards_at_location(
                          objects.card_engine, api.location, 3))
                 {
@@ -5300,10 +5371,31 @@ namespace QuantumCheckpoint
                     const auto definition = defined_player_card_statistics(nullptr, card.card, false);
                     if (health_state.base_health != definition.health)
                         throw std::runtime_error{"FIELD dynamic base health is outside the supported definition baseline"};
+                    const auto instance = required_getter_text(card.card, STR("getCardInfoInstance"));
+                    std::string identity_error{};
+                    const auto identity = exact_card_identity_key_from_instance(instance, identity_error);
+                    if (!identity) throw std::runtime_error{identity_error};
+                    if (identity->starts_with("sakuraBow@"))
+                    {
+                        const auto immutable = defined_player_card_statistics(objects.game_instance, card.card);
+                        ObjectSnapshot level{};
+                        append_native_card_level(level, card.card);
+                        const auto level_verified = std::any_of(level.properties.begin(), level.properties.end(),
+                            [](const auto& value) { return value.name == "nativeLevel:status"
+                                && value.value == "verified-native-level"; });
+                        if (*identity != "sakuraBow@0" || captures_field_bow || !level_verified
+                            || immutable.attack != 1 || immutable.health != 1 || immutable.level != 1
+                            || read_native_value<std::int32_t>(card.state, 0x110) != immutable.level
+                            || read_native_value<std::int32_t>(card.state, CardStateTurnBaseOffset) != 0
+                            || read_native_value<std::int32_t>(card.state, CardStateTurnAdjustmentOffset) != -1
+                            || parse_int32(required_getter_text(card.card, STR("getCurrentTurnCounter"))) != -1
+                            || turn_active != "True")
+                            throw std::runtime_error{"F12 supports one base Bow FIELD with immutable default level and turn state"};
+                        captures_field_bow = true;
+                    }
                     captured_cards.push_back(CapturedFieldCard{
                         .placement = *placement,
-                        .instance = required_getter_text(
-                            card.card, STR("getCardInfoInstance")),
+                        .instance = instance,
                         .health = *health,
                         .turn_active = turn_active == "True",
                         .attack = capture_player_attack_state(card.card,true),
@@ -5326,6 +5418,10 @@ namespace QuantumCheckpoint
                     });
 
                 ExactPlayerFieldCheckpoint exact{};
+                // Ordinary fruit FIELD captures retain F11, including its existing
+                // HAND/TRASH Bow combinations. F12 is an explicit narrow admission.
+                exact.schema_version = captures_field_bow ? ExactPlayerFieldBowPlacementSchemaVersion
+                    : ExactPlayerFieldBowOnceQualificationSchemaVersion;
                 exact.qualification_policy = ExactPlayerQualificationBowOncePolicy;
                 exact.captured_at_utc = checkpoint.captured_at_utc;
                 exact.route_c_payload_checksum = checkpoint.payload_checksum;
@@ -5386,6 +5482,9 @@ namespace QuantumCheckpoint
                 {
                     throw std::runtime_error{exact_validation_error};
                 }
+                if (captures_field_bow)
+                    append_route_c_trace_failure("capture.bow-field-placement.admitted",
+                        "schema=12 bows=1 scope=base-bow-field-default-numerics");
                 exact_player_field = std::move(exact);
                 append_route_c_trace("capture.exact-player-field.prepare.complete");
             }
@@ -6403,13 +6502,164 @@ namespace QuantumCheckpoint
             reinterpret_cast<Add>(module_base + 0xE0F640)(api.engine_state, &empty, &target, owned.data());
         }
 
-        auto restore_field_card_effects(PendingNativeFieldMove& target,
-                                        bool field_trace = true) -> bool
+        auto bow_field_witness_detail(const PendingNativeFieldMove& target, bool suppressed,
+                                      std::uint8_t location) -> std::string
         {
+            const auto& witness = target.bow_field_witness.value();
+            const auto& native = witness.original;
+            const auto& effect = native.membership.descriptors.at(0);
+            std::ostringstream detail{};
+            detail << "row=" << target.row << " index=" << target.index << " ordinal=0 cardId=" << native.card_id
+                << " effectGuid=" << std::hex << std::uppercase << std::setfill('0');
+            for (auto byte : effect.guid) detail << std::setw(2) << unsigned(byte);
+            detail << " ownerCardGuid=";
+            for (auto byte : native.card_guid) detail << std::setw(2) << unsigned(byte);
+            detail << " flagsHeader=";
+            for (auto byte : native.values.at(0).flags_header) detail << std::setw(2) << unsigned(byte);
+            detail << " flagsWords=";
+            if (native.values.at(0).allocation_words.empty()) detail << "none";
+            for (auto word : native.values.at(0).allocation_words) detail << std::setw(8) << word;
+            detail << " flagsEntries=";
+            if (native.values.at(0).entries.empty()) detail << "none";
+            for (const auto& entry : native.values.at(0).entries)
+            {
+                detail << "0x" << reinterpret_cast<std::uintptr_t>(entry.address) << ":";
+                for (auto byte : entry.bytes) detail << std::setw(2) << unsigned(byte);
+                detail << ";";
+            }
+            detail << " actor=0x" << reinterpret_cast<std::uintptr_t>(witness.card.object)
+                << " world=0x" << reinterpret_cast<std::uintptr_t>(witness.world.object)
+                << " engine=0x" << reinterpret_cast<std::uintptr_t>(witness.engine.object)
+                << " nativeObject=0x" << reinterpret_cast<std::uintptr_t>(native.membership.object)
+                << " state=0x" << reinterpret_cast<std::uintptr_t>(native.membership.state)
+                << " controller=0x" << reinterpret_cast<std::uintptr_t>(native.membership.controller)
+                << " array=0x" << reinterpret_cast<std::uintptr_t>(native.membership.array)
+                << " effect=0x" << reinterpret_cast<std::uintptr_t>(effect.object)
+                << " effectController=0x" << reinterpret_cast<std::uintptr_t>(effect.controller)
+                << std::dec << " count=" << (suppressed ? 0 : native.membership.count)
+                << " savedCount=" << native.membership.count << " capacity=" << native.membership.capacity
+                << " location=" << unsigned(location) << " used=0 flags=0"
+                << " type=" << unsigned(effect.type) << " tag=" << effect.tag << " factory=" << effect.factory_key
+                << " worldIndex=" << witness.world.internal_index << " engineIndex=" << witness.engine.internal_index
+                << " actorIndex=" << witness.card.internal_index;
+            return detail.str();
+        }
+
+        auto verify_bow_field_descriptor_witness(const PendingNativeFieldMove& target, bool suppressed)
+            -> std::uint8_t
+        {
+            if (!target.bow_field_witness_required || !target.bow_field_witness)
+                throw std::runtime_error{"Bow FIELD descriptor witness is missing"};
+            const auto& witness = *target.bow_field_witness;
+            const auto registered = registered_overlay_objects();
+            auto* world = witness.world.object;
+            auto* engine = witness.engine.object;
+            const auto guard = [&] {
+                if (!witness.world.weak_verified || !witness.engine.weak_verified || !witness.card.weak_verified
+                    || !same_route_c_capture_object(witness.world, world, nullptr, registered)
+                    || !same_route_c_capture_object(witness.engine, engine, world, registered)
+                    || !same_route_c_capture_object(witness.card, target.card, world, registered)
+                    || witness.original.membership.state != target.state
+                    || witness.original.membership.object != target.native_card_object
+                    || witness.original.membership.array != target.effect_list_pointer
+                    || witness.original.membership.count != target.effect_list_count
+                    || witness.original.membership.capacity != target.effect_list_capacity)
+                    throw std::runtime_error{"Bow FIELD descriptor witness lifetime/target binding changed"};
+            };
+            guard();
+            const auto& effect = witness.original.membership.descriptors.at(0);
+            const auto base = reinterpret_cast<std::uintptr_t>(GetModuleHandleW(L"Quantum-Win64-Shipping.exe"));
+            if (!base || !address_is_readable(effect.object, 0x198)
+                || read_native_value<std::uintptr_t>(effect.object, 0) != base + bow_once::VtableRva
+                || read_native_value<std::int32_t>(effect.object, 0x190) != 4)
+                throw std::runtime_error{"Bow FIELD witness native implementation changed"};
+            const auto observed = observe_native_card_qualification(engine, target.card,
+                suppressed ? &witness.original.membership : nullptr);
+            guard();
+            if (observed.location != 0 && observed.location != 3)
+                throw std::runtime_error{"Bow FIELD witness left the permitted HAND/FIELD transition"};
+            auto expected = witness.original;
+            expected.location = observed.location;
+            if (observed != expected)
+                throw std::runtime_error{"Bow FIELD ordered descriptor/owner/GUID/full-info/flags/used0 witness changed"};
+            return observed.location;
+        }
+
+        auto capture_bow_field_descriptor_witness(PendingNativeFieldMove& target,
+                                                  const RouteCBattleObjects& objects) -> void
+        {
+            if (!target.bow_field_witness_required || target.bow_field_witness)
+                throw std::runtime_error{"Bow FIELD descriptor witness cannot be recaptured"};
+            const auto registered = registered_overlay_objects();
+            auto* world = reinterpret_cast<UObject*>(objects.card_engine->GetWorld());
+            BowFieldDescriptorWitness witness{};
+            witness.world = pin_route_c_capture_object(world, nullptr, registered);
+            witness.engine = pin_route_c_capture_object(objects.card_engine, world, registered);
+            witness.card = pin_route_c_capture_object(target.card, world, registered);
+            if (!witness.world.weak_verified || !witness.engine.weak_verified || !witness.card.weak_verified)
+                throw std::runtime_error{"Bow FIELD requires verified world/engine/card weak identities"};
+            validate_player_card_effect_membership(objects.card_engine, target.card);
+            witness.original = observe_native_card_qualification(objects.card_engine, target.card);
+            const auto& native = witness.original;
+            std::string error{};
+            const auto key = exact_card_identity_key_from_instance(native.card_info, error);
+            if (!key || *key != "sakuraBow@0" || native.card_info != target.bow_field_expected_info
+                || native.location != 0 || native.membership.state != target.state
+                || native.membership.object != target.native_card_object
+                || native.membership.array != target.effect_list_pointer
+                || native.membership.count != target.effect_list_count
+                || native.membership.capacity != target.effect_list_capacity
+                || native.membership.count != 1 || native.membership.descriptors.size() != 1
+                || native.values.size() != 1 || native.values[0].used_once != 0
+                || native.values[0].flags != std::vector<std::uint8_t>{0})
+                throw std::runtime_error{"Bow FIELD witness needs exact base Bow full-info/profile and newborn HAND used0"};
+            const auto& effect = native.membership.descriptors[0];
+            const auto profile = qualification::lookup_effect_qualification_profile(*key, 0,
+                effect.factory_key, effect.tag, effect.type, ExactPlayerQualificationBowOncePolicy);
+            const auto base = reinterpret_cast<std::uintptr_t>(GetModuleHandleW(L"Quantum-Win64-Shipping.exe"));
+            if (!profile || !profile->permits_used_once_replay || !base
+                || !address_is_readable(effect.object, 0x198)
+                || read_native_value<std::uintptr_t>(effect.object, 0) != base + bow_once::VtableRva
+                || read_native_value<std::int32_t>(effect.object, 0x190) != 4)
+                throw std::runtime_error{"Bow FIELD witness implementation/profile differs"};
+            const auto qualifications = observe_player_qualification(objects, ExactPlayerQualificationBowOncePolicy);
+            std::size_t bows{};
+            for (const auto& card : qualifications)
+            {
+                const auto identity = exact_card_identity_key_from_instance(card.saved.card_info_instance, error);
+                if (!identity) throw std::runtime_error{"Bow FIELD population identity is unavailable"};
+                if (*identity == "sakuraBow@0") ++bows;
+            }
+            if (bows != 1)
+                throw std::runtime_error{"Bow FIELD witness requires one unique base Bow in player D/H/T/F"};
+            target.bow_field_witness = std::move(witness);
+            const auto location = verify_bow_field_descriptor_witness(target, false);
+            if (location != 0) throw std::runtime_error{"Bow FIELD witness capture changed HAND location"};
+            append_bow_field_witness_trace("restore.bow-field-witness.before-suppression",
+                bow_field_witness_detail(target, false, location));
+        }
+
+        auto restore_field_card_effects(PendingNativeFieldMove& target,
+                                        bool field_trace = true,
+                                        bool terminal_cleanup_only = false) -> bool
+        {
+            if (target.bow_field_witness_required
+                && (target.bow_field_identity_failed
+                    || (target.bow_field_witness_failed && !terminal_cleanup_only)))
+                return false; // Evidence failure never revives a qualified claim.
             if (!target.effects_suppressed)
             {
                 return true;
             }
+            const auto bow_failure = [&](std::string_view reason, bool identity_failed) {
+                if (target.bow_field_witness_required)
+                {
+                    target.bow_field_witness_failed = true;
+                    target.bow_field_identity_failed = target.bow_field_identity_failed || identity_failed;
+                    append_route_c_trace_failure("restore.bow-field-witness.failed", reason);
+                }
+                return false;
+            };
             if (!target.native_card_object
                 || !address_is_readable(
                     static_cast<const std::byte*>(target.native_card_object)
@@ -6420,7 +6670,7 @@ namespace QuantumCheckpoint
                         + NativeCardEffectListCountOffset,
                     sizeof(std::int32_t)))
             {
-                return false;
+                return bow_failure("suppressed effect header is unavailable", true);
             }
             const auto* pointer = read_native_value<const void*>(
                 target.native_card_object, NativeCardEffectListPointerOffset);
@@ -6432,7 +6682,25 @@ namespace QuantumCheckpoint
                 || capacity != target.effect_list_capacity
                 || capacity < target.effect_list_count)
             {
-                return false;
+                return bow_failure("suppressed effect header differs from the original", true);
+            }
+            std::uint8_t location{};
+            if (target.bow_field_witness_required)
+            {
+                try { location = verify_bow_field_descriptor_witness(target, true); }
+                catch (const std::exception& error) { return bow_failure(error.what(), true); }
+                if (!terminal_cleanup_only)
+                {
+                    try
+                    {
+                        append_bow_field_witness_trace("restore.bow-field-witness.before-count-restore",
+                            bow_field_witness_detail(target, true, location));
+                    }
+                    catch (const std::exception& error) { return bow_failure(error.what(), false); }
+                }
+                // Also revalidate after potentially blocking evidence I/O; no count write precedes this.
+                try { (void)verify_bow_field_descriptor_witness(target, true); }
+                catch (const std::exception& error) { return bow_failure(error.what(), true); }
             }
             write_native_value(
                 target.native_card_object,
@@ -6442,12 +6710,36 @@ namespace QuantumCheckpoint
                     target.native_card_object,
                     NativeCardEffectListCountOffset) != target.effect_list_count)
             {
-                return false;
+                return bow_failure("effect count restoration did not verify", true);
+            }
+            if (target.bow_field_witness_required)
+            {
+                try { location = verify_bow_field_descriptor_witness(target, false); }
+                catch (const std::exception& error)
+                {
+                    target.effects_suppressed = false; // Count released, identity claim permanently failed.
+                    return bow_failure(error.what(), true);
+                }
+                if (!terminal_cleanup_only)
+                {
+                    try
+                    {
+                        append_bow_field_witness_trace("restore.bow-field-witness.after-count-restore",
+                            bow_field_witness_detail(target, false, location));
+                    }
+                    catch (const std::exception& error)
+                    {
+                        target.effects_suppressed = false;
+                        return bow_failure(error.what(), false);
+                    }
+                }
             }
             target.effects_suppressed = false;
-            if (field_trace)
+            if (target.bow_field_witness_required && terminal_cleanup_only)
+                append_route_c_trace("restore.bow-field-witness.terminal-cleanup-count-released");
+            else if (field_trace)
                 append_route_c_trace("restore.exact-player-field.effects.restored");
-            return true;
+            return true; // Terminal mode reports cleanup only; it never clears either failure latch.
         }
 
         auto restore_move_card_effects(PendingRouteCRestore& restore,
@@ -7374,7 +7666,7 @@ namespace QuantumCheckpoint
                             found = found || (card.card == target.card && card.state == target.state);
                         }
                     }
-                    if (!found || !restore_field_card_effects(target))
+                    if (!found || !restore_field_card_effects(target, true, true))
                     {
                         throw std::runtime_error{"suppressed effect owner or array no longer matches"};
                     }
@@ -9945,6 +10237,8 @@ namespace QuantumCheckpoint
                     throw std::runtime_error{
                         "field target play-effect list changed before suppression"};
                 }
+                if (target.bow_field_witness_required)
+                    capture_bow_field_descriptor_witness(target, objects);
                 write_native_value(
                     target.native_card_object,
                     NativeCardEffectListCountOffset,
@@ -9956,6 +10250,13 @@ namespace QuantumCheckpoint
                 {
                     throw std::runtime_error{
                         "field target play-effect suppression did not verify"};
+                }
+                if (target.bow_field_witness_required)
+                {
+                    const auto location = verify_bow_field_descriptor_witness(target, true);
+                    if (location != 0) throw std::runtime_error{"suppressed Bow FIELD target left HAND before queue"};
+                    append_bow_field_witness_trace("restore.bow-field-witness.suppressed",
+                        bow_field_witness_detail(target, true, location));
                 }
                 append_route_c_trace(
                     "restore.exact-player-field.effects.suppressed");
@@ -10301,6 +10602,9 @@ namespace QuantumCheckpoint
                         .original_turn_active = native_turn_active != 0,
                         .target_turn_active =
                             (*expected_states)[saved_index].turn_active,
+                        .bow_field_witness_required = restore.exact_player_field->schema_version
+                            == ExactPlayerFieldBowPlacementSchemaVersion && candidate.key == "sakuraBow@0",
+                        .bow_field_expected_info = (*expected_field)[saved_index],
                     });
                 }
                 std::stable_sort(targets.begin(), targets.end(), [](const auto& left,
@@ -15664,9 +15968,9 @@ namespace QuantumCheckpoint
         QuantumCheckpointMod()
         {
             ModName = STR("QuantumCheckpoint");
-            ModVersion = STR("0.42.0");
+            ModVersion = STR("0.43.0");
 #if defined(QUANTUM_CHECKPOINT_RUNTIME_TEST_FIXTURES)
-            ModVersion = STR("0.42.0-test-fixtures");
+            ModVersion = STR("0.43.0-test-fixtures");
 #endif
             ModDescription = STR("Route C checkpoint with optional exact-state supplements");
             ModAuthors = STR("zaofenMachine and contributors");

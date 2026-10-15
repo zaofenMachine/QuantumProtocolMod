@@ -2349,6 +2349,86 @@ namespace QuantumCheckpoint
         return output.str();
     }
 
+    auto validate_player_field_bow_placement_scope(
+        const ExactPlayerFieldCheckpoint& checkpoint, std::string& error) -> bool
+    {
+        error.clear();
+        if (checkpoint.schema_version != ExactPlayerFieldBowPlacementSchemaVersion)
+            return true;
+        if (checkpoint.kind != ExactPlayerFieldCheckpointKind
+            || checkpoint.qualification_policy != ExactPlayerQualificationBowOncePolicy)
+        {
+            error = "F12 Bow placement requires the unchanged Q2 Bow qualification policy";
+            return false;
+        }
+        const std::array<std::string_view, 4> arrays{
+            checkpoint.player_hand, checkpoint.player_deck,
+            checkpoint.player_trash, checkpoint.player_field};
+        std::size_t bow_count{}, bow_field_index{}, total{}, field_count{};
+        for (std::size_t zone{}; zone < arrays.size(); ++zone)
+        {
+            const auto cards = split_route_c_unreal_array(arrays[zone], error);
+            if (!cards) return false;
+            total += cards->size();
+            if (zone == 0 && cards->size() > 7)
+            {
+                error = "F12 Bow placement exceeds the qualified seven-card HAND bound";
+                return false;
+            }
+            if (zone == 3) field_count = cards->size();
+            for (std::size_t index{}; index < cards->size(); ++index)
+            {
+                const auto card = exact_card_from_instance((*cards)[index], error);
+                if (!card) return false;
+                if (card->tag == "sakuraBow")
+                {
+                    if (zone != 3 || card->upgrade_level != 0 || ++bow_count > 1)
+                    {
+                        error = "F12 requires exactly one base Bow across D/H/T/F, only in FIELD";
+                        return false;
+                    }
+                    bow_field_index = index;
+                }
+                else if (zone == 3 && !supports_plain_player_field_card(card->tag))
+                {
+                    error = "F12 FIELD admits only the original plain fruit and one base Bow";
+                    return false;
+                }
+            }
+        }
+        if (bow_count != 1 || total > 128)
+        {
+            error = "F12 requires exactly one FIELD base Bow within the 128-card bound";
+            return false;
+        }
+        const auto states = parse_exact_player_field_states(checkpoint.player_field_states, error);
+        const auto attack = parse_player_attack_states(checkpoint.player_field_attack_states, error);
+        const auto health = parse_player_health_states(checkpoint.player_field_health_states, error);
+        const auto counters = parse_player_counter_states(checkpoint.player_field_counter_states, error);
+        if (!states || !attack || !health || !counters
+            || states->size() != field_count || attack->size() != field_count
+            || health->size() != field_count || counters->size() != field_count)
+        {
+            error = "F12 Bow numeric records are missing, invalid or not aligned with FIELD";
+            return false;
+        }
+        // Pinned Sakura table / Phase40 profile has attack1, health1 for Bow@0.
+        // Runtime separately proves full immutable CardInfo/definition equality.
+        const auto& a = (*attack)[bow_field_index];
+        const auto& h = (*health)[bow_field_index];
+        const auto& c = (*counters)[bow_field_index];
+        if (a.base_attack != 1 || a.current_attack != 1 || !a.modifiers.empty()
+            || h.base_health != 1 || h.max_health != 1 || !h.modifiers.empty()
+            || (*states)[bow_field_index].current_health != 1
+            || !(*states)[bow_field_index].turn_active
+            || c.generic != 0 || !c.special.empty())
+        {
+            error = "F12 base Bow requires default attack/health, no modifiers, zero counters and turn-active true";
+            return false;
+        }
+        return true;
+    }
+
     auto validate_exact_player_field_checkpoint(
         const ExactPlayerFieldCheckpoint& checkpoint, std::string& error) -> bool
     {
@@ -2480,7 +2560,9 @@ namespace QuantumCheckpoint
                         + array_error;
                     return false;
                 }
-                if (zone == &*field && !supports_plain_player_field_card(card->tag))
+                if (zone == &*field && !supports_plain_player_field_card(card->tag)
+                    && !(checkpoint.schema_version == ExactPlayerFieldBowPlacementSchemaVersion
+                         && card->tag == "sakuraBow" && card->upgrade_level == 0))
                 {
                     error = "exact player field contains a card outside the first guarded "
                         "plain-fruit slice";
@@ -2488,6 +2570,7 @@ namespace QuantumCheckpoint
                 }
             }
         }
+        if (!validate_player_field_bow_placement_scope(checkpoint, error)) return false;
         if (!validate_hand_health_checksum_link(hand->size(), checkpoint.player_hand_health_checksum,
                                                checkpoint.schema_version >= 7, error)) return false;
         if (!validate_off_field_base_health_records(deck->size(), checkpoint.player_deck_base_health_states,
