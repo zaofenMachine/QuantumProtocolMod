@@ -4,6 +4,8 @@
 
 当前 v0.45.0 沿用路线 C“普通地牢小关语义重开”，叠加受限的玩家精确恢复：原生牌序、手牌数量、场格、生命与攻击修正、计数器、抽牌进度，以及春生成的一张额外苹果。恢复在游戏线程执行，精确层失败后重新加载一次纯 Route C。
 
+新增只读状态工具：`pwsh -NoProfile -File ./scripts/Get-CheckpointStatus.ps1`，支持中文输出和 `-Json`。它区分上次保存回执与当前文件，避免把旧回执当作当前存档或恢复保证。需要 PowerShell 7.2+，实际在7.6.5通过80项测试及12次CLI检查；游戏与DLL未改动。用法和结果含义见[第四十六阶段](docs/phase-46-checkpoint-status.md)。
+
 v0.45.0 新增保存结果回执：区分主档保存、玩家布局／资格组合提交、部分发布和拒绝，保留实际首拒绝原因。5/5 CTest、四份实机捕获审计及新存档／原用户恢复回归通过；不扩大恢复范围。详见[第四十五阶段](docs/phase-45-capture-outcome.md)。
 
 阶段44补齐双弓同前排、同后排与HAND7暂存的实机覆盖，包含新进程重复，四次恢复均25/25；沿用同一DLL。详见[第四十四阶段](docs/phase-44-bow-field-coverage.md)。
@@ -91,7 +93,7 @@ HAND schema 3 按原生下标保存基础生命、HEALTH 修正与 generic 计�
 - `src/QuantumCheckpointProbe`：UE4SS Lua 研究原型。
 - `cpp/QuantumCheckpoint`：战斗状态导出器与受控原生写入探针的 C++ 源码；已在本机构建并实测。
 - `deployment`：开发探针使用的 UE4SS 配置。
-- `scripts`：安装、卸载和收集日志的 PowerShell 脚本。
+- `scripts`：安装、卸载、只读查看保存状态和收集日志的 PowerShell 脚本。
 - `docs`：需求、架构决策和阶段实验记录。
 - `vendor`、`runtime`、`logs`、`backups`：本地依赖和运行产物，不进入版本库。
 
