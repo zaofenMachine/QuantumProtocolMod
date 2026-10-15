@@ -66,7 +66,7 @@ if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE
 }
 
-& $cmakePath --build $resolvedBuildDirectory --config $Configuration --target QuantumCheckpointPersistenceTests QuantumCheckpointAttackStateTests QuantumCheckpointHealthStateTests QuantumCheckpointCounterStateTests QuantumCheckpoint
+& $cmakePath --build $resolvedBuildDirectory --config $Configuration --target QuantumCheckpointPersistenceTests QuantumCheckpointAttackStateTests QuantumCheckpointHealthStateTests QuantumCheckpointCounterStateTests QuantumCheckpointCaptureOutcomeTests QuantumCheckpoint
 $buildExitCode = $LASTEXITCODE
 if ($buildExitCode -eq 0) {
     & $cmakePath --build $resolvedBuildDirectory --config $Configuration --target RUN_TESTS

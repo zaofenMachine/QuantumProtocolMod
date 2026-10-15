@@ -1,6 +1,19 @@
 # QuantumCheckpoint 当前工作进度（临时续接记录）
 
-> 2026-10-15 沿“小关重开＋受限玩家恢复”推进。用户已将收尾阈值更新为周额度剩余约10%。Phase44同排与满手牌覆盖已完成验证、冻结、原数据还原和停机。下方各阶段保留当时结果，不代表当前部署。
+> 2026-10-15 沿“小关重开＋受限玩家恢复”推进。用户收尾阈值为周额度剩余约10%。Phase45已完成验证、冻结、原数据还原和停机。下方历史结果不代表当前部署。
+
+## 2026-10-15 第四十五阶段：保存结果回执已收尾
+
+当前v0.45.0，生产OFF5/5CTest。新增 `Reports/route-c-capture-latest.json`，区分玩家布局／资格成套提交、主档单独提交、部分发布及主档前拒绝；七组件状态、实际首拒绝、attempt/time/binding独立记录，诊断异常不改产品控制流。恢复不读取receipt，未扩准入。详见[第四十五阶段](phase-45-capture-outcome.md)。
+
+四份捕获审计实际为完整提交、main-only、预览未命中prompt的main-only、真正选择提示中的拒绝；原始意图与实际结果分开。新捕获恢复与原用户两次恢复比较均25/25，原28项及differences保留。16正70拒绝捕获组件自测，2正6拒绝清理隔离自测。新自动transient／实机写盘故障未覆盖。
+
+证据根 `QuantumProtoclMod.runtime-evidence/20261015-capture-outcome`；冻结21工具／312本轮文件／297审计依赖，10项复验。manifest `5A7AF793101EB091EE72AFC0A0B90A440521E803880B40D61167E84990DAEE07`；入口 `phase45-frozen-revalidation-20261015T045049923478Z/revalidation-index.json`，SHA `A1B1BB055EAE2FC06AC22BF3B3725130F257CF610788B26E2A6E81C7C97536F3`。summary `F896753AA8A2BA19BD7B20F7E6B9CA6B88F85275719F5342698EEBEC07898717`，cleanup `81EC8A47CAAD042631BC40E8F05D0F70274BD24381C5F26248FA1766A4438EA5`。
+
+原17CP＋4SaveGames逐字节恢复，main `81095982711C71E2`，游戏正常关闭，Genesis未碰；保留DLL `D526BAEF456ED40FAB4B591B8676FECF4020D431988FE807CE223EDD883E5A13`，Mod源码 `304943E4C8FB901A9D1D2E742DEB71D6A37F5A723D57532060B268912DE9E952`。构建01断言、首次路径错误审计请求、Int64清理前检拒绝均保留。全部冻结45工具和case禁止改写。
+
+下一片Phase46：独立只读状态查看工具，明确“上次保存结果”与“当前磁盘档案是否匹配”，处理无receipt legacy、旧回执、损坏／缺失文件；不读取游戏内存或新增写入、不重启游戏、不扩大恢复承诺。当前周额度约剩18%，仍按10%左右收尾。新工具不得依赖runtime证据绝对路径，随仓库即可使用。
+
 
 ## 2026-10-15 第四十四阶段：双弓同排与HAND7覆盖已收尾
 

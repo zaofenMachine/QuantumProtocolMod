@@ -2,6 +2,7 @@
 #define WIN32_LEAN_AND_MEAN
 
 #include "CheckpointSchema.hpp"
+#include "CaptureOutcome.hpp"
 #include "CheckpointPersistence.hpp"
 #include "EffectQualificationPolicy.hpp"
 #include "BowOnceNativeSignature.hpp"
@@ -2019,7 +2020,7 @@ namespace QuantumCheckpoint
             }
         }
 
-        auto invalidate_exact_supplements_before_capture() -> void
+        auto invalidate_exact_supplements_before_capture(capture_outcome::Outcome* diagnostic = nullptr) -> void
         {
             // A same-second capture can have the same semantic Route C checksum.
             // Remove every old optional generation before publishing a new main
@@ -2035,14 +2036,18 @@ namespace QuantumCheckpoint
                     auto path = primary;
                     path += suffix;
                     std::error_code error{};
-                    std::filesystem::remove(path, error);
+                    const bool removed = std::filesystem::remove(path, error);
                     if (error)
                     {
                         const auto reason = "old exact supplement invalidation failed: "
                             + path.filename().string() + " error=" + std::to_string(error.value());
+                        if (diagnostic) diagnostic->failure("invalidation", "remove-failed", reason, false);
                         append_route_c_trace_failure("capture.old-exact-supplements.invalidation-failed", reason);
                         throw std::runtime_error{reason};
                     }
+                    if (diagnostic) diagnostic->safely([&] {
+                        diagnostic->event("invalidation", removed ? "removed" : "already-absent", path.filename().string());
+                    });
                 }
             }
             append_route_c_trace("capture.old-exact-supplements.invalidated");
@@ -4953,7 +4958,50 @@ namespace QuantumCheckpoint
             }
         }
 
-        auto capture_route_c_checkpoint(std::optional<PendingRouteCCapture> expected = std::nullopt)
+        auto capture_receipt_hash(capture_outcome::Outcome& outcome, capture_outcome::Part part) noexcept -> void
+        {
+            outcome.safely([&] {
+                auto& component = outcome.components[static_cast<unsigned>(part)];
+                try { component.sha256 = sha256_file(std::filesystem::path{component.path}); component.hashStatus = "observed-after-write"; }
+                catch (...) { component.hashStatus = "unavailable"; }
+            });
+        }
+
+        auto finish_capture_receipt(capture_outcome::Outcome& outcome) noexcept -> void
+        {
+            try {
+                outcome.safely([&] { outcome.finishedAtUtc = utc_timestamp(); });
+                const auto path = std::filesystem::path{UE4SSProgram::get_program().get_mods_directory()}
+                    / STR("QuantumCheckpoint") / STR("Reports") / STR("route-c-capture-latest.json");
+                const bool published = capture_outcome::publish(outcome, [&](std::string_view text) { write_file_atomically(path, text); });
+                append_route_c_trace_failure("capture.receipt.terminal",
+                    "attempt=" + outcome.attemptId + " outcome=" + std::string{outcome.classification()}
+                        + " receipt=" + (published ? "written" : "unavailable"));
+                Output::send<LogLevel::Default>(STR("[QuantumCheckpoint] Capture receipt {}: outcome={} playerBundle={} file=Reports/route-c-capture-latest.json (diagnostic only).\n"),
+                    published ? STR("written") : STR("unavailable"), to_wstring(outcome.classification()),
+                    outcome.player_committed() ? STR("committed-layout-and-qualification") : STR("not-committed"));
+            } catch (...) { /* Diagnostic failure must never change capture or retry. */ }
+        }
+
+        auto initialize_capture_receipt(capture_outcome::Outcome& outcome,
+            const PendingRouteCCapture* expected) noexcept -> void
+        {
+            static std::atomic_uint64_t next_manual{0};
+            outcome.safely([&] {
+                outcome.origin = expected ? "automatic" : "manual";
+                outcome.attemptedAtUtc = utc_timestamp();
+                outcome.attemptId = std::to_string(GetCurrentProcessId()) + ":" + outcome.origin + ":"
+                    + std::to_string(expected ? expected->request_id : ++next_manual);
+                append_route_c_trace_failure("capture.receipt.attempt",
+                    "attempt=" + outcome.attemptId + " origin=" + outcome.origin);
+                if (expected) {
+                    outcome.waveIndex = expected->wave_index;
+                    outcome.automaticDeadlineTicks = expected->deadline.time_since_epoch().count();
+                }
+            });
+        }
+
+        auto capture_route_c_checkpoint_impl(const std::optional<PendingRouteCCapture>& expected, capture_outcome::Outcome& diagnostic)
             -> std::filesystem::path
         {
             append_route_c_trace("capture.begin");
@@ -5022,6 +5070,11 @@ namespace QuantumCheckpoint
             checkpoint.source_level_name = required_text(
                 export_property_text(objects.game_instance, STR("sourceLevelName")),
                 "GameInstance.sourceLevelName");
+            diagnostic.safely([&] {
+                diagnostic.capturedAtUtc = checkpoint.captured_at_utc;
+                diagnostic.executableSha256 = checkpoint.game_executable_sha256;
+                diagnostic.sourceLevelName = checkpoint.source_level_name;
+            });
             checkpoint.active_character_info = required_text(
                 export_property_text(objects.game_instance, STR("activeCharacterInfo")),
                 "GameInstance.activeCharacterInfo");
@@ -5135,6 +5188,7 @@ namespace QuantumCheckpoint
             {
                 // Route C is the stable fallback. Failure to capture its optional exact
                 // supplement must not prevent the semantic checkpoint from being committed.
+                diagnostic.failure("exact-spawn-plan", "observation-not-selected", error.what(), false);
                 append_route_c_trace_failure(
                     "capture.exact-spawn-plan.skipped", error.what());
             }
@@ -5161,6 +5215,7 @@ namespace QuantumCheckpoint
             }
             catch (const std::exception& error)
             {
+                diagnostic.failure("qualification", "observation-refused", error.what(), true);
                 player_qualification_rejection = error.what();
                 append_route_c_trace_failure("capture.player-qualification.rejected", player_qualification_rejection);
             }
@@ -5198,6 +5253,7 @@ namespace QuantumCheckpoint
             }
             catch (const std::exception& error)
             {
+                diagnostic.failure("off-field", "observation-refused", error.what(), true);
                 off_field_rejection = error.what();
                 append_route_c_trace_failure("capture.off-field-statistics.rejected", off_field_rejection);
             }
@@ -5498,6 +5554,8 @@ namespace QuantumCheckpoint
             }
             catch (const std::exception& error)
             {
+                if (!exact_player_zones && !exact_player_trash)
+                    diagnostic.failure("layout", "observation-refused", error.what(), true);
                 append_route_c_trace_failure(
                     "capture.exact-player-field.skipped", error.what());
             }
@@ -5538,6 +5596,7 @@ namespace QuantumCheckpoint
             }
             catch (const std::exception& error)
             {
+                diagnostic.failure("exact-character-charge", "observation-not-selected", error.what(), false);
                 append_route_c_trace_failure(
                     "capture.exact-character-charge.skipped", error.what());
             }
@@ -5604,12 +5663,14 @@ namespace QuantumCheckpoint
             }
             catch (const std::exception& error)
             {
+                diagnostic.failure("exact-turn-progress", "observation-not-selected", error.what(), false);
                 append_route_c_trace_failure(
                     "capture.exact-turn-progress.skipped", error.what());
             }
 
             std::optional<ExactPlayerQualificationCheckpoint> exact_player_qualification{};
             const auto discard_player_supplements = [&]() {
+                diagnostic.withdrawn();
                 exact_player_qualification.reset();
                 exact_player_hand_health.reset();
                 exact_player_zones.reset(); exact_player_trash.reset(); exact_player_field.reset();
@@ -5647,7 +5708,8 @@ namespace QuantumCheckpoint
                 }
                 catch (const std::exception& error)
                 {
-                    player_qualification_rejection = error.what();
+                    diagnostic.failure("qualification", "observation-refused", error.what(), true);
+                player_qualification_rejection = error.what();
                     discard_player_supplements();
                     append_route_c_trace_failure("capture.player-qualification.proof-rejected", error.what());
                 }
@@ -5698,9 +5760,49 @@ namespace QuantumCheckpoint
                         + " pinGlobalEpoch=" + std::to_string(expected->delete_epoch)
                         + " globalEpoch=" + std::to_string(g_route_c_capture_delete_listener.epoch.load(std::memory_order_seq_cst))
                         + " targetEpoch=" + std::to_string(expected->target_epoch));
-            invalidate_exact_supplements_before_capture();
+            diagnostic.safely([&] {
+                using capture_outcome::Part;
+                diagnostic.mainPayloadChecksum = checkpoint.payload_checksum;
+                diagnostic.waveIndex = checkpoint.wave_index;
+                diagnostic.select(Part::Main, false, path.string(), checkpoint.payload_checksum);
+                const auto select = [&](Part part, const auto& value, const auto& target, bool required) {
+                    if (value) diagnostic.select(part, required, target.string(), value->payload_checksum);
+                };
+                select(Part::Spawn, exact_spawn_plan, exact_spawn_plan_checkpoint_path(), false);
+                select(Part::Charge, exact_character_charge, exact_character_charge_checkpoint_path(), false);
+                select(Part::Turn, exact_turn_progress, exact_turn_progress_checkpoint_path(), false);
+                select(Part::Hand, exact_player_hand_health, exact_player_hand_health_checkpoint_path(), false);
+                select(Part::Qualification, exact_player_qualification, exact_player_qualification_checkpoint_path(), true);
+                if (exact_player_qualification) {
+                    diagnostic.qualificationLayoutChecksum = exact_player_qualification->layout_payload_checksum;
+                    diagnostic.qualificationLayoutKind = exact_player_qualification->layout_kind;
+                    diagnostic.qualificationMainChecksum = exact_player_qualification->route_c_payload_checksum;
+                }
+                const auto layout = [&](const auto& value, const auto& target) {
+                    if (!value) return;
+                    diagnostic.playerSelected = true;
+                    diagnostic.layoutKind = value->kind;
+                    diagnostic.layoutSchema = value->schema_version;
+                    diagnostic.qualificationPolicy = value->qualification_policy;
+                    diagnostic.select(Part::Layout, true, target.string(), value->payload_checksum);
+                    diagnostic.handRequiredChecksum = value->player_hand_health_checksum;
+                    if (!value->player_hand_health_checksum.empty())
+                        diagnostic.components[static_cast<unsigned>(Part::Hand)].requiredForPlayer = true;
+                };
+                layout(exact_player_zones, exact_player_zones_checkpoint_path());
+                layout(exact_player_trash, exact_player_trash_checkpoint_path());
+                layout(exact_player_field, exact_player_field_checkpoint_path());
+            });
+            diagnostic.invalidationStarted = true;
+            diagnostic.event("invalidation", "entered", "old supplement invalidation entered; partial failure may leave unknown files");
+            invalidate_exact_supplements_before_capture(&diagnostic);
+            diagnostic.invalidationCompleted = true;
+            diagnostic.event("invalidation", "returned", "existing invalidation function returned");
             append_route_c_trace("capture.write.begin");
+            diagnostic.safely([&] { diagnostic.components[0].status = "writing"; });
             write_file_atomically(path, main_contents);
+            diagnostic.written(capture_outcome::Part::Main);
+            capture_receipt_hash(diagnostic, capture_outcome::Part::Main);
             append_route_c_trace("capture.complete");
             if (exact_spawn_plan)
             {
@@ -5710,10 +5812,15 @@ namespace QuantumCheckpoint
                     write_file_atomically(
                         exact_spawn_plan_checkpoint_path(),
                         serialize_exact_spawn_plan_checkpoint(std::move(*exact_spawn_plan)));
+                    diagnostic.written(capture_outcome::Part::Spawn);
+                    capture_receipt_hash(diagnostic, capture_outcome::Part::Spawn);
                     append_route_c_trace("capture.exact-spawn-plan.write.complete");
                 }
                 catch (const std::exception& error)
                 {
+                    if (diagnostic.components[static_cast<unsigned>(capture_outcome::Part::Spawn)].status != "committed")
+                        diagnostic.failed(capture_outcome::Part::Spawn, error.what(), false);
+                    else diagnostic.event("exact-spawn-plan", "post-commit-error", error.what());
                     append_route_c_trace_failure(
                     "capture.exact-spawn-plan.write.failed", error.what());
                 }
@@ -5724,10 +5831,15 @@ namespace QuantumCheckpoint
                 {
                     write_file_atomically(exact_player_hand_health_checkpoint_path(),
                         serialize_exact_player_hand_health_checkpoint(*exact_player_hand_health));
+                    diagnostic.written(capture_outcome::Part::Hand);
+                    capture_receipt_hash(diagnostic, capture_outcome::Part::Hand);
                     append_route_c_trace("capture.exact-player-hand-health.write.complete");
                 }
                 catch (const std::exception& error)
                 {
+                    if (diagnostic.components[static_cast<unsigned>(capture_outcome::Part::Hand)].status != "committed")
+                        diagnostic.failed(capture_outcome::Part::Hand, error.what(), true);
+                    else diagnostic.event("exact-player-hand-health", "post-commit-error", error.what());
                     // Never publish a layout that depends on an uncommitted sidecar.
                     player_qualification_rejection = "required HAND publication failed: " + std::string{error.what()};
                     discard_player_supplements();
@@ -5740,10 +5852,15 @@ namespace QuantumCheckpoint
                 {
                     write_file_atomically(exact_player_qualification_checkpoint_path(),
                         serialize_exact_player_qualification_checkpoint(*exact_player_qualification));
+                    diagnostic.written(capture_outcome::Part::Qualification);
+                    capture_receipt_hash(diagnostic, capture_outcome::Part::Qualification);
                     append_route_c_trace("capture.player-qualification.write.complete");
                 }
                 catch (const std::exception& error)
                 {
+                    if (diagnostic.components[static_cast<unsigned>(capture_outcome::Part::Qualification)].status != "committed")
+                        diagnostic.failed(capture_outcome::Part::Qualification, error.what(), true);
+                    else diagnostic.event("player-qualification", "post-commit-error", error.what());
                     player_qualification_rejection = "required qualification publication failed: " + std::string{error.what()};
                     discard_player_supplements();
                     append_route_c_trace_failure("capture.player-qualification.write.failed", error.what());
@@ -5759,11 +5876,16 @@ namespace QuantumCheckpoint
                         exact_player_zones_checkpoint_path(),
                         serialize_exact_player_zones_checkpoint(
                             std::move(*exact_player_zones)));
+                    diagnostic.written(capture_outcome::Part::Layout);
+                    capture_receipt_hash(diagnostic, capture_outcome::Part::Layout);
                     append_route_c_trace("capture.exact-player-zones.write.complete");
                     player_layout_published = true;
                 }
                 catch (const std::exception& error)
                 {
+                    if (diagnostic.components[static_cast<unsigned>(capture_outcome::Part::Layout)].status != "committed")
+                        diagnostic.failed(capture_outcome::Part::Layout, error.what(), true);
+                    else diagnostic.event("exact-player-zones", "post-commit-error", error.what());
                     player_qualification_rejection = "required layout publication failed: " + std::string{error.what()};
                     discard_player_supplements();
                     append_route_c_trace_failure(
@@ -5779,11 +5901,16 @@ namespace QuantumCheckpoint
                         exact_player_trash_checkpoint_path(),
                         serialize_exact_player_trash_checkpoint(
                             std::move(*exact_player_trash)));
+                    diagnostic.written(capture_outcome::Part::Layout);
+                    capture_receipt_hash(diagnostic, capture_outcome::Part::Layout);
                     append_route_c_trace("capture.exact-player-trash.write.complete");
                     player_layout_published = true;
                 }
                 catch (const std::exception& error)
                 {
+                    if (diagnostic.components[static_cast<unsigned>(capture_outcome::Part::Layout)].status != "committed")
+                        diagnostic.failed(capture_outcome::Part::Layout, error.what(), true);
+                    else diagnostic.event("exact-player-trash", "post-commit-error", error.what());
                     player_qualification_rejection = "required layout publication failed: " + std::string{error.what()};
                     discard_player_supplements();
                     append_route_c_trace_failure(
@@ -5799,11 +5926,16 @@ namespace QuantumCheckpoint
                         exact_player_field_checkpoint_path(),
                         serialize_exact_player_field_checkpoint(
                             std::move(*exact_player_field)));
+                    diagnostic.written(capture_outcome::Part::Layout);
+                    capture_receipt_hash(diagnostic, capture_outcome::Part::Layout);
                     append_route_c_trace("capture.exact-player-field.write.complete");
                     player_layout_published = true;
                 }
                 catch (const std::exception& error)
                 {
+                    if (diagnostic.components[static_cast<unsigned>(capture_outcome::Part::Layout)].status != "committed")
+                        diagnostic.failed(capture_outcome::Part::Layout, error.what(), true);
+                    else diagnostic.event("exact-player-field", "post-commit-error", error.what());
                     player_qualification_rejection = "required layout publication failed: " + std::string{error.what()};
                     discard_player_supplements();
                     append_route_c_trace_failure(
@@ -5819,10 +5951,15 @@ namespace QuantumCheckpoint
                         exact_character_charge_checkpoint_path(),
                         serialize_exact_character_charge_checkpoint(
                             std::move(*exact_character_charge)));
+                    diagnostic.written(capture_outcome::Part::Charge);
+                    capture_receipt_hash(diagnostic, capture_outcome::Part::Charge);
                     append_route_c_trace("capture.exact-character-charge.write.complete");
                 }
                 catch (const std::exception& error)
                 {
+                    if (diagnostic.components[static_cast<unsigned>(capture_outcome::Part::Charge)].status != "committed")
+                        diagnostic.failed(capture_outcome::Part::Charge, error.what(), false);
+                    else diagnostic.event("exact-character-charge", "post-commit-error", error.what());
                     append_route_c_trace_failure(
                         "capture.exact-character-charge.write.failed", error.what());
                 }
@@ -5836,10 +5973,15 @@ namespace QuantumCheckpoint
                         exact_turn_progress_checkpoint_path(),
                         serialize_exact_turn_progress_checkpoint(
                             std::move(*exact_turn_progress)));
+                    diagnostic.written(capture_outcome::Part::Turn);
+                    capture_receipt_hash(diagnostic, capture_outcome::Part::Turn);
                     append_route_c_trace("capture.exact-turn-progress.write.complete");
                 }
                 catch (const std::exception& error)
                 {
+                    if (diagnostic.components[static_cast<unsigned>(capture_outcome::Part::Turn)].status != "committed")
+                        diagnostic.failed(capture_outcome::Part::Turn, error.what(), false);
+                    else diagnostic.event("exact-turn-progress", "post-commit-error", error.what());
                     append_route_c_trace_failure(
                         "capture.exact-turn-progress.write.failed", error.what());
                 }
@@ -5852,6 +5994,36 @@ namespace QuantumCheckpoint
                 player_layout_published ? STR("profile-flags-and-bow-once-used") : STR("unsupported-no-player-layout"),
                 to_wstring(player_qualification_rejection));
             return path;
+        }
+
+        auto capture_route_c_checkpoint(std::optional<PendingRouteCCapture> expected = std::nullopt,
+            capture_outcome::Outcome* automatic_outcome = nullptr) -> std::filesystem::path
+        {
+            capture_outcome::Outcome local{};
+            auto& outcome = automatic_outcome ? *automatic_outcome : local;
+            if (!automatic_outcome) initialize_capture_receipt(outcome, expected ? &*expected : nullptr);
+            try {
+                auto path = capture_route_c_checkpoint_impl(expected, outcome);
+                finish_capture_receipt(outcome);
+                return path;
+            } catch (const RouteCCaptureProcessingWait& error) {
+                if (!automatic_outcome) { outcome.failure("capture", "processing-refused", error.what(), false); finish_capture_receipt(outcome); }
+                throw; }
+              catch (const RouteCCaptureNativeActionsBusy& error) {
+                if (!automatic_outcome) { outcome.failure("capture", "busy-refused", error.what(), false); finish_capture_receipt(outcome); }
+                throw; }
+              catch (const std::exception& error) {
+                if (outcome.components[0].status == "writing") outcome.failed(capture_outcome::Part::Main, error.what(), false);
+                outcome.failure("capture", "terminal-exception", error.what(), false);
+                if (!automatic_outcome) finish_capture_receipt(outcome);
+                throw;
+            } catch (...) {
+                if (outcome.components[0].status == "writing")
+                    outcome.failed(capture_outcome::Part::Main, "unknown non-standard capture exception", false);
+                outcome.failure("capture", "unknown-terminal-exception", "unknown non-standard capture exception", false);
+                if (!automatic_outcome) finish_capture_receipt(outcome);
+                throw;
+            }
         }
 
         auto write_route_c_restore_report(const PendingRouteCRestore& restore)
@@ -12455,10 +12627,22 @@ namespace QuantumCheckpoint
                 return;
             }
             auto capture = *g_pending_route_c_capture;
+            // One pending automatic request at a time; retain its diagnostic first refusal
+            // across transient attempts without allocating a new retry authority.
+            static capture_outcome::Outcome retained_diagnostic{};
+            static std::uint64_t diagnostic_request{};
+            if (diagnostic_request != capture.request_id) {
+                retained_diagnostic = capture_outcome::Outcome{};
+                diagnostic_request = capture.request_id;
+                initialize_capture_receipt(retained_diagnostic, &capture);
+            }
+            auto& diagnostic = retained_diagnostic;
             const auto still_current = [&] {
                 return g_pending_route_c_capture && g_pending_route_c_capture->request_id == capture.request_id;
             };
             const auto refuse = [&](std::string_view reason) {
+                diagnostic.failure("automatic", "terminal-refused", reason, false);
+                finish_capture_receipt(diagnostic);
                 if (still_current()) g_pending_route_c_capture.reset();
                 append_route_c_trace_failure("auto-capture.refused", reason);
                 Output::send<LogLevel::Warning>(
@@ -12511,7 +12695,7 @@ namespace QuantumCheckpoint
                 if (now >= capture.deadline)
                     throw std::runtime_error{"automatic capture expired thirty seconds after its first due time"};
                 const auto lifetime_identity = route_c_capture_lifetime_identity(capture);
-                const auto path = capture_route_c_checkpoint(capture);
+                const auto path = capture_route_c_checkpoint(capture, &diagnostic);
                 if (still_current()) g_pending_route_c_capture.reset();
                 append_route_c_trace_failure("auto-capture.complete",
                     "request=" + std::to_string(capture.request_id) + " wave=" + std::to_string(capture.wave_index)
@@ -16288,9 +16472,9 @@ namespace QuantumCheckpoint
         QuantumCheckpointMod()
         {
             ModName = STR("QuantumCheckpoint");
-            ModVersion = STR("0.44.0");
+            ModVersion = STR("0.45.0");
 #if defined(QUANTUM_CHECKPOINT_RUNTIME_TEST_FIXTURES)
-            ModVersion = STR("0.44.0-test-fixtures");
+            ModVersion = STR("0.45.0-test-fixtures");
 #endif
             ModDescription = STR("Route C checkpoint with optional exact-state supplements");
             ModAuthors = STR("zaofenMachine and contributors");

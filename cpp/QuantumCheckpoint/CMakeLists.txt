@@ -6,6 +6,7 @@ add_library(
     ${TARGET}
     SHARED
     src/QuantumCheckpointMod.cpp
+    src/CaptureOutcome.cpp
     src/CheckpointPersistence.cpp
     src/PlayerRestorePlan.cpp
     src/PlayerAttackState.cpp
@@ -58,3 +59,8 @@ add_executable(QuantumCheckpointCounterStateTests tests/PlayerCounterStateTests.
 target_include_directories(QuantumCheckpointCounterStateTests PRIVATE include)
 target_compile_features(QuantumCheckpointCounterStateTests PRIVATE cxx_std_23)
 add_test(NAME QuantumCheckpointCounterState COMMAND QuantumCheckpointCounterStateTests)
+
+add_executable(QuantumCheckpointCaptureOutcomeTests tests/CaptureOutcomeTests.cpp src/CaptureOutcome.cpp)
+target_include_directories(QuantumCheckpointCaptureOutcomeTests PRIVATE include)
+target_compile_features(QuantumCheckpointCaptureOutcomeTests PRIVATE cxx_std_23)
+add_test(NAME QuantumCheckpointCaptureOutcome COMMAND QuantumCheckpointCaptureOutcomeTests)
