@@ -210,6 +210,7 @@ namespace QuantumCheckpoint
         {
             RouteCCaptureObjectIdentity world{}, engine{}, card{};
             NativeCardQualificationObservation original{};
+            std::int32_t planned_row{-1}, planned_index{-1};
         };
 
         struct PendingNativeFieldMove
@@ -233,6 +234,10 @@ namespace QuantumCheckpoint
             bool bow_field_identity_failed{};
             std::string bow_field_expected_info{};
             std::optional<BowFieldDescriptorWitness> bow_field_witness{};
+            std::vector<BowFieldDescriptorWitness> bow_field_pair{};
+            std::size_t bow_field_pair_ordinal{};
+            std::array<bool, 2> bow_field_pair_completed{};
+            std::optional<RouteCCaptureObjectIdentity> bow_pair_field_actor_identity{};
         };
 
         struct PendingNativeRestoreMove
@@ -296,6 +301,7 @@ namespace QuantumCheckpoint
             std::vector<PendingNativeTrashMove> exact_player_field_trash_targets{};
             std::size_t exact_player_field_trash_target_index{};
             std::size_t exact_player_field_target_index{};
+            std::size_t bow_field_pair_idle_boundaries{};
             std::optional<std::chrono::steady_clock::time_point>
                 exact_player_field_move_started_at{};
             std::string original_auto_spawn{};
@@ -5346,7 +5352,7 @@ namespace QuantumCheckpoint
                     PlayerCounterState counter_state{};
                 };
                 std::vector<CapturedFieldCard> captured_cards{};
-                bool captures_field_bow{};
+                std::size_t captured_field_bows{};
                 for (const auto& card : native_cards_at_location(
                          objects.card_engine, api.location, 3))
                 {
@@ -5383,15 +5389,15 @@ namespace QuantumCheckpoint
                         const auto level_verified = std::any_of(level.properties.begin(), level.properties.end(),
                             [](const auto& value) { return value.name == "nativeLevel:status"
                                 && value.value == "verified-native-level"; });
-                        if (*identity != "sakuraBow@0" || captures_field_bow || !level_verified
+                        if (*identity != "sakuraBow@0" || captured_field_bows >= 2 || !level_verified
                             || immutable.attack != 1 || immutable.health != 1 || immutable.level != 1
                             || read_native_value<std::int32_t>(card.state, 0x110) != immutable.level
                             || read_native_value<std::int32_t>(card.state, CardStateTurnBaseOffset) != 0
                             || read_native_value<std::int32_t>(card.state, CardStateTurnAdjustmentOffset) != -1
                             || parse_int32(required_getter_text(card.card, STR("getCurrentTurnCounter"))) != -1
                             || turn_active != "True")
-                            throw std::runtime_error{"F12 supports one base Bow FIELD with immutable default level and turn state"};
-                        captures_field_bow = true;
+                            throw std::runtime_error{"Bow FIELD supports at most two base copies with immutable default level and turn state"};
+                        ++captured_field_bows;
                     }
                     captured_cards.push_back(CapturedFieldCard{
                         .placement = *placement,
@@ -5420,7 +5426,8 @@ namespace QuantumCheckpoint
                 ExactPlayerFieldCheckpoint exact{};
                 // Ordinary fruit FIELD captures retain F11, including its existing
                 // HAND/TRASH Bow combinations. F12 is an explicit narrow admission.
-                exact.schema_version = captures_field_bow ? ExactPlayerFieldBowPlacementSchemaVersion
+                exact.schema_version = captured_field_bows == 2 ? ExactPlayerFieldBowPairPlacementSchemaVersion
+                    : captured_field_bows == 1 ? ExactPlayerFieldBowPlacementSchemaVersion
                     : ExactPlayerFieldBowOnceQualificationSchemaVersion;
                 exact.qualification_policy = ExactPlayerQualificationBowOncePolicy;
                 exact.captured_at_utc = checkpoint.captured_at_utc;
@@ -5482,9 +5489,10 @@ namespace QuantumCheckpoint
                 {
                     throw std::runtime_error{exact_validation_error};
                 }
-                if (captures_field_bow)
+                if (captured_field_bows)
                     append_route_c_trace_failure("capture.bow-field-placement.admitted",
-                        "schema=12 bows=1 scope=base-bow-field-default-numerics");
+                        "schema=" + std::to_string(exact.schema_version) + " bows=" + std::to_string(captured_field_bows)
+                            + " scope=base-bow-field-default-numerics");
                 exact_player_field = std::move(exact);
                 append_route_c_trace("capture.exact-player-field.prepare.complete");
             }
@@ -6542,7 +6550,96 @@ namespace QuantumCheckpoint
                 << " type=" << unsigned(effect.type) << " tag=" << effect.tag << " factory=" << effect.factory_key
                 << " worldIndex=" << witness.world.internal_index << " engineIndex=" << witness.engine.internal_index
                 << " actorIndex=" << witness.card.internal_index;
+            if (!target.bow_field_pair.empty()) detail << " pairOrdinal=" << target.bow_field_pair_ordinal;
             return detail.str();
+        }
+
+        auto require_distinct_bow_pair(const std::vector<BowFieldDescriptorWitness>& pair) -> void
+        {
+            if (pair.size() != 2 || pair[0].world.object != pair[1].world.object
+                || pair[0].engine.object != pair[1].engine.object
+                || (pair[0].planned_row == pair[1].planned_row && pair[0].planned_index == pair[1].planned_index))
+                throw std::runtime_error{"F13 Bow pair world/engine/slot binding differs"};
+            const auto& a = pair[0].original; const auto& b = pair[1].original;
+            if (pair[0].card.object == pair[1].card.object || pair[0].card.internal_index == pair[1].card.internal_index
+                || a.card_id == b.card_id || a.card_guid == b.card_guid
+                || a.membership.descriptors.size() != 1 || b.membership.descriptors.size() != 1
+                || a.values.size() != 1 || b.values.size() != 1
+                || a.membership.descriptors[0].guid == b.membership.descriptors[0].guid)
+                throw std::runtime_error{"F13 Bow pair actor/card/effect GUID aliases"};
+            using Range = std::pair<std::uintptr_t, std::size_t>;
+            const auto ranges = [&](const BowFieldDescriptorWitness& bound) {
+                std::vector<Range> values{};
+                const auto add = [&](const void* pointer, std::size_t bytes) {
+                    const auto address = reinterpret_cast<std::uintptr_t>(pointer);
+                    if (!address || !bytes || address > std::numeric_limits<std::uintptr_t>::max() - bytes)
+                        throw std::runtime_error{"F13 Bow pair mutable storage range is invalid"};
+                    values.emplace_back(address, bytes);
+                };
+                const auto& n = bound.original; const auto& effect = n.membership.descriptors.at(0);
+                add(bound.card.object, 1); add(n.membership.state, 1);
+                add(n.membership.object, 0x1C8); add(n.membership.controller, 24);
+                add(n.membership.array, static_cast<std::size_t>(n.membership.capacity) * 16);
+                add(effect.object, 0x198); add(effect.controller, 24);
+                for (const auto& entry : n.values.at(0).entries) add(entry.address, entry.bytes.size());
+                const auto* flags_data = read_native_value<const void*>(n.values.at(0).flags_header.data(), 0);
+                const auto flags_capacity = read_native_value<std::int32_t>(n.values.at(0).flags_header.data(), 12);
+                if (flags_capacity < 0 || flags_capacity > 4096)
+                    throw std::runtime_error{"F13 Bow flags storage capacity exceeds the reviewed sparse bound"};
+                if (flags_capacity) add(flags_data, static_cast<std::size_t>(flags_capacity) * 12);
+                if (!n.values.at(0).allocation_words.empty())
+                {
+                    const auto* words = read_native_value<const void*>(n.values[0].flags_header.data(), 0x20);
+                    if (!words) words = static_cast<const std::byte*>(effect.object) + 0xA8;
+                    add(words, n.values[0].allocation_words.size() * sizeof(std::uint32_t));
+                }
+                return values;
+            };
+            const auto left = ranges(pair[0]), right = ranges(pair[1]);
+            for (const auto& [a_begin, a_size] : left)
+                for (const auto& [b_begin, b_size] : right)
+                    if (a_begin < b_begin + b_size && b_begin < a_begin + a_size)
+                        throw std::runtime_error{"F13 Bow pair cross-copy mutable owner/array/effect/flags storage aliases"};
+        }
+
+        auto verify_bow_field_pair(const PendingNativeFieldMove& target, bool suppressed) -> void
+        {
+            if (target.bow_field_pair.empty()) return;
+            require_distinct_bow_pair(target.bow_field_pair);
+            if (target.bow_field_pair_ordinal >= 2)
+                throw std::runtime_error{"F13 Bow pair ordinal is invalid"};
+            const auto registered = registered_overlay_objects();
+            for (std::size_t i{}; i < 2; ++i)
+            {
+                const auto& bound = target.bow_field_pair[i];
+                const auto guard = [&] {
+                    if (!bound.world.weak_verified || !bound.engine.weak_verified || !bound.card.weak_verified
+                        || !same_route_c_capture_object(bound.world, bound.world.object, nullptr, registered)
+                        || !same_route_c_capture_object(bound.engine, bound.engine.object, bound.world.object, registered)
+                        || !same_route_c_capture_object(bound.card, bound.card.object, bound.world.object, registered))
+                        throw std::runtime_error{"F13 Bow pair weak ownership changed"};
+                };
+                guard();
+                const bool current = i == target.bow_field_pair_ordinal;
+                const auto observed = observe_native_card_qualification(bound.engine.object, bound.card.object,
+                    current && suppressed ? &bound.original.membership : nullptr);
+                guard();
+                if ((observed.location != 0 && observed.location != 1 && observed.location != 3)
+                    || (target.bow_field_pair_completed[i] && observed.location != 3)
+                    || (!current && !target.bow_field_pair_completed[i] && observed.location == 3))
+                    throw std::runtime_error{"F13 Bow pair left its assigned staging/placement sequence"};
+                auto expected = bound.original; expected.location = observed.location;
+                if (observed != expected)
+                    throw std::runtime_error{"F13 Bow pair original descriptor/full-info/raw-flags/used0 identity changed"};
+                if (observed.location == 3)
+                {
+                    const auto api = validated_native_move_card_on_field_api(bound.engine.object);
+                    const auto placement = native_card_placement(api, NativeCardReference{.card=bound.card.object, .state=observed.membership.state});
+                    if (!placement || placement->type != 1 || placement->side != 0
+                        || placement->row != bound.planned_row || placement->index != bound.planned_index)
+                        throw std::runtime_error{"F13 Bow pair arrived at another copy's assigned FIELD slot"};
+                }
+            }
         }
 
         auto verify_bow_field_descriptor_witness(const PendingNativeFieldMove& target, bool suppressed)
@@ -6582,6 +6679,7 @@ namespace QuantumCheckpoint
             expected.location = observed.location;
             if (observed != expected)
                 throw std::runtime_error{"Bow FIELD ordered descriptor/owner/GUID/full-info/flags/used0 witness changed"};
+            verify_bow_field_pair(target, suppressed);
             return observed.location;
         }
 
@@ -6622,21 +6720,162 @@ namespace QuantumCheckpoint
                 || read_native_value<std::uintptr_t>(effect.object, 0) != base + bow_once::VtableRva
                 || read_native_value<std::int32_t>(effect.object, 0x190) != 4)
                 throw std::runtime_error{"Bow FIELD witness implementation/profile differs"};
-            const auto qualifications = observe_player_qualification(objects, ExactPlayerQualificationBowOncePolicy);
-            std::size_t bows{};
-            for (const auto& card : qualifications)
+            if (target.bow_field_pair.empty())
             {
-                const auto identity = exact_card_identity_key_from_instance(card.saved.card_info_instance, error);
-                if (!identity) throw std::runtime_error{"Bow FIELD population identity is unavailable"};
-                if (*identity == "sakuraBow@0") ++bows;
+                const auto qualifications = observe_player_qualification(objects, ExactPlayerQualificationBowOncePolicy);
+                std::size_t bows{};
+                for (const auto& card : qualifications)
+                {
+                    const auto identity = exact_card_identity_key_from_instance(card.saved.card_info_instance, error);
+                    if (!identity) throw std::runtime_error{"Bow FIELD population identity is unavailable"};
+                    if (*identity == "sakuraBow@0") ++bows;
+                }
+                if (bows != 1)
+                    throw std::runtime_error{"Bow FIELD witness requires one unique base Bow in player D/H/T/F"};
             }
-            if (bows != 1)
-                throw std::runtime_error{"Bow FIELD witness requires one unique base Bow in player D/H/T/F"};
+            else
+            {
+                verify_bow_field_pair(target, false);
+                const auto& initial = target.bow_field_pair.at(target.bow_field_pair_ordinal);
+                auto expected = initial.original; expected.location = 0;
+                if (initial.card.object != target.card || initial.planned_row != target.row
+                    || initial.planned_index != target.index || expected != witness.original)
+                    throw std::runtime_error{"F13 Bow HAND witness differs from its original assigned pair binding"};
+            }
             target.bow_field_witness = std::move(witness);
             const auto location = verify_bow_field_descriptor_witness(target, false);
             if (location != 0) throw std::runtime_error{"Bow FIELD witness capture changed HAND location"};
             append_bow_field_witness_trace("restore.bow-field-witness.before-suppression",
                 bow_field_witness_detail(target, false, location));
+        }
+
+        auto verify_f13_bow_pair_population(const PendingRouteCRestore& restore,
+                                            const RouteCBattleObjects& objects) -> void
+        {
+            if (!restore.move_effect_suppressions.empty())
+                throw std::runtime_error{"F13 global population read requested during MOVE suppression"};
+            const PendingNativeFieldMove* representative{};
+            for (const auto& target : restore.exact_player_field_targets)
+                if (!target.bow_field_pair.empty()) representative = &target;
+            if (!representative || representative->bow_field_pair.size() != 2)
+                throw std::runtime_error{"F13 global population has no complete original pair binding"};
+            const auto registered = registered_overlay_objects();
+            const auto& owner = representative->bow_field_pair[0];
+            if (!owner.world.weak_verified || !owner.engine.weak_verified
+                || !same_route_c_capture_object(owner.world, owner.world.object, nullptr, registered)
+                || !same_route_c_capture_object(owner.engine, objects.card_engine, owner.world.object, registered))
+                throw std::runtime_error{"F13 population world/engine weak identity changed before physical header reads"};
+            for (const auto& target : restore.exact_player_field_targets)
+            {
+                if (!target.bow_pair_field_actor_identity || !target.bow_pair_field_actor_identity->weak_verified
+                    || !same_route_c_capture_object(*target.bow_pair_field_actor_identity, target.card, owner.world.object, registered)
+                    || !address_is_readable(static_cast<const std::byte*>(static_cast<const void*>(target.card))
+                        + InGameCardStatePointerOffset, sizeof(void*))
+                    || read_native_value<const void*>(target.card, InGameCardStatePointerOffset) != target.state
+                    || !target.state || !address_is_readable(static_cast<const std::byte*>(target.state)
+                        + CardStateSharedObjectOffset, sizeof(void*))
+                    || read_native_value<const void*>(target.state, CardStateSharedObjectOffset) != target.native_card_object
+                    || !target.native_card_object || !address_is_readable(static_cast<const std::byte*>(target.native_card_object)
+                        + NativeCardEffectListPointerOffset, sizeof(void*) + 2 * sizeof(std::int32_t)))
+                    throw std::runtime_error{"F13 field target weak/native ownership changed before physical header reads"};
+                if (target.effects_suppressed || target.bow_field_witness_failed || target.bow_field_identity_failed
+                    || read_native_value<const void*>(target.native_card_object, NativeCardEffectListPointerOffset) != target.effect_list_pointer
+                    || read_native_value<std::int32_t>(target.native_card_object, NativeCardEffectListCountOffset) != target.effect_list_count
+                    || read_native_value<std::int32_t>(target.native_card_object, NativeCardEffectListCapacityOffset) != target.effect_list_capacity)
+                    throw std::runtime_error{"F13 global population requires every original effect header released and no failed witness"};
+            }
+            if (!native_restore_actions_settled(validated_native_move_card_api(objects.card_engine).engine_state))
+                throw std::runtime_error{"F13 global population requires idle native queue"};
+            verify_bow_field_pair(*representative, false);
+            const auto all = observe_player_qualification(objects, ExactPlayerQualificationBowOncePolicy);
+            std::size_t count{}; std::string error{};
+            for (const auto& card : all)
+            {
+                const auto key = exact_card_identity_key_from_instance(card.saved.card_info_instance, error);
+                if (!key) throw std::runtime_error{"F13 population full identity is unavailable"};
+                if (*key != "sakuraBow@0") continue;
+                ++count;
+                const auto found = std::find_if(representative->bow_field_pair.begin(), representative->bow_field_pair.end(),
+                    [&](const auto& bound) { return bound.card.object == card.actor; });
+                if (found == representative->bow_field_pair.end())
+                    throw std::runtime_error{"F13 population substituted another equal-definition Bow actor"};
+                auto expected = found->original; expected.location = card.native.location;
+                if (card.native != expected)
+                    throw std::runtime_error{"F13 population changed an originally bound newborn Bow"};
+            }
+            if (count != 2) throw std::runtime_error{"F13 population no longer contains exactly two bound Bow copies"};
+        }
+
+        auto bind_initial_bow_field_pair(PendingRouteCRestore& restore, const RouteCBattleObjects& objects) -> void
+        {
+            if (!restore.move_effect_suppressions.empty()
+                || std::any_of(restore.exact_player_field_targets.begin(), restore.exact_player_field_targets.end(),
+                    [](const auto& t) { return t.effects_suppressed || !t.bow_field_pair.empty() || t.bow_field_witness.has_value(); })
+                || !native_restore_actions_settled(validated_native_move_card_api(objects.card_engine).engine_state))
+                throw std::runtime_error{"F13 initial pair binding must precede every suppression with an idle queue"};
+            const auto all = observe_player_qualification(objects, ExactPlayerQualificationBowOncePolicy);
+            std::vector<PendingNativeFieldMove*> targets{};
+            for (auto& target : restore.exact_player_field_targets)
+                if (target.bow_field_witness_required) targets.push_back(&target);
+            std::sort(targets.begin(), targets.end(), [](const auto* a, const auto* b) {
+                return a->row != b->row ? a->row < b->row : a->index < b->index;
+            });
+            if (targets.size() != 2) throw std::runtime_error{"F13 needs two individually assigned Bow FIELD targets"};
+            const auto registered = registered_overlay_objects();
+            auto* world = reinterpret_cast<UObject*>(objects.card_engine->GetWorld());
+            for (auto& target : restore.exact_player_field_targets)
+            {
+                target.bow_pair_field_actor_identity = pin_route_c_capture_object(target.card, world, registered);
+                if (!target.bow_pair_field_actor_identity->weak_verified)
+                    throw std::runtime_error{"F13 field target has no verified original actor weak identity"};
+            }
+            std::vector<BowFieldDescriptorWitness> pair{}; std::size_t bows{}; std::string error{};
+            for (const auto& card : all)
+            {
+                const auto key = exact_card_identity_key_from_instance(card.saved.card_info_instance, error);
+                if (!key) throw std::runtime_error{"F13 initial population identity is unavailable"};
+                if (*key == "sakuraBow@0") ++bows;
+            }
+            if (bows != 2) throw std::runtime_error{"F13 initial population must contain exactly two Bow copies"};
+            for (auto* target : targets)
+            {
+                const auto found = std::find_if(all.begin(), all.end(), [&](const auto& card) { return card.actor == target->card; });
+                if (found == all.end()) throw std::runtime_error{"F13 planned Bow actor absent from the initial full population"};
+                BowFieldDescriptorWitness bound{};
+                bound.world = pin_route_c_capture_object(world, nullptr, registered);
+                bound.engine = pin_route_c_capture_object(objects.card_engine, world, registered);
+                bound.card = pin_route_c_capture_object(target->card, world, registered);
+                bound.original = found->native; bound.planned_row = target->row; bound.planned_index = target->index;
+                const auto& n = bound.original;
+                if (!bound.world.weak_verified || !bound.engine.weak_verified || !bound.card.weak_verified
+                    || (n.location != 0 && n.location != 1) || n.card_info != target->bow_field_expected_info
+                    || n.membership.state != target->state || n.membership.object != target->native_card_object
+                    || n.membership.array != target->effect_list_pointer || n.membership.count != 1
+                    || n.membership.capacity != target->effect_list_capacity || n.membership.descriptors.size() != 1
+                    || n.values.size() != 1 || n.values[0].used_once != 0 || n.values[0].flags != std::vector<std::uint8_t>{0})
+                    throw std::runtime_error{"F13 initial Bow assignment/owner/full-info/profile/newborn0 binding differs"};
+                pair.push_back(std::move(bound));
+            }
+            require_distinct_bow_pair(pair);
+            for (std::size_t i{}; i < 2; ++i)
+            {
+                targets[i]->bow_field_pair = pair; targets[i]->bow_field_pair_ordinal = i;
+            }
+            verify_f13_bow_pair_population(restore, objects);
+            try
+            {
+                for (std::size_t i{}; i < 2; ++i)
+                {
+                    auto event_target = *targets[i]; event_target.bow_field_witness = pair[i];
+                    append_bow_field_witness_trace("restore.bow-field-witness.initial-pair-bound",
+                        bow_field_witness_detail(event_target, false, pair[i].original.location));
+                }
+            }
+            catch (...)
+            {
+                for (auto* target : targets) target->bow_field_witness_failed = true;
+                throw;
+            }
         }
 
         auto restore_field_card_effects(PendingNativeFieldMove& target,
@@ -9935,6 +10174,7 @@ namespace QuantumCheckpoint
                 && restore.exact_player_field_status != "moving-field-trash"
                 && restore.exact_player_field_status != "moving-field-to-hand"
                 && restore.exact_player_field_status != "playing-field"
+                && restore.exact_player_field_status != "awaiting-field-pair-idle"
                 && restore.exact_player_field_status != "verified-position-health")
             {
                 return true;
@@ -10171,7 +10411,9 @@ namespace QuantumCheckpoint
                 return true;
             };
 
-            if (restore.exact_player_field_target_index
+            if ((restore.exact_player_field->schema_version != ExactPlayerFieldBowPairPlacementSchemaVersion
+                    || restore.exact_player_field_status != "awaiting-field-pair-idle")
+                && restore.exact_player_field_target_index
                     == restore.exact_player_field_targets.size()
                 && !restore.exact_player_field_targets.empty()
                 && final_state_matches())
@@ -10186,7 +10428,9 @@ namespace QuantumCheckpoint
                 update_exact_player_field_turn_diagnostic(restore);
                 return true;
             }
-            if (restore.exact_player_field_target_index
+            if ((restore.exact_player_field->schema_version != ExactPlayerFieldBowPairPlacementSchemaVersion
+                    || restore.exact_player_field_status != "awaiting-field-pair-idle")
+                && restore.exact_player_field_target_index
                     == restore.exact_player_field_targets.size()
                 && !restore.exact_player_field_targets.empty())
             {
@@ -10262,6 +10506,15 @@ namespace QuantumCheckpoint
                     "restore.exact-player-field.effects.suppressed");
             };
             const auto queue_play = [&](PendingNativeFieldMove& target) {
+                if (restore.exact_player_field->schema_version == ExactPlayerFieldBowPairPlacementSchemaVersion)
+                {
+                    if (!restore.move_effect_suppressions.empty() || !native_restore_actions_settled(api.location.engine_state))
+                    {
+                        restore.exact_player_field_status = "awaiting-field-pair-idle";
+                        return;
+                    }
+                    verify_f13_bow_pair_population(restore, objects);
+                }
                 const auto location = native_card_location(
                     api.location.engine_state,
                     target.state,
@@ -10325,6 +10578,15 @@ namespace QuantumCheckpoint
                         + native_queue_diagnostic(api.location.engine_state));
             };
             const auto queue_current_target = [&]() {
+                if (restore.exact_player_field->schema_version == ExactPlayerFieldBowPairPlacementSchemaVersion)
+                {
+                    if (!restore.move_effect_suppressions.empty() || !native_restore_actions_settled(api.location.engine_state))
+                    {
+                        restore.exact_player_field_status = "awaiting-field-pair-idle";
+                        return;
+                    }
+                    verify_f13_bow_pair_population(restore, objects);
+                }
                 auto& target = restore.exact_player_field_targets.at(
                     restore.exact_player_field_target_index);
                 const auto location = native_card_location(
@@ -10427,6 +10689,9 @@ namespace QuantumCheckpoint
 
             if (restore.exact_player_field_status == "pending")
             {
+                if (restore.exact_player_field->schema_version == ExactPlayerFieldBowPairPlacementSchemaVersion
+                    && (!restore.move_effect_suppressions.empty() || !native_restore_actions_settled(api.location.engine_state)))
+                    return false; // Existing restore.started_at deadline remains authoritative.
                 std::string staging_error{};
                 if (!exact_player_field_staging_matches(
                         restore.exact_player_field->player_deck,
@@ -10602,8 +10867,9 @@ namespace QuantumCheckpoint
                         .original_turn_active = native_turn_active != 0,
                         .target_turn_active =
                             (*expected_states)[saved_index].turn_active,
-                        .bow_field_witness_required = restore.exact_player_field->schema_version
-                            == ExactPlayerFieldBowPlacementSchemaVersion && candidate.key == "sakuraBow@0",
+                        .bow_field_witness_required = candidate.key == "sakuraBow@0"
+                            && (restore.exact_player_field->schema_version == ExactPlayerFieldBowPlacementSchemaVersion
+                                || restore.exact_player_field->schema_version == ExactPlayerFieldBowPairPlacementSchemaVersion),
                         .bow_field_expected_info = (*expected_field)[saved_index],
                     });
                 }
@@ -10613,6 +10879,8 @@ namespace QuantumCheckpoint
                 });
                 restore.exact_player_field_targets = std::move(targets);
                 restore.exact_player_field_target_index = 0;
+                if (restore.exact_player_field->schema_version == ExactPlayerFieldBowPairPlacementSchemaVersion)
+                    bind_initial_bow_field_pair(restore, objects);
                 restore.exact_player_field_trash_targets = std::move(trash_targets);
                 restore.exact_player_field_trash_target_index = 0;
                 append_route_c_trace_failure(
@@ -10631,6 +10899,46 @@ namespace QuantumCheckpoint
                 return false;
             }
 
+            if (restore.exact_player_field_status == "awaiting-field-pair-idle")
+            {
+                if (!restore.move_effect_suppressions.empty() || !native_restore_actions_settled(api.location.engine_state))
+                    return false; // No rebaseline/requeue/events; fixed 90-second restore deadline is unchanged.
+                verify_f13_bow_pair_population(restore, objects);
+                std::size_t completed_bows{};
+                for (const auto& placed : restore.exact_player_field_targets)
+                    if (!placed.bow_field_pair.empty() && placed.bow_field_pair_completed[placed.bow_field_pair_ordinal]) ++completed_bows;
+                if (completed_bows > restore.bow_field_pair_idle_boundaries)
+                {
+                    if (completed_bows != restore.bow_field_pair_idle_boundaries + 1 || completed_bows > 2)
+                        return fail_after_write("F13 Bow pair idle boundary sequence changed");
+                    try
+                    {
+                        append_bow_field_witness_trace("restore.bow-field-witness.pair-idle-boundary",
+                            "nextTarget=" + std::to_string(completed_bows) + " bows=2");
+                    }
+                    catch (...)
+                    {
+                        for (auto& member : restore.exact_player_field_targets)
+                            if (!member.bow_field_pair.empty()) member.bow_field_witness_failed = true;
+                        throw;
+                    }
+                    restore.bow_field_pair_idle_boundaries = completed_bows;
+                }
+                if (restore.exact_player_field_target_index < restore.exact_player_field_targets.size())
+                {
+                    queue_current_target();
+                    return false;
+                }
+                if (!final_state_matches()) return false;
+                if (!verify_exact_player_field_attack(restore, objects, now)) return false;
+                if (!verify_exact_player_field_health(restore, objects, now)) return false;
+                if (!verify_exact_player_field_counters(restore, objects, now)) return false;
+                rollback_active_decklist();
+                restore.exact_player_field_status = "verified-position-health";
+                append_route_c_trace("restore.exact-player-field.verified-position-health");
+                update_exact_player_field_turn_diagnostic(restore);
+                return true;
+            }
             auto& target = restore.exact_player_field_targets.at(
                 restore.exact_player_field_target_index);
             const auto location = native_card_location(
@@ -10722,6 +11030,18 @@ namespace QuantumCheckpoint
                         + std::to_string(target.target_health)
                         + " turnActive="
                         + (target.target_turn_active ? "True" : "False"));
+                if (restore.exact_player_field->schema_version == ExactPlayerFieldBowPairPlacementSchemaVersion)
+                {
+                    if (!target.bow_field_pair.empty())
+                    {
+                        const auto ordinal = target.bow_field_pair_ordinal;
+                        for (auto& member : restore.exact_player_field_targets)
+                            if (!member.bow_field_pair.empty()) member.bow_field_pair_completed.at(ordinal) = true;
+                    }
+                    ++restore.exact_player_field_target_index;
+                    restore.exact_player_field_status = "awaiting-field-pair-idle";
+                    return false;
+                }
                 ++restore.exact_player_field_target_index;
                 if (restore.exact_player_field_target_index
                     < restore.exact_player_field_targets.size())
@@ -15968,9 +16288,9 @@ namespace QuantumCheckpoint
         QuantumCheckpointMod()
         {
             ModName = STR("QuantumCheckpoint");
-            ModVersion = STR("0.43.0");
+            ModVersion = STR("0.44.0");
 #if defined(QUANTUM_CHECKPOINT_RUNTIME_TEST_FIXTURES)
-            ModVersion = STR("0.43.0-test-fixtures");
+            ModVersion = STR("0.44.0-test-fixtures");
 #endif
             ModDescription = STR("Route C checkpoint with optional exact-state supplements");
             ModAuthors = STR("zaofenMachine and contributors");

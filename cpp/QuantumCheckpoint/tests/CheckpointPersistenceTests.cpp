@@ -712,14 +712,15 @@ namespace
         using namespace QuantumCheckpoint;
         std::string error{};
         require(ExactPlayerFieldCheckpoint{}.schema_version == ExactPlayerFieldBowOnceQualificationSchemaVersion
-                    && ExactPlayerFieldSchemaVersion == ExactPlayerFieldBowPlacementSchemaVersion
+                    && ExactPlayerFieldSchemaVersion == ExactPlayerFieldBowPairPlacementSchemaVersion
+                    && ExactPlayerFieldBowPlacementSchemaVersion == 12
                     && ExactPlayerFieldBowOnceQualificationSchemaVersion == 11
                     && ExactPlayerFieldQualificationSchemaVersion == 10,
-                "F12 ceiling preserves F11 default and fixed A/B admission versions");
+                "F13 ceiling preserves F11 default and fixed A/B/F12 admission versions");
         require(!supports_plain_player_field_card("sakuraBow")
                     && qualification::qualification_policy_for_layout(ExactPlayerFieldCheckpointKind, 12)
                         == ExactPlayerQualificationBowOncePolicy
-                    && !qualification::qualification_policy_for_layout(ExactPlayerFieldCheckpointKind, 13),
+                    && !qualification::qualification_policy_for_layout(ExactPlayerFieldCheckpointKind, 14),
                 "F12 maps explicitly to unchanged B while plain overlap policy stays unchanged");
         auto route = sample_checkpoint();
         route.payload_checksum = "0123456789ABCDEF";
@@ -734,6 +735,7 @@ namespace
         field.player_field_counter_states = "0";
         field.qualification_policy = ExactPlayerQualificationBowOncePolicy;
         field.payload_checksum = exact_player_field_payload_checksum(field);
+        require(field.payload_checksum == "89761F02D67BEB5D", "historical F12 singleton checksum stays byte-for-byte unchanged");
         const auto json = serialize_exact_player_field_checkpoint(field);
         const auto parsed = parse_exact_player_field_checkpoint(json, error);
         require(parsed && serialize_exact_player_field_checkpoint(*parsed) == json
@@ -745,7 +747,7 @@ namespace
             auto old = field;
             old.schema_version = version;
             require(!parse_exact_player_field_checkpoint(serialize_exact_player_field_checkpoint(old), error),
-                    "old FIELD schemas and unknown F13 cannot acquire Bow placement even with recalculated checksum");
+                    "old FIELD schemas and F13 cannot acquire singleton Bow placement even with recalculated checksum");
         }
         auto proof = ExactPlayerQualificationCheckpoint{
             .schema_version = ExactPlayerQualificationBowOnceSchemaVersion,
@@ -880,6 +882,249 @@ namespace
         require(!plan_player_field_restore(field,bad_candidate,error,7), "F12 cannot assign an upgraded live candidate");
         bad_candidate = from_hand; bad_candidate[0].location = 2;
         require(!plan_player_field_restore(field,bad_candidate,error,7), "F12 does not treat live TRASH as a staged field target");
+    }
+
+    auto run_bow_field_pair_placement_tests() -> void
+    {
+        using namespace QuantumCheckpoint;
+        std::string error{};
+        require(ExactPlayerFieldBowPairPlacementSchemaVersion == 13
+                    && qualification::qualification_policy_for_layout(ExactPlayerFieldCheckpointKind, 13)
+                        == ExactPlayerQualificationBowOncePolicy
+                    && !qualification::qualification_policy_for_layout(ExactPlayerFieldCheckpointKind, 14)
+                    && !qualification::qualification_policy_for_layout(ExactPlayerTrashCheckpointKind, 13)
+                    && !supports_plain_player_field_card("sakuraBow"),
+                "F13 explicitly reuses Q2/B without changing plain overlap or other layout versions");
+        auto route = sample_checkpoint();
+        route.payload_checksum = "0123456789ABCDEF";
+        const std::string bow = "(CardInfo=(Tag=\"sakuraBow\",Level=1,upgradeLevels=((attack=1,health=1,effects=(\"player.aurora.sakura.sakurabow\")))),upgradeLevel=0)";
+        const std::string apple = "(CardInfo=(Tag=\"naturalApple\",Level=1,upgradeLevels=((attack=2,health=2,effects=(\"player.esper.fruit.apple\")))))";
+        auto pair = sample_exact_player_field(route);
+        pair.schema_version = ExactPlayerFieldBowPairPlacementSchemaVersion;
+        pair.player_deck = pair.player_hand = pair.player_trash = "()";
+        pair.player_field = "(" + bow + "," + bow + ")";
+        pair.player_field_states = "0,0,1,1;1,4,1,1";
+        pair.player_field_attack_states = pair.player_field_health_states = "1,1;1,1";
+        pair.player_field_counter_states = "0;0";
+        pair.qualification_policy = ExactPlayerQualificationBowOncePolicy;
+        pair.payload_checksum = exact_player_field_payload_checksum(pair);
+        require(pair.payload_checksum == "C74CDA72AAE5A880", "F13 two-slot checksum has an independent fixed FNV golden");
+        const auto json = serialize_exact_player_field_checkpoint(pair);
+        const auto parsed = parse_exact_player_field_checkpoint(json, error);
+        require(parsed && serialize_exact_player_field_checkpoint(*parsed) == json
+                    && validate_player_field_bow_placement_scope(*parsed, error)
+                    && json.find("fieldCardPolicy") == std::string::npos,
+                "F13 round trips two default FIELD Bows without adding or reordering serialized fields");
+        for (const auto schema : {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14})
+        {
+            auto incompatible = pair; incompatible.schema_version = schema;
+            require(!parse_exact_player_field_checkpoint(serialize_exact_player_field_checkpoint(incompatible), error),
+                    "F13 pair cannot silently expand any historical or future FIELD schema");
+        }
+
+        auto proof = ExactPlayerQualificationCheckpoint{
+            .schema_version = ExactPlayerQualificationBowOnceSchemaVersion,
+            .captured_at_utc = pair.captured_at_utc,
+            .route_c_payload_checksum = pair.route_c_payload_checksum,
+            .game_executable_sha256 = pair.game_executable_sha256,
+            .game_executable_size = pair.game_executable_size,
+            .source_level_name = pair.source_level_name,
+            .wave_index = pair.wave_index,
+            .layout_kind = pair.kind,
+            .layout_payload_checksum = pair.payload_checksum,
+            .qualification_policy = std::string{ExactPlayerQualificationBowOncePolicy},
+            .cards = {
+                {.native_location = 3, .row = 0, .index = 0, .card_info_instance = bow,
+                 .effects = {{.ordinal = 0, .factory_key = "player.aurora.sakura.sakurabow", .tag = "sakuraBow",
+                     .type = 1, .flags = {0}, .used_once = 0,
+                     .profile_id = "phase40-bow-once-v2:player.aurora.sakura.sakurabow"}}},
+                {.native_location = 3, .row = 1, .index = 4, .card_info_instance = bow,
+                 .effects = {{.ordinal = 0, .factory_key = "player.aurora.sakura.sakurabow", .tag = "sakuraBow",
+                     .type = 1, .flags = {0}, .used_once = 0,
+                     .profile_id = "phase40-bow-once-v2:player.aurora.sakura.sakurabow"}}}}
+        };
+        constexpr std::array<std::string_view, 4> goldens{
+            "427EFA17ABBB4F21", "CCC3E4E69B29AD32", "453342AE80CBED56", "21C723CD4825268D"};
+        for (std::size_t mask{}; mask < goldens.size(); ++mask)
+        {
+            proof.cards[0].effects[0].used_once = static_cast<int>(mask & 1);
+            proof.cards[1].effects[0].used_once = static_cast<int>((mask >> 1) & 1);
+            proof.payload_checksum = exact_player_qualification_payload_checksum(proof);
+            require(proof.payload_checksum == goldens[mask], "each position-bound F13 used vector has a distinct fixed Q2 FNV golden");
+            const auto q = parse_exact_player_qualification_checkpoint(serialize_exact_player_qualification_checkpoint(proof), error);
+            require(q && q->schema_version == 2 && q->cards == proof.cards
+                        && validate_exact_player_qualification_binding(*q, pair, error),
+                    "Q2 binds source vectors00/10/01/11 to exact F13 slots without changing its schema or used semantics");
+        }
+        for (int mutation{}; mutation < 15; ++mutation)
+        {
+            auto bad = proof;
+            switch (mutation)
+            {
+            case 0: bad.cards[1].row = 0; bad.cards[1].index = 0; break;
+            case 1: std::swap(bad.cards[0], bad.cards[1]); break;
+            case 2: bad.cards[1].native_index = 0; break;
+            case 3: bad.cards[1].index = 3; break;
+            case 4: bad.cards[1].effects[0].ordinal = 1; break;
+            case 5: bad.cards[1].effects.push_back(bad.cards[1].effects[0]); break;
+            case 6: bad.cards.pop_back(); break;
+            case 7: bad.cards.push_back(bad.cards[1]); break;
+            case 8: bad.cards[1].card_info_instance = "(CardInfo=(Tag=\"sakuraBow\",Level=2))"; break;
+            case 9: bad.cards[1].effects[0].used_once = 2; break;
+            case 10: bad.cards[1].effects[0].flags = {0, 6}; break;
+            case 11: bad.layout_payload_checksum = "89761F02D67BEB5D"; break;
+            case 12: bad.schema_version = 1; bad.qualification_policy = ExactPlayerQualificationPolicy; break;
+            case 13: bad.route_c_payload_checksum = "FEDCBA9876543210"; break;
+            case 14: bad.captured_at_utc = "2000-01-01T00:00:00Z"; break;
+            }
+            bad.payload_checksum = exact_player_qualification_payload_checksum(bad);
+            require(!validate_exact_player_qualification_binding(bad, pair, error),
+                    "F13 Q2 refuses semantic aliasing, missing/extra/reordered records and slot/full-info/profile/linkage drift");
+        }
+
+        const std::vector<PlayerRestoreCandidate> both_hand{{"sakuraBow@0",0},{"sakuraBow@0",0}};
+        const std::vector<PlayerRestoreCandidate> mixed_origin{{"sakuraBow@0",1},{"sakuraBow@0",0}};
+        const std::vector<PlayerRestoreCandidate> both_deck{{"sakuraBow@0",1},{"sakuraBow@0",1}};
+        for (const auto& candidates : {both_hand, mixed_origin, both_deck})
+        {
+            const auto staged = plan_player_hand_staging(pair, candidates, 7, error);
+            const auto placed = plan_player_field_restore(pair, candidates, error, 7);
+            const auto expected = candidates[0].location == 1 && candidates[1].location == 0
+                ? std::vector<std::size_t>{1, 0} : std::vector<std::size_t>{0, 1};
+            require(staged && placed && placed->field_candidates == expected
+                        && placed->field_candidates[0] != placed->field_candidates[1],
+                    "F13 reserves two distinct candidate occurrences from native HAND/DECK with deterministic origins");
+        }
+        auto invalid_candidates = both_hand; invalid_candidates.pop_back();
+        require(!plan_player_field_restore(pair, invalid_candidates, error, 7), "F13 cannot reuse one candidate for two same-name FIELD slots");
+        invalid_candidates = both_hand; invalid_candidates[1].identity = "sakuraBow@1";
+        require(!plan_player_field_restore(pair, invalid_candidates, error, 7), "F13 cannot replace the second candidate with an upgraded copy");
+        invalid_candidates = both_hand; invalid_candidates[1].location = 2;
+        require(!plan_player_field_restore(pair, invalid_candidates, error, 7), "F13 does not treat live TRASH as a staged FIELD candidate");
+
+        const auto reject_scope = [&](auto bad) {
+            bad.payload_checksum = exact_player_field_payload_checksum(bad);
+            require(!validate_player_field_bow_placement_scope(bad,error)
+                        && !parse_exact_player_field_checkpoint(serialize_exact_player_field_checkpoint(bad),error)
+                        && !plan_player_hand_staging(bad,both_hand,7,error)
+                        && !plan_player_field_restore(bad,both_hand,error,7),
+                    "F13 parser and direct planners enforce the same exact two-Bow scope");
+        };
+        for (int mutation{}; mutation < 22; ++mutation)
+        {
+            auto bad = pair;
+            switch (mutation)
+            {
+            case 0: bad.player_field = "(" + bow + ")"; break;
+            case 1: bad.player_field = "(" + bow + "," + bow + "," + bow + ")"; break;
+            case 2: bad.player_hand = "(" + bow + ")"; break;
+            case 3: bad.player_deck = "(" + bow + ")"; break;
+            case 4: bad.player_trash = "(" + bow + ")"; break;
+            case 5: bad.player_field = "(" + bow + ",(CardInfo=(Tag=\"sakuraBow\"),upgradeLevel=1))"; break;
+            case 6: bad.player_field_states = "0,0,1,1;1,4,1,0"; break;
+            case 7: bad.player_field_states = "0,0,1,1;1,4,2,1"; break;
+            case 8: bad.player_field_attack_states = "1,1;2,2"; break;
+            case 9: bad.player_field_attack_states = "1,1;1,2|fieldBuff,1,-1,0"; break;
+            case 10: bad.player_field_health_states = "1,1;2,2"; break;
+            case 11: bad.player_field_health_states = "1,1;1,2|fieldHp,1,-1,0"; break;
+            case 12: bad.player_field_counter_states = "0;1"; break;
+            case 13: bad.player_field_counter_states = "0;0|genericSpecial,1"; break;
+            case 14: bad.player_field_states = "0,0,1,1;0,0,1,1"; break;
+            case 15: bad.player_field_states = "1,4,1,1;0,0,1,1"; break;
+            case 16: bad.player_field_states = "0,0,1,1;1,5,1,1"; break;
+            case 17: bad.player_field_attack_states = "1,1"; break;
+            case 18: bad.qualification_policy = ExactPlayerQualificationPolicy; break;
+            case 19: bad.kind = ExactPlayerTrashCheckpointKind; break;
+            case 20: bad.player_field = "(" + bow + ",(CardInfo=(Tag=\"spDeckEdit\")))"; break;
+            case 21: bad.player_field = "(" + apple + "," + apple + ")"; break;
+            }
+            reject_scope(bad);
+        }
+        // All numeric checks must cover both copies, not just the last Bow.
+        auto bad_first = pair; bad_first.player_field_attack_states = "2,2;1,1"; reject_scope(bad_first);
+        bad_first = pair; bad_first.player_field_states = "0,0,1,0;1,4,1,1"; reject_scope(bad_first);
+
+        auto fruit = pair;
+        fruit.player_field = "(" + bow + "," + apple + "," + bow + ")";
+        fruit.player_field_states = "0,0,1,1;0,3,2,0;1,4,1,1";
+        fruit.player_field_attack_states = fruit.player_field_health_states = "1,1;2,2;1,1";
+        fruit.player_field_counter_states = "0;0;0";
+        fruit.payload_checksum = exact_player_field_payload_checksum(fruit);
+        require(parse_exact_player_field_checkpoint(serialize_exact_player_field_checkpoint(fruit),error).has_value(),
+                "F13 checks both Bow records while preserving interposed fruit numeric and inactive semantics");
+        auto fruit_proof = proof; fruit_proof.layout_payload_checksum = fruit.payload_checksum;
+        fruit_proof.cards.insert(fruit_proof.cards.begin()+1, ExactPlayerQualificationCard{
+            .native_location=3,.row=0,.index=3,.card_info_instance=apple,
+            .effects={{.ordinal=0,.factory_key="player.esper.fruit.apple",.tag="naturalApple",.type=3,
+                .profile_id="phase39-default-v1:player.esper.fruit.apple"}}});
+        fruit_proof.payload_checksum = exact_player_qualification_payload_checksum(fruit_proof);
+        const std::vector<PlayerRestoreCandidate> fruit_candidates{{"sakuraBow@0",1},{"naturalApple@0",1},{"sakuraBow@0",0}};
+        const auto fruit_plan = plan_player_field_restore(fruit,fruit_candidates,error,7);
+        require(validate_exact_player_qualification_binding(fruit_proof,fruit,error) && fruit_plan
+                    && fruit_plan->field_candidates == std::vector<std::size_t>{2,1,0},
+                "F13 slot-bound Q2 and planner do not confuse Bow occurrence indices with an interposed fruit record");
+
+        auto ordered = pair;
+        ordered.player_deck = "(" + apple + ",(CardInfo=(Tag=\"naturalLemon\")))";
+        ordered.player_hand = "((CardInfo=(Tag=\"naturalCherry\")),(CardInfo=(Tag=\"genericUpdraft\")))";
+        const std::vector<PlayerRestoreCandidate> initial_ordered{
+            {"naturalApple@0",1},{"naturalCherry@0",0},{"genericUpdraft@0",0},
+            {"sakuraBow@0",0},{"sakuraBow@0",0},{"naturalLemon@0",0}};
+        require(plan_player_hand_staging(ordered,initial_ordered,7,error).has_value(),
+                "F13 hand staging reconstructs the complete distinct-key native startup sequence");
+        auto wrong_order = initial_ordered; std::swap(wrong_order[1],wrong_order[2]);
+        require(!plan_player_hand_staging(ordered,wrong_order,7,error),
+                "F13 refuses startup HAND-order drift even when the complete identity multiset is unchanged");
+        const std::vector<PlayerRestoreCandidate> staged_ordered{
+            {"naturalApple@0",1},{"naturalLemon@0",1},{"sakuraBow@0",1},{"sakuraBow@0",1},
+            {"naturalCherry@0",0},{"genericUpdraft@0",0}};
+        const auto ordered_plan = plan_player_field_restore(ordered,staged_ordered,error,7);
+        require(ordered_plan && ordered_plan->field_candidates == std::vector<std::size_t>{2,3},
+                "F13 reserves exact native DECK/HAND subsequences before assigning either FIELD Bow occurrence");
+        wrong_order = staged_ordered; std::swap(wrong_order[0],wrong_order[1]);
+        require(!plan_player_field_restore(ordered,wrong_order,error,7),
+                "F13 cannot hide reversed retained DECK order behind the same multiset");
+        wrong_order = staged_ordered; std::swap(wrong_order[4],wrong_order[5]);
+        require(!plan_player_field_restore(ordered,wrong_order,error,7),
+                "F13 cannot hide reversed retained HAND order behind the same multiset");
+
+        auto full = pair;
+        full.player_hand = "(";
+        for (std::size_t i{};i<7;++i) { if(i) full.player_hand+=','; full.player_hand+=apple; }
+        full.player_hand += ')'; full.player_hand_health_checksum = "FEDCBA9876543210";
+        full.payload_checksum = exact_player_field_payload_checksum(full);
+        require(parse_exact_player_field_checkpoint(serialize_exact_player_field_checkpoint(full),error).has_value(),
+                "F13 accepts exactly seven saved HAND cards with its independent linked health supplement");
+        const std::vector<PlayerRestoreCandidate> full_candidates{
+            {"sakuraBow@0",1},{"sakuraBow@0",1},{"naturalApple@0",1},{"naturalApple@0",1},
+            {"naturalApple@0",0},{"naturalApple@0",0},{"naturalApple@0",0},{"naturalApple@0",0},{"naturalApple@0",0}};
+        const auto full_plan = plan_player_hand_staging(full,full_candidates,7,error);
+        require(full_plan && full_plan->moves.size()==12 && full_plan->before_field_move_count==11,
+                "F13 full HAND retains the deferred final-card staging prefix for two FIELD targets");
+        auto execution = full;
+        execution.player_deck = "(" + apple + ")";
+        execution.player_deck_base_health_states = "2,2";
+        execution.player_hand = "(";
+        for (std::size_t i{};i<6;++i) { if(i) execution.player_hand+=','; execution.player_hand+=apple; }
+        execution.player_hand += ')';
+        const std::vector<PlayerRestoreCandidate> deferred{
+            {"sakuraBow@0",1},{"sakuraBow@0",1},{"naturalApple@0",1},
+            {"naturalApple@0",0},{"naturalApple@0",0},{"naturalApple@0",0},{"naturalApple@0",0},{"naturalApple@0",0},{"naturalApple@0",0}};
+        const auto deferred_plan = plan_player_field_restore(execution,deferred,error,7);
+        require(execution.payload_checksum != exact_player_field_payload_checksum(execution)
+                    && deferred_plan && deferred_plan->field_candidates == std::vector<std::size_t>{0,1},
+                "F13 validates unchanged pair scope in an intentional deferred execution view without checking its stale saved checksum");
+        auto overfull = full; overfull.player_hand.insert(overfull.player_hand.size()-1,","+apple); reject_scope(overfull);
+        auto oversized = pair; oversized.player_deck="(";
+        for (std::size_t i{};i<127;++i) { if(i) oversized.player_deck+=','; oversized.player_deck+=apple; }
+        oversized.player_deck+=')'; reject_scope(oversized);
+
+        // The new admission does not weaken the historical special overlap rule.
+        ExactPlayerFieldCheckpoint old{}; old.schema_version=11; old.player_deck="()";
+        old.player_hand="("+bow+")"; old.player_trash="("+bow+")"; old.player_field="("+apple+")";
+        require(!plan_player_hand_staging(old,{{"sakuraBow@0",1},{"naturalApple@0",1},{"sakuraBow@0",0}},7,error)
+                    && !plan_player_field_restore(old,{{"sakuraBow@0",0},{"sakuraBow@0",0},{"naturalApple@0",0}},error,7),
+                "F13 leaves historical F11 special HAND/TRASH overlap rejection unchanged");
     }
 
     auto run_character_allowance_tests() -> void
@@ -2774,6 +3019,7 @@ int main()
 
     run_qualification_tests();
     run_bow_field_placement_tests();
+    run_bow_field_pair_placement_tests();
     run_character_allowance_tests();
     std::cout << "Route C checkpoint persistence tests passed\n";
     return 0;

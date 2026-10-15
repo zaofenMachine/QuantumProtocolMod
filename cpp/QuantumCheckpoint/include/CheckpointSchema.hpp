@@ -40,6 +40,8 @@ namespace QuantumCheckpoint
     inline constexpr int ExactPlayerFieldBowOnceQualificationSchemaVersion = 11;
     // F12 adds one base Bow in PLAYER FIELD; Q2's effect contract is unchanged.
     inline constexpr int ExactPlayerFieldBowPlacementSchemaVersion = 12;
+    // F13 adds exactly two base Bows, both in FIELD, under the same Q2 policy.
+    inline constexpr int ExactPlayerFieldBowPairPlacementSchemaVersion = 13;
     inline constexpr int ExactPlayerQualificationSchemaVersion = 2;
     inline constexpr std::string_view ExactPlayerQualificationCheckpointKind =
         "route-c-exact-player-qualification";
@@ -54,7 +56,7 @@ namespace QuantumCheckpoint
     inline constexpr int ExactPlayerTrashSchemaVersion = 8;
     inline constexpr std::string_view ExactPlayerTrashCheckpointKind =
         "route-c-exact-player-trash";
-    inline constexpr int ExactPlayerFieldSchemaVersion = 12;
+    inline constexpr int ExactPlayerFieldSchemaVersion = 13;
     inline constexpr std::string_view ExactPlayerFieldCheckpointKind =
         "route-c-exact-player-field";
     // Fixed minimum for replaying HAND base-HP gains; keep older schemas default-only.
@@ -208,7 +210,7 @@ namespace QuantumCheckpoint
     // by deterministic row/index order.
     struct ExactPlayerFieldCheckpoint
     {
-        // Capture explicitly selects F12 only for its narrow Bow FIELD slice.
+        // Capture explicitly selects F12/F13 for their distinct Bow FIELD slices.
         int schema_version{ExactPlayerFieldBowOnceQualificationSchemaVersion};
         std::string kind{ExactPlayerFieldCheckpointKind};
         std::string captured_at_utc{};

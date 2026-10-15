@@ -74,7 +74,8 @@ namespace QuantumCheckpoint
         -> std::optional<ExactPlayerFieldCheckpoint>;
     auto validate_exact_player_field_checkpoint(
         const ExactPlayerFieldCheckpoint& checkpoint, std::string& error) -> bool;
-    // F12 only: one base Bow in FIELD, default numeric records, turn-active true.
+    // F12: exactly one base Bow; F13: exactly two. All Bows must be in FIELD,
+    // with default numeric records and turn-active true; no Bow is allowed in D/H/T.
     // No checksum/metadata requirement: planners also use temporary execution
     // views. Other layout versions retain their existing admission unchanged.
     // Full immutable definition, live level/turn counters and ownership remain

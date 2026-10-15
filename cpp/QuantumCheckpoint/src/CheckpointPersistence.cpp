@@ -2353,18 +2353,22 @@ namespace QuantumCheckpoint
         const ExactPlayerFieldCheckpoint& checkpoint, std::string& error) -> bool
     {
         error.clear();
-        if (checkpoint.schema_version != ExactPlayerFieldBowPlacementSchemaVersion)
+        const std::size_t required_bows = checkpoint.schema_version == ExactPlayerFieldBowPlacementSchemaVersion ? 1
+            : checkpoint.schema_version == ExactPlayerFieldBowPairPlacementSchemaVersion ? 2 : 0;
+        if (required_bows == 0)
             return true;
+        const auto version = "F" + std::to_string(checkpoint.schema_version);
         if (checkpoint.kind != ExactPlayerFieldCheckpointKind
             || checkpoint.qualification_policy != ExactPlayerQualificationBowOncePolicy)
         {
-            error = "F12 Bow placement requires the unchanged Q2 Bow qualification policy";
+            error = version + " Bow placement requires the unchanged Q2 Bow qualification policy";
             return false;
         }
         const std::array<std::string_view, 4> arrays{
             checkpoint.player_hand, checkpoint.player_deck,
             checkpoint.player_trash, checkpoint.player_field};
-        std::size_t bow_count{}, bow_field_index{}, total{}, field_count{};
+        std::size_t total{}, field_count{};
+        std::vector<std::size_t> bow_field_indices{};
         for (std::size_t zone{}; zone < arrays.size(); ++zone)
         {
             const auto cards = split_route_c_unreal_array(arrays[zone], error);
@@ -2372,7 +2376,7 @@ namespace QuantumCheckpoint
             total += cards->size();
             if (zone == 0 && cards->size() > 7)
             {
-                error = "F12 Bow placement exceeds the qualified seven-card HAND bound";
+                error = version + " Bow placement exceeds the qualified seven-card HAND bound";
                 return false;
             }
             if (zone == 3) field_count = cards->size();
@@ -2382,23 +2386,25 @@ namespace QuantumCheckpoint
                 if (!card) return false;
                 if (card->tag == "sakuraBow")
                 {
-                    if (zone != 3 || card->upgrade_level != 0 || ++bow_count > 1)
+                    if (zone != 3 || card->upgrade_level != 0 || bow_field_indices.size() == required_bows)
                     {
-                        error = "F12 requires exactly one base Bow across D/H/T/F, only in FIELD";
+                        error = version + " requires exactly " + std::to_string(required_bows)
+                            + " base Bow(s) across D/H/T/F, only in FIELD";
                         return false;
                     }
-                    bow_field_index = index;
+                    bow_field_indices.push_back(index);
                 }
                 else if (zone == 3 && !supports_plain_player_field_card(card->tag))
                 {
-                    error = "F12 FIELD admits only the original plain fruit and one base Bow";
+                    error = version + " FIELD admits only the original plain fruit and its exact base Bow count";
                     return false;
                 }
             }
         }
-        if (bow_count != 1 || total > 128)
+        if (bow_field_indices.size() != required_bows || total > 128)
         {
-            error = "F12 requires exactly one FIELD base Bow within the 128-card bound";
+            error = version + " requires exactly " + std::to_string(required_bows)
+                + " FIELD base Bow(s) within the 128-card bound";
             return false;
         }
         const auto states = parse_exact_player_field_states(checkpoint.player_field_states, error);
@@ -2409,22 +2415,24 @@ namespace QuantumCheckpoint
             || states->size() != field_count || attack->size() != field_count
             || health->size() != field_count || counters->size() != field_count)
         {
-            error = "F12 Bow numeric records are missing, invalid or not aligned with FIELD";
+            error = version + " Bow numeric records are missing, invalid or not aligned with FIELD";
             return false;
         }
         // Pinned Sakura table / Phase40 profile has attack1, health1 for Bow@0.
         // Runtime separately proves full immutable CardInfo/definition equality.
-        const auto& a = (*attack)[bow_field_index];
-        const auto& h = (*health)[bow_field_index];
-        const auto& c = (*counters)[bow_field_index];
-        if (a.base_attack != 1 || a.current_attack != 1 || !a.modifiers.empty()
-            || h.base_health != 1 || h.max_health != 1 || !h.modifiers.empty()
-            || (*states)[bow_field_index].current_health != 1
-            || !(*states)[bow_field_index].turn_active
-            || c.generic != 0 || !c.special.empty())
+        for (const auto index : bow_field_indices)
         {
-            error = "F12 base Bow requires default attack/health, no modifiers, zero counters and turn-active true";
-            return false;
+            const auto& a = (*attack)[index];
+            const auto& h = (*health)[index];
+            const auto& c = (*counters)[index];
+            if (a.base_attack != 1 || a.current_attack != 1 || !a.modifiers.empty()
+                || h.base_health != 1 || h.max_health != 1 || !h.modifiers.empty()
+                || (*states)[index].current_health != 1 || !(*states)[index].turn_active
+                || c.generic != 0 || !c.special.empty())
+            {
+                error = version + " base Bow requires default attack/health, no modifiers, zero counters and turn-active true";
+                return false;
+            }
         }
         return true;
     }
@@ -2561,7 +2569,8 @@ namespace QuantumCheckpoint
                     return false;
                 }
                 if (zone == &*field && !supports_plain_player_field_card(card->tag)
-                    && !(checkpoint.schema_version == ExactPlayerFieldBowPlacementSchemaVersion
+                    && !((checkpoint.schema_version == ExactPlayerFieldBowPlacementSchemaVersion
+                          || checkpoint.schema_version == ExactPlayerFieldBowPairPlacementSchemaVersion)
                          && card->tag == "sakuraBow" && card->upgrade_level == 0))
                 {
                     error = "exact player field contains a card outside the first guarded "
