@@ -1857,7 +1857,7 @@ namespace QuantumCheckpoint
                 / STR("route-c-exact-turn-progress.json");
         }
 
-        auto append_route_c_trace(std::string_view event) noexcept -> void
+        auto append_route_c_trace(std::string_view event, bool expanded_capture_timing = false) noexcept -> void
         {
             try
             {
@@ -1880,7 +1880,18 @@ namespace QuantumCheckpoint
 
                 SYSTEMTIME utc{};
                 GetSystemTime(&utc);
-                std::array<char, 512> line{};
+                // Ordinary breadcrumbs retain their original 256-byte event limit.
+                // The bounded automatic-capture timing wrapper uses the same single
+                // write/flush with enough room for its original payload and clocks.
+                constexpr std::size_t OrdinaryEventBytes = 256;
+                constexpr std::size_t CaptureTimingEventBytes = 1536;
+                constexpr std::size_t TraceLineBytes = 2048;
+                // UTC/PID/TID prefix and CRLF fit within this reserved margin.
+                static_assert(CaptureTimingEventBytes + 128 < TraceLineBytes);
+                const auto event_limit = expanded_capture_timing
+                    && (event.starts_with("auto-capture.") || event.starts_with("capture.processing.waitable"))
+                    ? CaptureTimingEventBytes : OrdinaryEventBytes;
+                std::array<char, TraceLineBytes> line{};
                 const int length = std::snprintf(
                     line.data(),
                     line.size(),
@@ -1894,7 +1905,7 @@ namespace QuantumCheckpoint
                     static_cast<unsigned>(utc.wMilliseconds),
                     static_cast<unsigned long>(GetCurrentProcessId()),
                     static_cast<unsigned long>(GetCurrentThreadId()),
-                    static_cast<int>(std::min(event.size(), line.size() / 2)),
+                    static_cast<int>(std::min(event.size(), event_limit)),
                     event.data());
                 if (length > 0)
                 {
@@ -4927,6 +4938,61 @@ namespace QuantumCheckpoint
                 throw std::runtime_error{"automatic capture spawner lifetime changed during identity validation"};
         }
 
+        // Diagnostic clocks only: no game observation, retry authority or new IO.
+        // All added formatting is isolated so it cannot cancel a pending capture.
+        auto append_route_c_capture_timing_trace(std::string_view event,
+            const PendingRouteCCapture& capture, std::string_view reason = {},
+            bool fresh_schedule = false) noexcept -> void
+        {
+            const auto original_trace = [&]() noexcept {
+                if (reason.empty()) append_route_c_trace(event);
+                else append_route_c_trace_failure(event, reason);
+            };
+            try
+            {
+                constexpr std::size_t MaximumEventBytes = 1536;
+                if (event.size() > 96 || reason.size() > MaximumEventBytes
+                    || event.find_first_of("\r\n\0", 0, 3) != std::string_view::npos
+                    || reason.find('\0') != std::string_view::npos)
+                {
+                    original_trace();
+                    return;
+                }
+                const auto observed = std::chrono::steady_clock::now();
+                // ready_at changes on retry; this value is explicitly derived
+                // from the unchanged deadline, not an independent first sample.
+                const auto first_due_derived = capture.deadline - std::chrono::seconds{30};
+                std::string line{event};
+                line += " reason=";
+                for (const char character : reason)
+                    line.push_back(character == '\r' || character == '\n' ? ' ' : character);
+                if (!reason.empty()) line += ' ';
+                line += "timingRequest=" + std::to_string(capture.request_id)
+                    + " timingWave=" + std::to_string(capture.wave_index)
+                    + " clock=steady clockPeriodNum=" + std::to_string(std::chrono::steady_clock::period::num)
+                    + " clockPeriodDen=" + std::to_string(std::chrono::steady_clock::period::den)
+                    + " observedTicks=" + std::to_string(observed.time_since_epoch().count())
+                    + " readyTicks=" + std::to_string(capture.ready_at.time_since_epoch().count())
+                    + " deadlineTicks=" + std::to_string(capture.deadline.time_since_epoch().count())
+                    + " firstDueDerivedTicks=" + std::to_string(first_due_derived.time_since_epoch().count())
+                    + " firstDueDerivation=deadline-minus-30s";
+                // Only the newly created request exposes its actual initial
+                // ready_at; coalesced/retry/terminal records do not relabel it.
+                if (fresh_schedule)
+                    line += " scheduleReadyTicks=" + std::to_string(capture.ready_at.time_since_epoch().count());
+                if (line.size() > MaximumEventBytes)
+                {
+                    original_trace();
+                    return;
+                }
+                append_route_c_trace(line, true);
+            }
+            catch (...)
+            {
+                original_trace();
+            }
+        }
+
         auto schedule_route_c_capture(UObject* spawner, std::int32_t wave,
                                        std::chrono::steady_clock::time_point ready_at, std::string_view event) -> void
         {
@@ -4939,12 +5005,12 @@ namespace QuantumCheckpoint
                     // wave. Validate the original W/T before make can publish a
                     // new watch. An invalid old identity must never be repinned.
                     validate_pending_route_c_capture(*g_pending_route_c_capture, find_route_c_objects());
-                    append_route_c_trace("auto-capture.schedule.coalesced");
+                    append_route_c_capture_timing_trace("auto-capture.schedule.coalesced", *g_pending_route_c_capture);
                     return;
                 }
                 auto next = make_pending_route_c_capture(spawner, wave, ready_at);
                 g_pending_route_c_capture = std::move(next);
-                append_route_c_trace(event);
+                append_route_c_capture_timing_trace(event, *g_pending_route_c_capture, {}, true);
             }
             catch (const std::exception& error)
             {
@@ -5093,7 +5159,7 @@ namespace QuantumCheckpoint
                 validated_native_move_card_api(objects.card_engine).engine_state);
             if (game_state == "PROCESSING")
             {
-                append_route_c_trace_failure("capture.processing.waitable",
+                append_route_c_capture_timing_trace("capture.processing.waitable", *expected,
                     "request=" + std::to_string(expected->request_id)
                         + " wave=" + std::to_string(expected->wave_index)
                         + " state=PROCESSING selection=None placement=None nativeStructure=valid settled="
@@ -12644,7 +12710,7 @@ namespace QuantumCheckpoint
                 diagnostic.failure("automatic", "terminal-refused", reason, false);
                 finish_capture_receipt(diagnostic);
                 if (still_current()) g_pending_route_c_capture.reset();
-                append_route_c_trace_failure("auto-capture.refused", reason);
+                append_route_c_capture_timing_trace("auto-capture.refused", capture, reason);
                 Output::send<LogLevel::Warning>(
                     STR("[QuantumCheckpoint] Automatic Route C checkpoint refused: {}\n"), to_wstring(reason));
             };
@@ -12681,7 +12747,7 @@ namespace QuantumCheckpoint
                 pending.ready_at = retry_at;
                 if (processing) ++pending.open_waits;
                 else ++pending.busy_retries;
-                append_route_c_trace_failure(event_prefix + "retry-scheduled",
+                append_route_c_capture_timing_trace(event_prefix + "retry-scheduled", pending,
                     "request=" + std::to_string(pending.request_id) + " wave=" + std::to_string(pending.wave_index)
                         + (processing ? " openWaits=" : " busyRetries=")
                         + std::to_string(processing ? pending.open_waits : pending.busy_retries)
@@ -12697,7 +12763,7 @@ namespace QuantumCheckpoint
                 const auto lifetime_identity = route_c_capture_lifetime_identity(capture);
                 const auto path = capture_route_c_checkpoint(capture, &diagnostic);
                 if (still_current()) g_pending_route_c_capture.reset();
-                append_route_c_trace_failure("auto-capture.complete",
+                append_route_c_capture_timing_trace("auto-capture.complete", capture,
                     "request=" + std::to_string(capture.request_id) + " wave=" + std::to_string(capture.wave_index)
                         + " busyRetries=" + std::to_string(capture.busy_retries)
                         + " openWaits=" + std::to_string(capture.open_waits)
@@ -16472,9 +16538,9 @@ namespace QuantumCheckpoint
         QuantumCheckpointMod()
         {
             ModName = STR("QuantumCheckpoint");
-            ModVersion = STR("0.45.0");
+            ModVersion = STR("0.46.0");
 #if defined(QUANTUM_CHECKPOINT_RUNTIME_TEST_FIXTURES)
-            ModVersion = STR("0.45.0-test-fixtures");
+            ModVersion = STR("0.46.0-test-fixtures");
 #endif
             ModDescription = STR("Route C checkpoint with optional exact-state supplements");
             ModAuthors = STR("zaofenMachine and contributors");

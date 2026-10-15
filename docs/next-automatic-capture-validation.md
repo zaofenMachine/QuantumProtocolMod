@@ -2,6 +2,8 @@
 
 这是续接方案，没有新增实测结论。当前仍沿“小关重开＋受限玩家恢复”；不更改捕获准入、不扩敌人或重编程。阶段37证明过真实 native busy 后重试，阶段45增加终态回执，阶段46增加只读查看；它们都没有补足 PROCESSING 等待的实机覆盖。
 
+阶段47已准备[时钟记录候选](phase-47-capture-timing.md)，构建通过但未部署。下一次先在独立备份后核对并部署候选；现有新增字段仍只是日志观测，不能替代下面的状态、身份和文件证据。
+
 ## 最小执行顺序
 
 1. 建立新证据根和独立备份，固定当前 DLL／EXE、原17个 checkpoint、4个 SaveGames、回执及文件集合。旧冻结材料只读，测试结束重新核对并还原原数据。
@@ -18,7 +20,7 @@
 | 有提示，未知状态，非法队列图 | 终止拒绝，不作为可重试动画 |
 | weak身份／目标生命周期或监听条件变化 | 核对对应拒绝及无后续同请求发布；另设独立负例，不能从一个正例推断全覆盖 |
 
-现有DEV pending夹具明确要求 `busy_retries=1`、`open_waits=0`，因此不能拿它替代PROCESSING正例。依据当前 [捕获和更新器源码](../cpp/QuantumCheckpoint/src/QuantumCheckpointMod.cpp)：PROCESSING判断约5094行，现DEV断言约11923行，保留原请求与500ms延期约12652–12719行；行号仅为续接定位，应重新核对实际代码。
+现有DEV pending夹具明确要求 `busy_retries=1`、`open_waits=0`，因此不能拿它替代PROCESSING正例。依据当前 [捕获和更新器源码](../cpp/QuantumCheckpoint/src/QuantumCheckpointMod.cpp)中的 `capture.processing.waitable`、DEV的 `open_waits != 0` 断言及 `auto-capture.processing.` 重试分支定位，续接时重新核对实际代码。
 
 ## 通过条件与边界
 

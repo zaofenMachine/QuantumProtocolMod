@@ -1,6 +1,14 @@
 # QuantumCheckpoint 当前工作进度（临时续接记录）
 
-> 2026-10-15 沿“小关重开＋受限玩家恢复”推进。用户收尾阈值为周额度剩余约10%。Phase46只读状态工具已完成验证和冻结，部署仍为v0.45.0，游戏关闭。下方历史结果不代表当前部署。
+> 2026-10-15 本轮收尾，周额度最后进入收尾时剩约11%，用户阈值为约10%。Phase46只读状态工具已验收；Phase47时钟候选已构建但未部署。现场仍为v0.45.0，原数据完好、游戏关闭。下方历史结果不代表当前部署。
+
+## 2026-10-15 第四十七阶段：自动保存时钟候选已构建，待实机
+
+v0.46.0候选只扩已有自动capture的调度／合并／PROCESSING等待／重试／终态日志，记录原始steady ticks及period、当前ready、固定deadline；fresh scheduleReady为实际初始值，firstDueDerived明确为deadline-30秒推导。新增格式化在noexcept边界内，超界或失败回原日志一次；普通日志仍256字节，专用记录1536／栈2048。不改请求、期限、计数、身份或native控制流。独立审阅通过，生产OFF5/5CTest；尚无新游戏／日志故障注入／PROCESSING实测。详见[第四十七阶段](phase-47-capture-timing.md)。
+
+候选DLL `D1AA93DBF5CF4E5C47946B6C2730E942A8D9738BC5AEE0CED3C56362B8F746CB`，Mod源码 `626C07AD195661540732FAD5DA45519EB580E1B1978A0B49D81A9563453C6F89`。证据根 `QuantumProtoclMod.runtime-evidence/20261015-capture-timing`，build-01保存候选及27源码／构建快照；验证SHA `42DC3C6CF212655840575AD7DC65757115E0B2917FD1E68DD8E1F5206DD53B3A`，summary固定35文件记录，SHA `433F6DEE908CB7FC7E09A9DEA5BBD690FB586C3FEF298F8845E8E3F5388FD179`。提交／推送记录另存该根目录。
+
+本片23现场文件及CP／SaveGames集合未变，原17CP＋4SaveGames保持还原结果，部署仍v0.45.0 D526BAEF…E5A13，游戏关闭。下一轮先独立备份并部署核对过的v0.46候选，按[PROCESSING续测方案](next-automatic-capture-validation.md)最多做3次完整普通换波候选；不能把busy、手动拒绝、时钟推导或合成测试记成PROCESSING实测。不扩敌人精确恢复／重编程。
 
 ## 2026-10-15 第四十六阶段：只读保存状态已验收
 
